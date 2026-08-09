@@ -11,7 +11,11 @@
 #             LLM API needs a trust store) + libssl3 (the wechat channel's
 #             `wechatbot` crate pulls reqwest's native-tls, which dynamically
 #             links libssl on Linux — without it the binary won't even load) +
-#             tzdata (reminders and the briefing run on local time — set TZ)
+#             tzdata (reminders and the briefing run on local time — set TZ) +
+#             git (`komo skills install owner/repo` shells out to `git clone`;
+#             only the single-file `…/SKILL.md` form uses the built-in HTTP
+#             client) + curl (nothing in komo calls it — skills do, since a
+#             skill is largely "here is the command line for this API")
 #
 # Build for the NAS's architecture, NOT your laptop's. On Apple Silicon:
 #   docker buildx build --platform linux/amd64 -t ghcr.io/solren7/komo:latest --push .
@@ -43,8 +47,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---- runtime ----------------------------------------------------------------
 FROM debian:trixie-slim AS runtime
 
+# Measured on trixie-slim/amd64: base layer 31 MB, +5 MB for curl, +35 MB for
+# git (liberror-perl is a hard dependency, not a recommend, so it comes along
+# either way). --no-install-recommends saves a further 4 MB — worth keeping,
+# but git is the real cost. Drop git if you only ever install single-file
+# skills by raw SKILL.md URL, which uses the built-in HTTP client.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata libssl3 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates tzdata libssl3 git curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/komo /usr/local/bin/komo
