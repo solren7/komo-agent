@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use komo_config::{ModelConfig, Provider, split_model_id};
 use komo_core::domain::{
@@ -318,7 +319,7 @@ impl ProviderLlm {
             self.max_history_messages,
             self.max_history_bytes,
         );
-        let history: Vec<Turn> = window.iter().filter_map(to_turn).collect();
+        let history: Vec<Turn> = window.iter().flat_map(to_turns).collect();
 
         // Rebuild the system prompt for this turn. It rides on the per-turn
         // request rather than on shared state, so concurrent sessions in the
@@ -818,11 +819,42 @@ fn blocks_to_step(blocks: &[AssistantBlock]) -> Step {
         }
     }
     if calls.is_empty() {
+        if let Some(marker) = FABRICATED_CALL_MARKERS
+            .iter()
+            .find(|m| text.contains(**m))
+            .filter(|_| !text.is_empty())
+        {
+            warn!(
+                marker,
+                "the model wrote tool-call syntax as prose and issued no call — \
+                 the answer it is about to give is very likely fabricated"
+            );
+        }
         Step::Final(text)
     } else {
         Step::ToolCalls { calls, text }
     }
 }
+
+/// Tool-call syntax that must never appear in a model's *prose*. Finding it in a
+/// round that issued no call means the model narrated a tool call instead of
+/// making one, and the answer built on it is invented — the failure that led here
+/// had a turn quoting a plausible JSON result for a command it never ran, with an
+/// empty ledger and nothing in any log to say so. Detection cannot be a hard error
+/// (the strings are model-specific and a legitimate reply could quote one while
+/// discussing tooling), so this only leaves a breadcrumb: `komo logs` now names
+/// the failure that otherwise has to be reconstructed from an empty run ledger.
+///
+/// The last entry is komo's own digest fence (`domain::run::tool_digest`): the
+/// model emitting it means it is echoing the shape of its replayed history rather
+/// than acting.
+const FABRICATED_CALL_MARKERS: [&str; 5] = [
+    "tool▁calls▁begin",
+    "｜DSML｜",
+    "<|tool_calls_begin|>",
+    "<tool_call>",
+    "<previous_turn_tools>",
+];
 
 /// Build an LLM client covering every provider the configured `models` menu
 /// spans, exposing `tools` via function calling.
@@ -1101,32 +1133,49 @@ fn is_window_anchor(m: &Message) -> bool {
     h % WINDOW_ANCHOR_SPACING == 0
 }
 
-/// Map a komo message into a provider chat-history turn. The system prompt is
+/// Map a komo message into provider chat-history turns. The system prompt is
 /// supplied via the preamble, and tool outputs are folded into the following
 /// assistant reply, so both `System` and `Tool` roles are skipped here.
 ///
-/// The turn's tool-activity digest rides along on an assistant message, which is
-/// what lets the *next* turn know tools ran at all — the user-visible `content`
-/// stays exactly what every client renders.
+/// A note-bearing assistant message renders as **two** turns: the reply itself,
+/// then the tool digest as a *user* turn. The digest is what lets the next turn
+/// know tools ran at all, but it must not look like assistant output — rendered
+/// inside the assistant's own text (as it was until this changed), it reads as a
+/// worked example of an assistant narrating tool calls in prose, and a model that
+/// copies the shape gets a turn that reports invented commands and invented
+/// results with nothing in the ledger. Attributing it to the other side of the
+/// conversation, plus `tool_digest`'s fence, is what breaks the pattern. The
+/// user-visible `content` is untouched either way — it stays exactly what every
+/// client renders.
+///
+/// Two user turns in a row can result (digest, then the next real user message).
+/// Both wires handle it: `messages` merges same-role neighbours because Anthropic
+/// demands strict alternation, and `responses` flattens turns into an input list
+/// that never required it.
 ///
 /// **The rendering is a pure function of the message.** Nothing here may depend
-/// on where the message sits in the window (see [`ProviderLlm::assemble`]). This
-/// used to carry the note only for the last three note-bearing turns, which meant
-/// every tool turn silently rewrote an older message's bytes and cost the provider
-/// prefix cache everything from ~3 turns back, every turn. Always attaching is
-/// both simpler and cheaper: the digest is already capped when it is written
-/// (`domain::run::tool_digest`), and [`window_history`]'s byte budget has always
-/// counted `tool_note` for every message in the window regardless of whether it
-/// was rendered — so the accounting now matches what is actually sent.
-fn to_turn(msg: &Message) -> Option<Turn> {
+/// on where the message sits in the window (see [`ProviderLlm::assemble`]) — which
+/// is why the digest becomes its own turn rather than a prefix on the *following*
+/// user message: `window_history` always cuts so the window opens on a user
+/// message, so a prefixed digest would appear or vanish depending on whether its
+/// assistant survived the cut. Emitted as a pair, the two turns live and die
+/// together. This also used to carry the note only for the last three
+/// note-bearing turns, which meant every tool turn silently rewrote an older
+/// message's bytes and cost the provider prefix cache everything from ~3 turns
+/// back, every turn. Always attaching is both simpler and cheaper: the digest is
+/// already capped when it is written (`domain::run::tool_digest`), and
+/// [`window_history`]'s byte budget has always counted `tool_note` for every
+/// message in the window regardless of whether it was rendered — so the
+/// accounting matches what is actually sent.
+fn to_turns(msg: &Message) -> Vec<Turn> {
     match msg.role {
-        Role::User => Some(Turn::user(msg.content.clone())),
-        Role::Assistant if !msg.tool_note.is_empty() => Some(Turn::assistant(format!(
-            "{}\n\n{}",
-            msg.content, msg.tool_note
-        ))),
-        Role::Assistant => Some(Turn::assistant(msg.content.clone())),
-        Role::System | Role::Tool => None,
+        Role::User => vec![Turn::user(msg.content.clone())],
+        Role::Assistant if !msg.tool_note.is_empty() => vec![
+            Turn::assistant(msg.content.clone()),
+            Turn::user(msg.tool_note.clone()),
+        ],
+        Role::Assistant => vec![Turn::assistant(msg.content.clone())],
+        Role::System | Role::Tool => Vec::new(),
     }
 }
 
@@ -1650,7 +1699,7 @@ mod tests {
         }
         let render = |msgs: &[Message]| -> Vec<String> {
             msgs.iter()
-                .filter_map(to_turn)
+                .flat_map(to_turns)
                 .map(|m| format!("{m:?}"))
                 .collect()
         };
@@ -1681,13 +1730,43 @@ mod tests {
     fn a_tool_note_never_touches_the_user_visible_content() {
         let msg = Message::assistant("the answer").with_tool_note("[tools used] read foo.rs");
         // The model sees the note; `content` stays exactly the reply.
-        let rendered = format!("{:?}", to_turn(&msg).unwrap());
-        assert!(rendered.contains("the answer") && rendered.contains("read foo.rs"));
+        let rendered: Vec<String> = to_turns(&msg).iter().map(|t| format!("{t:?}")).collect();
+        assert!(rendered.iter().any(|t| t.contains("the answer")));
+        assert!(rendered.iter().any(|t| t.contains("read foo.rs")));
         // And the stored message itself is untouched — every client renders this.
         assert_eq!(msg.content, "the answer");
         let plain = Message::assistant("just talk");
-        let rendered = format!("{:?}", to_turn(&plain).unwrap());
+        let rendered = format!("{:?}", to_turns(&plain)[0]);
         assert!(rendered.contains("just talk"));
+    }
+
+    /// The regression this whole change exists for: a tool digest replayed inside
+    /// the assistant's own text is a worked example of narrating tool calls in
+    /// prose, and a model that copies it answers from invented results with no
+    /// tool steps in the ledger. The digest must reach the model as the *other*
+    /// speaker's words, and the assistant turn must carry nothing but the reply.
+    #[test]
+    fn a_tool_note_reaches_the_model_as_a_user_turn() {
+        let msg = Message::assistant("the answer").with_tool_note("[tools used] read foo.rs");
+        let turns = to_turns(&msg);
+        assert_eq!(turns.len(), 2, "reply plus digest: {turns:?}");
+        match &turns[0] {
+            Turn::Assistant { .. } => {
+                let rendered = format!("{:?}", turns[0]);
+                assert!(
+                    !rendered.contains("read foo.rs"),
+                    "the digest must not ride in the assistant turn: {rendered}"
+                );
+            }
+            other => panic!("expected the reply first, got {other:?}"),
+        }
+        match &turns[1] {
+            Turn::User(_) => {
+                let rendered = format!("{:?}", turns[1]);
+                assert!(rendered.contains("read foo.rs"), "{rendered}");
+            }
+            other => panic!("expected the digest as a user turn, got {other:?}"),
+        }
     }
 
     #[test]

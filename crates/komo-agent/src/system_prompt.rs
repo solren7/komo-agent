@@ -119,6 +119,23 @@ const TOOL_ECONOMY_GUIDANCE: &str = "Tool calls in one round run concurrently: \
     have not changed since you last ran it — verify once, at the point the result \
     actually matters.";
 
+/// Injected whenever any tool is loaded, and the reason is a real incident: asked
+/// what it had spent this month, the model answered "no records, 0 yuan" in 76
+/// output tokens with zero tool steps in the ledger — the data was there the whole
+/// time. Pressed to check again, it produced a shell command and a JSON result in
+/// prose, both invented, and never issued a call. Nothing in the loop can catch
+/// that: a turn that reports a fabricated result looks exactly like a turn that
+/// answered from knowledge. Only the model can hold this line, so state it.
+const GROUNDING_GUIDANCE: &str = "Anything about the user's own data — their \
+    files, records, messages, devices, schedule, or any external system — must \
+    come from a tool call in this turn. You have no memory of their current state \
+    between turns. Never report a tool's output, or say you checked, ran, looked \
+    up, or verified something, unless you actually issued the call this turn and \
+    read the result. Never write out a tool call or its result as text in your \
+    reply — that is not a call and returns nothing. If a tool fails or comes back \
+    empty, say so plainly and name the failure; an empty result is a fact about \
+    the query, not proof the thing does not exist.";
+
 /// Gated on `todo`. The description on the tool itself states the same policy,
 /// but models weight system-prompt behavioral rules higher — this is what
 /// actually stops a three-step git task from growing a bookkeeping side-channel.
@@ -370,6 +387,7 @@ impl SystemPromptBuilder {
 
         // Tool-aware guidance: only inject when the tool is loaded.
         if !self.tool_names.is_empty() {
+            parts.push(GROUNDING_GUIDANCE.to_string());
             parts.push(TOOL_ECONOMY_GUIDANCE.to_string());
         }
         if self.has("time") {

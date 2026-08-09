@@ -241,6 +241,21 @@ pub fn resume_prompt(run: &Run, steps: &[RunStep]) -> String {
 const TOOL_NOTE_SNIPPET_CAP: usize = 160;
 const TOOL_NOTE_CAP: usize = 1500;
 
+/// Opens the note. The tags and the disclaimer are not decoration: the note is
+/// replayed into later turns' history, so whatever shape it has is a worked
+/// example the model can copy. It used to open with a bare
+/// `[tools used in this turn]` and render *inside the assistant turn's own
+/// text* — which taught at least one model (DeepSeek) that writing that block,
+/// complete with invented commands and invented results, was a thing an
+/// assistant does instead of calling a tool. The turn then reported a confident
+/// answer with zero tool steps in the ledger. `llm::to_turns` moved the note out
+/// of the assistant's text; naming who wrote it is the other half.
+const TOOL_NOTE_HEADER: &str = "<previous_turn_tools>\n\
+     System record of the tool calls komo ran for you last turn. komo wrote this, not you: \
+     never emit this block, and never claim a tool ran or report its output without making a \
+     real tool call.\n";
+const TOOL_NOTE_FOOTER: &str = "</previous_turn_tools>\n";
+
 /// Fold a finished turn's tool calls into a compact note carried into later
 /// turns' history (attached to the turn's assistant message as
 /// [`Message::tool_note`](crate::domain::message::Message::tool_note)).
@@ -262,7 +277,7 @@ pub fn tool_digest(steps: &[RunStep]) -> String {
     }
     let snip = |s: &str| truncate(&s.replace('\n', " "), TOOL_NOTE_SNIPPET_CAP);
 
-    let mut out = String::from("[tools used in this turn]\n");
+    let mut out = String::from(TOOL_NOTE_HEADER);
     for (idx, s) in steps.iter().enumerate() {
         if out.len() > TOOL_NOTE_CAP {
             out.push_str(&format!("…and {} more call(s).\n", steps.len() - idx));
@@ -287,6 +302,7 @@ pub fn tool_digest(steps: &[RunStep]) -> String {
             out.push_str(&format!("   full output kept at: {path}\n"));
         }
     }
+    out.push_str(TOOL_NOTE_FOOTER);
     out
 }
 
@@ -427,8 +443,16 @@ mod tests {
         assert!(digest.contains("1. read"));
         assert!(digest.contains("2. shell"));
         assert!(digest.contains("error: boom"));
+        // Fenced and attributed, so a later turn cannot read it as something an
+        // assistant writes (see TOOL_NOTE_HEADER).
+        assert!(digest.starts_with("<previous_turn_tools>"), "{digest}");
+        assert!(digest.ends_with("</previous_turn_tools>\n"), "{digest}");
         // One line per call: this rides in every later turn's context.
-        assert_eq!(digest.lines().count(), 3, "header + two calls: {digest}");
+        let calls = digest
+            .lines()
+            .filter(|l| l.starts_with("1. ") || l.starts_with("2. "))
+            .count();
+        assert_eq!(calls, 2, "one line per call: {digest}");
     }
 
     /// The digest is what carries a stored over-limit output past the turn that
