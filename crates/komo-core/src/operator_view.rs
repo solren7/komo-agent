@@ -58,6 +58,18 @@ pub struct SkillInvocation {
     pub ok: bool,
 }
 
+/// One skill's usage across the ledger scan window (backs the aggregate
+/// `komo skills audit`). Derived on every call — no counter is stored anywhere,
+/// so this reflects exactly what the ledger still holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillUsage {
+    pub name: String,
+    /// `skill view` steps seen in the scan window.
+    pub views: usize,
+    /// When it was last loaded; `None` = not once in the window.
+    pub last_at: Option<i64>,
+}
+
 /// The result of resuming an interrupted run, consumed by `komo run resume`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeOutcome {

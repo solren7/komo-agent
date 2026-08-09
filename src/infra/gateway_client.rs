@@ -28,7 +28,7 @@ use crate::domain::{
 };
 use crate::infra::rendezvous::{self, GatewayInfo};
 use crate::services::operator_control::{
-    DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary, SkillInvocation,
+    DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary, SkillInvocation, SkillUsage,
 };
 
 /// How long to wait for the gateway to answer a request (a turn can take a
@@ -281,6 +281,11 @@ impl GatewayClient {
     pub async fn skill_audit(&self, name: &str) -> anyhow::Result<Vec<SkillInvocation>> {
         self.get_field(&format!("/api/skills/{name}/audit"), "invocations")
             .await
+    }
+
+    /// Every active skill ranked coldest-first (same server-side derivation).
+    pub async fn skill_usage(&self) -> anyhow::Result<Vec<SkillUsage>> {
+        self.get_field("/api/skills/usage", "usage").await
     }
 
     pub async fn pairings(&self) -> anyhow::Result<Vec<PairingView>> {

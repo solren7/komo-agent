@@ -28,7 +28,9 @@ komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; 
 komo dream [--apply]               # usage-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|resume|prune # run ledger (⟲ = recoverable)
-komo skills list|install|inspect|promote|reject|protect|unprotect|enable|disable|audit
+komo skills list|install|inspect|promote|reject|protect|unprotect|enable|disable
+komo skills archive|restore            # retire an active skill / bring it back
+komo skills audit [name]               # one skill's loads, or all ranked coldest-first
 komo policy list|check|saved       # permission policy: config rules + job grants + saved grants
 komo journey                       # learning timeline (memories + skills)
 komo channel list|probe|setup      # channel inventory / verification / interactive setup
@@ -264,6 +266,13 @@ call the same functions, which is what keeps validation from forking.
   `skill`, `cron`, `ask_user` (clarify), `logs` (tail of komo's own
   tracing log — file lookup shared with `komo logs` via `komo-infra`'s `logs`, same
   deny-only file-read gate as `read`).
+- `komo-agent`'s `reviewer` — the post-turn extraction pass. It sees the
+  transcript only: `runtime` persists user and assistant messages, never tool
+  results, so the reviewer has **not** read any skill it proposes to change.
+  A proposal naming an existing active skill therefore goes through a second
+  aux call (`grounded_rewrite`) that is handed the real body and returns the
+  complete replacement; failing to ground drops the proposal rather than writing
+  the blind one. New skills need no second pass.
 - `komo-agent`'s `delegate` — sub-agent as a real agent turn on a `delegate:<uuid>`
   session; inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
@@ -359,12 +368,23 @@ call the same functions, which is what keeps validation from forking.
   turn (the ledger is an audit record, not a checkpoint); `recoverable` is set
   only by crash reconciliation, cleared at-most-once, never auto-resumed.
 - `domain/skill.rs` + `komo-infra`'s `skills` + `services/skill_registry.rs` —
-  skills are `SKILL.md` files under `~/.komo/skills/` (active) and
-  `.candidates/` (proposals). Automated writes (`save` — reviewer + `skill
-  learn`) only ever produce candidates; `install` is the human-in-the-loop
+  skills are `SKILL.md` files under `~/.komo/skills/` (active), `.candidates/`
+  (proposals), and `.archive/` (retired — `komo skills archive|restore`; nothing
+  here ever deletes an active skill). Automated writes (`save` — reviewer +
+  `skill learn`) only ever produce candidates; `install` is the human-in-the-loop
   exception that lands active. `protected` skills refuse even proposals.
-  `SkillRegistry` re-scans dirs on every query (no restart needed); only the
-  capped prompt catalog is a startup snapshot (cache stability).
+  A `promote` that overwrites an active body rolls the old one into
+  `.history/<name>/` — the automated path proposes *whole* bodies, so the
+  overwrite has to be recoverable. `SkillRegistry` re-scans dirs on every query
+  (no restart needed); only the capped prompt catalog is a startup snapshot
+  (cache stability). That catalog — and **only** that catalog — is gated by
+  `SkillOffer` (frontmatter `platforms:` / `requires_tools:`, evaluated per
+  runtime at wiring against its own registered tool set): an always-on prompt
+  line is the one place an irrelevant skill costs tokens every turn. It is never
+  a load gate; `skill` view/list and every `komo skills` command ignore it.
+  Usage is **derived**, never counted: `komo skills audit` rolls `skill view`
+  ledger steps up per skill (`domain/run.rs`'s `skill_viewed`), so it reaches
+  only as far back as the disposable `state.db` does.
 - `komo-agent`'s `daemon` — `Maintenance` sweeps under `supervise` (circuit breaker
   after 5 failures): `ReviewSweep` (via the shared `ReviewCoordinator`, which
   also serves the post-turn trigger — watermark + in-flight guard prevent

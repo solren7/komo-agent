@@ -152,6 +152,10 @@ impl Tool for SkillTool {
                     protected: false,
                     disabled: false,
                     source: SOURCE_LEARNED.to_string(),
+                    // Ungated: offer gating is an operator judgment about where a
+                    // skill is worth advertising, not something to infer from a turn.
+                    platforms: Vec::new(),
+                    requires_tools: Vec::new(),
                 };
                 // `save` writes a *candidate* (never an active skill): the same
                 // triage ladder as the reviewer, and it refuses a protected
@@ -268,6 +272,8 @@ mod tests {
             protected: false,
             disabled: false,
             source: "user".to_string(),
+            platforms: Vec::new(),
+            requires_tools: Vec::new(),
         }]))
     }
 
@@ -316,6 +322,8 @@ mod tests {
                 protected: false,
                 disabled: true,
                 source: "user".to_string(),
+                platforms: Vec::new(),
+                requires_tools: Vec::new(),
             }])),
             store("disabled"),
         );
@@ -500,6 +508,8 @@ mod tests {
                 protected: false,
                 disabled: false,
                 source: komo_core::domain::skill::SOURCE_LEARNED.to_string(),
+                platforms: Vec::new(),
+                requires_tools: Vec::new(),
             })
             .await
             .unwrap();

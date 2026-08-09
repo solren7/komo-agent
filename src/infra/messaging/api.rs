@@ -370,6 +370,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/cron", get(list_cron_jobs))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/{name}/audit", get(skill_audit))
+        .route("/api/skills/usage", get(skill_usage))
         .route("/api/pairings", get(list_pairings))
         .route("/api/dream", get(dream_preview))
         .route("/api/interactions/{session}", get(get_interactions))
@@ -1491,6 +1492,13 @@ async fn skill_audit(
 ) -> Result<Json<Value>, ApiError> {
     let invocations = state.actions.skill_audit(&name).await?;
     Ok(Json(json!({ "invocations": invocations })))
+}
+
+/// Every active skill ranked coldest-first (backs the name-less `komo skills
+/// audit`). Same ledger derivation, rolled up instead of filtered.
+async fn skill_usage(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let usage = state.actions.skill_usage().await?;
+    Ok(Json(json!({ "usage": usage })))
 }
 
 /// Pairings (backs `komo pair list`). A hash-free view — the salted code hash

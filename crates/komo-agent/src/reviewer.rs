@@ -38,26 +38,71 @@ impl ReflectiveReviewer {
             tasks,
         }
     }
-}
 
-#[async_trait]
-impl Reviewer for ReflectiveReviewer {
-    async fn review(&self, session: &Session) -> anyhow::Result<ReviewOutcome> {
-        let prompt = review_prompt(session);
-        let review_session = Session {
+    /// A synthetic single-message session for an aux call.
+    ///
+    /// `model`/`effort` stay empty on purpose: that is what keeps the reviewed
+    /// conversation's model choice from leaking onto the aux model (the same
+    /// invariant every other aux path holds).
+    fn aux_session(&self, session: &Session, prompt: String) -> Session {
+        Session {
             id: format!("review-{}", session.id),
             workspace: session.workspace.clone(),
             messages: vec![Message::user(prompt)],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             title: String::new(),
             status: String::new(),
-            // The reviewer always runs on the aux model: deliberately *not*
-            // inherited from the reviewed session's own model choice.
             model: String::new(),
             effort: String::new(),
-        };
+        }
+    }
 
-        let reply = self.llm.complete(&review_session).await?;
+    /// Fold a proposed change into a skill's **real** body, and return the
+    /// complete replacement — or `None`, which the caller treats as "drop this
+    /// proposal".
+    ///
+    /// This is the read half of read-before-write. The reviewer's transcript is
+    /// user and assistant text only — tool results are never persisted as
+    /// messages — so it has never seen a single skill body, yet `instructions`
+    /// is a *whole* body and `promote` writes it over the active file. Without
+    /// this pass, every update proposal is a rewrite-from-imagination of a file
+    /// the writer never opened.
+    ///
+    /// A failed or empty second pass returns `None` rather than falling back to
+    /// the ungrounded text: dropping a proposal costs one missed improvement,
+    /// writing it costs the operator's skill.
+    async fn grounded_rewrite(
+        &self,
+        session: &Session,
+        current: &Skill,
+        proposed: &str,
+    ) -> Option<String> {
+        let prompt = rewrite_prompt(current, proposed);
+        let reply = match self.llm.complete(&self.aux_session(session, prompt)).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                tracing::warn!(%error, name = %current.name, "grounded skill rewrite failed");
+                return None;
+            }
+        };
+        let body = strip_code_fence(&reply).trim().to_string();
+        (!body.is_empty()).then_some(body)
+    }
+}
+
+#[async_trait]
+impl Reviewer for ReflectiveReviewer {
+    async fn review(&self, session: &Session) -> anyhow::Result<ReviewOutcome> {
+        // The catalog is what lets the model target an *existing* skill by its
+        // real name instead of inventing a near-duplicate. It has never been in
+        // this prompt, which is why the skill ladder's "patch an existing
+        // skill" steps had nothing to aim at.
+        let catalog = skill_catalog(&self.skills.list().await.unwrap_or_default());
+        let prompt = review_prompt(session, &catalog);
+        let reply = self
+            .llm
+            .complete(&self.aux_session(session, prompt))
+            .await?;
         let Some(suggestions) = parse_suggestions(&reply)? else {
             return Ok(ReviewOutcome::default());
         };
@@ -135,16 +180,48 @@ impl Reviewer for ReflectiveReviewer {
             if existing.as_ref().is_some_and(|s| s.protected) {
                 continue;
             }
+            // Read-before-write: a proposal that replaces an existing skill is
+            // re-derived from that skill's real body first. New skills have
+            // nothing to read, so they go through as written.
+            let instructions = match &existing {
+                Some(current) => {
+                    match self
+                        .grounded_rewrite(session, current, &suggestion.instructions)
+                        .await
+                    {
+                        Some(body) => body,
+                        None => {
+                            tracing::info!(
+                                name = %suggestion.name,
+                                "skill update proposal dropped — could not ground it in the current body"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                None => suggestion.instructions,
+            };
             let skill = Skill {
                 name: suggestion.name,
                 description: suggestion
                     .description
                     .or_else(|| existing.as_ref().map(|s| s.description.clone()))
                     .unwrap_or_default(),
-                instructions: suggestion.instructions,
+                instructions,
                 protected: false,
                 disabled: false,
                 source: SOURCE_REVIEWER.to_string(),
+                // Offer gating is the operator's, not the reviewer's: an update
+                // proposal inherits it so promoting one can't quietly widen
+                // where a platform- or tool-gated skill gets advertised.
+                platforms: existing
+                    .as_ref()
+                    .map(|s| s.platforms.clone())
+                    .unwrap_or_default(),
+                requires_tools: existing
+                    .as_ref()
+                    .map(|s| s.requires_tools.clone())
+                    .unwrap_or_default(),
             };
             // `save` writes a *candidate* (never an active skill) — automated
             // extraction goes through triage like memory candidates. A refused
@@ -218,16 +295,60 @@ fn fnv1a(text: &str) -> u64 {
     hash
 }
 
-fn review_prompt(session: &Session) -> String {
+/// `- name: description` lines for the active skills, or empty when there are
+/// none. Descriptions only — bodies are what the second pass is for.
+fn skill_catalog(skills: &[Skill]) -> String {
+    skills
+        .iter()
+        .filter(|skill| !skill.disabled)
+        .map(|skill| format!("- {}: {}", skill.name, skill.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The second pass: the model is shown the skill it asked to change, and
+/// returns the whole updated body. Deliberately prose-in/prose-out — there is
+/// one value to produce, so wrapping it in JSON would only add a parse that can
+/// fail.
+fn rewrite_prompt(current: &Skill, proposed: &str) -> String {
+    format!(
+        "You proposed a change to the existing skill `{}`. Below is its CURRENT body \
+         — the text you are replacing — followed by what you proposed.\n\n\
+         Return ONLY the complete updated skill body: the full replacement text, no \
+         diff, no summary, no commentary, no frontmatter. Keep everything in the \
+         current body that your change does not specifically improve; you are editing \
+         a file someone else wrote, not rewriting it from scratch. If the current body \
+         already covers your change, return it unchanged.\n\n\
+         CURRENT body of `{}`:\n---\n{}\n---\n\n\
+         Proposed change:\n---\n{proposed}\n---",
+        current.name, current.name, current.instructions
+    )
+}
+
+fn review_prompt(session: &Session, catalog: &str) -> String {
     let transcript = session
         .messages
         .iter()
         .map(render_message)
         .collect::<Vec<_>>()
         .join("\n\n");
+    // Naming an existing skill means "change this one". Say so explicitly, and
+    // say that the body is not here — otherwise the model writes a replacement
+    // body for a file it has never read, which is exactly what the second pass
+    // exists to prevent.
+    let existing = if catalog.is_empty() {
+        "There are no existing skills yet; any skill you return is a new one.\n\n".to_string()
+    } else {
+        format!(
+            "Existing skills (name: description) — return one of these exact names to \
+             change it, or a new name to create one. You are NOT shown their bodies: \
+             when changing one, write `instructions` as the change you want made, and \
+             it will be folded into the real body for you.\n{catalog}\n\n"
+        )
+    };
 
     format!(
-        "{SELF_REVIEW_PROMPT}\n\nReturn only JSON in this exact shape:\n\
+        "{SELF_REVIEW_PROMPT}\n\n{existing}Return only JSON in this exact shape:\n\
          {{\"memories\":[{{\"kind\":\"profile|preference|feedback|project|person|fact|decision|reference\",\"content\":\"...\"}}],\
          \"skills\":[{{\"name\":\"class-level-skill-name\",\"description\":\"...\",\
          \"instructions\":\"full patched skill body\"}}],\
@@ -291,6 +412,12 @@ fn parse_suggestions(reply: &str) -> anyhow::Result<Option<ReviewSuggestions>> {
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(json)?))
+}
+
+/// The second pass returns prose, not JSON, but the fence handling is the same:
+/// models wrap a returned document in a code fence about half the time.
+fn strip_code_fence(reply: &str) -> &str {
+    extract_json(reply)
 }
 
 fn extract_json(reply: &str) -> &str {
@@ -447,6 +574,152 @@ mod tests {
             model: String::new(),
             effort: String::new(),
         }
+    }
+
+    // ── skill extraction ───────────────────────────────────────────────────────
+
+    /// Replies handed out in order, with every prompt it was asked recorded —
+    /// the two-pass skill path is only correct if the *second* prompt carries
+    /// the current body, so the test has to see the prompts.
+    #[derive(Default)]
+    struct ScriptedLlm {
+        replies: Mutex<std::collections::VecDeque<String>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedLlm {
+        fn new(replies: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies.iter().map(|r| r.to_string()).collect()),
+                prompts: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ScriptedLlm {
+        async fn complete(&self, session: &Session) -> anyhow::Result<String> {
+            self.prompts
+                .lock()
+                .unwrap()
+                .push(session.messages[0].content.clone());
+            Ok(self.replies.lock().unwrap().pop_front().unwrap_or_default())
+        }
+    }
+
+    fn active_skill(name: &str, body: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: format!("does {name}"),
+            instructions: body.to_string(),
+            protected: false,
+            disabled: false,
+            source: "user".to_string(),
+            platforms: Vec::new(),
+            requires_tools: Vec::new(),
+        }
+    }
+
+    fn skill_reviewer(
+        llm: Arc<ScriptedLlm>,
+        existing: Vec<Skill>,
+    ) -> (ReflectiveReviewer, Arc<FakeSkills>) {
+        let skills = Arc::new(FakeSkills(Mutex::new(existing)));
+        let reviewer = ReflectiveReviewer::new(
+            llm,
+            Arc::new(FakeMemories::default()),
+            skills.clone(),
+            Arc::new(FakeTasks::default()),
+        );
+        (reviewer, skills)
+    }
+
+    const PATCH_DEPLOY: &str = r#"{"memories":[],"commitments":[],"skills":[{"name":"deploy","description":"ship it","instructions":"also run the tests first"}]}"#;
+
+    /// The hole this closes: the reviewer never sees a skill body (tool results
+    /// are not persisted as messages), so an update proposal is written blind
+    /// and `promote` writes it over the real file. The second pass is the read.
+    #[tokio::test]
+    async fn an_update_proposal_is_rewritten_against_the_real_body() {
+        let llm = ScriptedLlm::new(&[PATCH_DEPLOY, "STEP ONE\nSTEP TWO\nSTEP THREE: run tests"]);
+        let (reviewer, skills) = skill_reviewer(
+            llm.clone(),
+            vec![active_skill("deploy", "STEP ONE\nSTEP TWO")],
+        );
+
+        let outcome = reviewer.review(&session("api:1")).await.unwrap();
+        assert_eq!(outcome.skills_written, ["deploy"]);
+
+        let prompts = llm.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2, "an update takes a grounding pass");
+        // Pass 1 knows the skill exists, but not what it says.
+        assert!(prompts[0].contains("deploy: does deploy"));
+        assert!(!prompts[0].contains("STEP TWO"));
+        // Pass 2 is handed the actual file plus the requested change.
+        assert!(prompts[1].contains("STEP ONE\nSTEP TWO"));
+        assert!(prompts[1].contains("also run the tests first"));
+
+        // What gets written is the grounded body, never the blind proposal.
+        let written = skills.0.lock().unwrap();
+        let candidate = written
+            .iter()
+            .find(|s| s.source == SOURCE_REVIEWER)
+            .unwrap();
+        assert!(candidate.instructions.contains("STEP TWO"));
+        assert!(candidate.instructions.contains("run tests"));
+        assert!(!candidate.instructions.contains("also run the tests first"));
+    }
+
+    /// Failing to ground drops the proposal — it must never fall back to the
+    /// blind body, which is the exact thing being guarded against.
+    #[tokio::test]
+    async fn an_ungroundable_update_is_dropped_not_written() {
+        // Second pass yields nothing usable.
+        let llm = ScriptedLlm::new(&[PATCH_DEPLOY, "   "]);
+        let (reviewer, skills) =
+            skill_reviewer(llm, vec![active_skill("deploy", "STEP ONE\nSTEP TWO")]);
+
+        let outcome = reviewer.review(&session("api:1")).await.unwrap();
+        assert!(outcome.skills_written.is_empty());
+        let written = skills.0.lock().unwrap();
+        assert!(written.iter().all(|s| s.source != SOURCE_REVIEWER));
+    }
+
+    /// A brand-new skill has no body to read, so it costs no second call and
+    /// goes through exactly as proposed.
+    #[tokio::test]
+    async fn a_new_skill_needs_no_grounding_pass() {
+        let llm = ScriptedLlm::new(&[PATCH_DEPLOY]);
+        let (reviewer, skills) = skill_reviewer(llm.clone(), Vec::new());
+
+        let outcome = reviewer.review(&session("api:1")).await.unwrap();
+        assert_eq!(outcome.skills_written, ["deploy"]);
+        assert_eq!(llm.prompts.lock().unwrap().len(), 1);
+        assert_eq!(
+            skills.0.lock().unwrap()[0].instructions,
+            "also run the tests first"
+        );
+    }
+
+    /// Protection still wins before any of this: no grounding call, no proposal.
+    #[tokio::test]
+    async fn a_protected_skill_is_never_even_grounded() {
+        let mut protected = active_skill("deploy", "STEP ONE");
+        protected.protected = true;
+        let llm = ScriptedLlm::new(&[PATCH_DEPLOY, "rewritten"]);
+        let (reviewer, skills) = skill_reviewer(llm.clone(), vec![protected]);
+
+        let outcome = reviewer.review(&session("api:1")).await.unwrap();
+        assert!(outcome.skills_written.is_empty());
+        assert_eq!(llm.prompts.lock().unwrap().len(), 1);
+        assert!(
+            skills
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|s| s.source != SOURCE_REVIEWER)
+        );
     }
 
     // ── commitment extraction ──────────────────────────────────────────────────

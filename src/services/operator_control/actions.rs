@@ -12,6 +12,7 @@ use komo_services::cron_actions;
 /// Re-exported so every operator-control caller keeps naming one place for
 /// the unknown-job message, wherever the implementation lives.
 pub use komo_services::cron_actions::no_cron_job_message;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::domain::cron::{CronJob, CronJobRepository, CronJobSpec};
@@ -24,7 +25,9 @@ use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
 use crate::domain::reminder::{Reminder, ReminderRepository};
 use crate::domain::repository::{MessageRepository, SessionRepository, SkillRepository};
-use crate::domain::run::{Run, RunRepository, RunStep, resume_prompt, step_views_skill};
+use crate::domain::run::{
+    Run, RunRepository, RunStep, resume_prompt, skill_viewed, step_views_skill,
+};
 use crate::domain::session::Session;
 use crate::domain::skill::Skill;
 use crate::domain::task::{Task, TaskRepository};
@@ -32,7 +35,7 @@ use crate::domain::task::{Task, TaskRepository};
 use super::now;
 use super::request::{
     DreamItem, DreamReport, MemoryTransitionAction, PairingView, SessionSummary, SkillInvocation,
-    WikiHitView, WikiIndexView, WikiStatusView,
+    SkillUsage, WikiHitView, WikiIndexView, WikiStatusView,
 };
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::wiki::{DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, WikiIndex, diversify};
@@ -294,6 +297,14 @@ impl OperatorActions {
         Ok(skill_invocations(steps, name, AUDIT_RESULT_CAP))
     }
 
+    /// Every active skill ranked coldest-first — the aggregate the per-name
+    /// audit could not answer ("which of these has nobody used?").
+    pub async fn skill_usage(&self) -> anyhow::Result<Vec<SkillUsage>> {
+        let steps = self.runs.steps_by_tool("skill", AUDIT_SCAN_LIMIT).await?;
+        let names = self.skills.list().await?.into_iter().map(|s| s.name);
+        Ok(skill_usage(names, steps))
+    }
+
     pub async fn pairing_views(&self) -> anyhow::Result<Vec<PairingView>> {
         Ok(pairing_views(self.pairings.list().await?, now()))
     }
@@ -509,6 +520,50 @@ pub fn skill_invocations(steps: Vec<RunStep>, name: &str, cap: usize) -> Vec<Ski
         .collect()
 }
 
+/// Roll `skill`-tool steps up into one row per skill, coldest first (never
+/// loaded, then least recently loaded). Skills are named by the caller rather
+/// than discovered from the steps, so a skill nobody has ever touched — the
+/// whole point of the report — still gets a row.
+pub fn skill_usage(
+    names: impl IntoIterator<Item = String>,
+    steps: Vec<RunStep>,
+) -> Vec<SkillUsage> {
+    let mut rows: BTreeMap<String, SkillUsage> = names
+        .into_iter()
+        .map(|name| {
+            (
+                name.clone(),
+                SkillUsage {
+                    name,
+                    views: 0,
+                    last_at: None,
+                },
+            )
+        })
+        .collect();
+    for step in steps {
+        let Some(name) = skill_viewed(&step) else {
+            continue;
+        };
+        // A view of a skill that is no longer active still counts: it says the
+        // ledger knows this name, which is exactly what a `restore` decision
+        // wants. It just has no row unless the caller named it.
+        let Some(row) = rows.get_mut(&name) else {
+            continue;
+        };
+        row.views += 1;
+        row.last_at = Some(
+            row.last_at
+                .map_or(step.started_at, |at| at.max(step.started_at)),
+        );
+    }
+    let mut rows: Vec<SkillUsage> = rows.into_values().collect();
+    // `None` sorts before `Some`, so never-used lands first; ties keep the
+    // BTreeMap's name order so the report is stable between runs.
+    rows.sort_by(|a, b| a.last_at.cmp(&b.last_at).then_with(|| a.name.cmp(&b.name)));
+    rows
+}
+
 /// Classify the memory library into the dreaming dry-run report: which
 /// candidates would promote (strongest case first) and which would archive.
 /// The same `dream_verdict` the sweep applies — this only *previews* it.
@@ -549,6 +604,65 @@ mod tests {
         let mut s = Session::new(id);
         s.status = status.to_string();
         s
+    }
+
+    fn skill_step(args: String, at: i64) -> RunStep {
+        RunStep {
+            run_id: "run".to_string(),
+            seq: 1,
+            tool_name: "skill".to_string(),
+            args,
+            result: "done".to_string(),
+            error: String::new(),
+            ok: true,
+            started_at: at,
+            ended_at: at,
+            elapsed_ms: 1,
+            structured: serde_json::Value::Null,
+            output_paths: Vec::new(),
+        }
+    }
+
+    fn view_step(skill: &str, at: i64) -> RunStep {
+        skill_step(format!(r#"{{"action":"view","name":"{skill}"}}"#), at)
+    }
+
+    /// The report's reason to exist: a skill nobody has loaded still gets a row,
+    /// and it sorts first.
+    #[test]
+    fn skill_usage_ranks_never_used_skills_first() {
+        let names = ["cold", "warm", "hot"].map(str::to_string);
+        let steps = vec![
+            view_step("hot", 300),
+            view_step("hot", 100),
+            view_step("warm", 200),
+            // A view of a skill that is no longer active is not invented into a row.
+            view_step("archived-one", 400),
+        ];
+
+        let rows = skill_usage(names, steps);
+        let shape: Vec<_> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.views, r.last_at))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("cold", 0, None),
+                ("warm", 1, Some(200)),
+                ("hot", 2, Some(300)),
+            ]
+        );
+    }
+
+    /// Non-`view` skill calls (`learn`, `install`) are not uses of a skill.
+    #[test]
+    fn skill_usage_counts_only_view_steps() {
+        let learn = skill_step(r#"{"action":"learn","name":"warm"}"#.to_string(), 500);
+
+        let rows = skill_usage(["warm".to_string()], vec![learn]);
+        assert_eq!(rows[0].views, 0);
+        assert_eq!(rows[0].last_at, None);
     }
 
     /// The repair widens only the ephemeral `api` scopes, leaves a real chat

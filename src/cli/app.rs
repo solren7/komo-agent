@@ -423,15 +423,25 @@ enum SkillsAction {
         /// Skill name
         name: String,
     },
+    /// Retire an active skill: move it out of the catalog, keep the files
+    Archive {
+        /// Skill name
+        name: String,
+    },
+    /// Bring an archived skill back into the active catalog
+    Restore {
+        /// Skill name
+        name: String,
+    },
     /// Show one skill in full: status, provenance, path, history, body
     Inspect {
         /// Skill name
         name: String,
     },
-    /// Which turns loaded this skill (derived from the run ledger)
+    /// Which turns loaded this skill; without a name, every skill coldest-first
     Audit {
-        /// Skill name
-        name: String,
+        /// Skill name (omit for the whole ranking)
+        name: Option<String>,
     },
 }
 
@@ -632,8 +642,12 @@ pub async fn run() -> anyhow::Result<()> {
             SkillsAction::Unprotect { name } => skill::protect(&name, false),
             SkillsAction::Enable { name } => skill::set_enabled(&name, true),
             SkillsAction::Disable { name } => skill::set_enabled(&name, false),
+            SkillsAction::Archive { name } => skill::archive(&name),
+            SkillsAction::Restore { name } => skill::restore(&name),
             SkillsAction::Inspect { name } => skill::inspect(&name),
-            SkillsAction::Audit { name } => skill::audit(&operator(&config).await?, &name).await,
+            SkillsAction::Audit { name } => {
+                skill::audit(&operator(&config).await?, name.as_deref()).await
+            }
         },
         Some(Commands::Journey { limit, since }) => {
             journey::journey(&operator(&config).await?, limit, since).await

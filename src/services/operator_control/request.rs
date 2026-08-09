@@ -18,7 +18,7 @@ use crate::domain::{
 // them here so `operator_control::{SessionSummary, …}` paths are unchanged.
 pub use komo_core::operator_view::{
     DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary, SkillInvocation,
-    WikiHitView, WikiIndexView, WikiStatusView,
+    SkillUsage, WikiHitView, WikiIndexView, WikiStatusView,
 };
 
 /// A read-only operator request. One `query` call per CLI render — the CLI
@@ -43,6 +43,8 @@ pub enum OperatorQuery {
     DreamPreview,
     /// Which turns loaded a skill (derived from the run ledger).
     SkillAudit { name: String },
+    /// Every active skill ranked coldest-first (same ledger derivation).
+    SkillUsage,
     /// The `/sethome` runtime override (`None` when unset).
     HomeOverride,
     /// Note-vault search. Routed like every other operator read so it works
@@ -67,6 +69,7 @@ pub enum OperatorQueryResult {
     Pairings(Vec<PairingView>),
     DreamPreview(DreamReport),
     SkillAudit(Vec<SkillInvocation>),
+    SkillUsage(Vec<SkillUsage>),
     HomeOverride(Option<String>),
     CronJobs(Vec<CronJob>),
     WikiHits(Vec<WikiHitView>),

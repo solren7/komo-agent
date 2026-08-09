@@ -12,6 +12,7 @@ use komo_agent::reviewer::ReflectiveReviewer;
 use komo_agent::runtime::AgentRuntime;
 use komo_agent::system_prompt::SystemPromptBuilder;
 use komo_core::domain::embedding::EmbeddingClient;
+use komo_core::domain::skill::SkillOffer;
 use komo_infra::embedding::OllamaEmbedder;
 use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::permissions_store::PermissionsStore;
@@ -316,15 +317,27 @@ pub async fn build(
 
     // Keep the always-on preamble small: list a bounded catalog, the rest is
     // discoverable on demand via the `skill` tool.
+    //
+    // Built per runtime rather than once, because the catalog is gated on what
+    // *that* runtime offers: a skill restricted to another OS, or one requiring
+    // a tool this runtime never registered (config-absent, or dropped by a
+    // policy deny), is not worth a prompt line every turn. Offer-time only —
+    // `skill` view/list and every `komo skills` command ignore the gating, so a
+    // skill left out of the preamble still loads the moment it's named.
     const SKILL_CATALOG_CAP: usize = 30;
-    let skills_note = (!skills.is_empty()).then(|| {
-        format!(
-            "You have skills (instruction playbooks) available. To use one, call the \
-             `skill` tool with action=view and the skill name to load its instructions, \
-             then follow them. Available skills:\n{}",
-            skills.catalog_capped(SKILL_CATALOG_CAP)
-        )
-    });
+    let skills_note_for = |tool_names: &[String]| -> Option<String> {
+        let catalog = skills.catalog_capped(
+            SKILL_CATALOG_CAP,
+            &SkillOffer::here(tool_names.iter().cloned()),
+        );
+        (!catalog.is_empty()).then(|| {
+            format!(
+                "You have skills (instruction playbooks) available. To use one, call the \
+                 `skill` tool with action=view and the skill name to load its instructions, \
+                 then follow them. Available skills:\n{catalog}"
+            )
+        })
+    };
 
     // The full tool set, parameterized only by its approver — so the main agent
     // and the unattended cron agent share one definition and can never drift.
@@ -475,15 +488,16 @@ pub async fn build(
     //   - it shares the run ledger, so each delegation is auditable on its own.
     // No memory enricher: a sub-agent is a worker, not the user's assistant.
     let subagent_tools = build_full_tools(approver.clone(), None);
-    let subagent_tool_names = subagent_tools
+    let subagent_tool_names: Vec<String> = subagent_tools
         .definitions()
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    let subagent_note = skills_note_for(&subagent_tool_names);
     let subagent_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
             .tools(subagent_tool_names)
-            .skills_note(skills_note.clone())
+            .skills_note(subagent_note)
             .workspace_root(Some(root.clone())),
     );
     let subagent_preamble: PreambleFn = Arc::new(move || subagent_builder.build());
@@ -520,15 +534,16 @@ pub async fn build(
     // project-instruction file, then the day-precision volatile footer. Wrapped
     // in a factory so `complete` rebuilds it per turn (per session) rather than
     // freezing the date at process start — important for the long-lived gateway.
-    let tool_names = tools
+    let tool_names: Vec<String> = tools
         .definitions()
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    let main_note = skills_note_for(&tool_names);
     let prompt_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
             .tools(tool_names)
-            .skills_note(skills_note.clone())
+            .skills_note(main_note)
             .workspace_root(Some(root.clone()))
             // The main agent fields "how do I configure Komo" questions, so it
             // gets the built-in platform manual (wechat login, pairing, …).
@@ -606,17 +621,18 @@ pub async fn build(
     // anyway, just less legibly. A cron job that needs a sub-agent should say so
     // explicitly (its own runtime with the unattended approver), not inherit one.
     let cron_tools = build_full_tools(cron_approver, None);
-    let cron_tool_names = cron_tools
+    let cron_tool_names: Vec<String> = cron_tools
         .definitions()
         .iter()
         .map(|t| t.name().to_string())
         .collect();
     // No operations_manual / user_profile: the cron agent is a background task
     // executor, not the user-facing assistant.
+    let cron_note = skills_note_for(&cron_tool_names);
     let cron_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
             .tools(cron_tool_names)
-            .skills_note(skills_note.clone())
+            .skills_note(cron_note)
             .workspace_root(Some(root.clone())),
     );
     let cron_preamble: PreambleFn = Arc::new(move || cron_builder.build());
@@ -672,15 +688,16 @@ pub async fn build(
         )));
     }
     briefing_tools.drop_policy_denied(&config.runtime.policy.policy);
-    let briefing_tool_names = briefing_tools
+    let briefing_tool_names: Vec<String> = briefing_tools
         .definitions()
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    let briefing_note = skills_note_for(&briefing_tool_names);
     let briefing_builder = Arc::new(
         SystemPromptBuilder::new(&aux_config)
             .tools(briefing_tool_names)
-            .skills_note(skills_note),
+            .skills_note(briefing_note),
     );
     let briefing_preamble: PreambleFn = Arc::new(move || briefing_builder.build());
     // No memory enricher: sweeps must not be fed the user's memory library.

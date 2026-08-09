@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
-use komo_core::domain::skill::Skill;
+use komo_core::domain::skill::{Skill, SkillOffer};
 
 /// Discovers skills from a set of `<name>/SKILL.md` directories.
 ///
@@ -127,9 +127,18 @@ impl SkillRegistry {
 
     /// A capped `- name: description` catalog for the system prompt: lists up to
     /// `max` skills, noting how many more exist (use the `skill` tool to list all).
-    pub fn catalog_capped(&self, max: usize) -> String {
+    ///
+    /// `offer` gates what this always-on surface advertises: a skill whose
+    /// `platforms` exclude this OS, or whose `requires_tools` this runtime did
+    /// not register, is not worth a prompt line every turn. It is **only** hidden
+    /// from this catalog — [`get`](Self::get) and the `skill` tool's `list` stay
+    /// unfiltered, so naming it still loads it (explicit ask = explicit consent).
+    pub fn catalog_capped(&self, max: usize, offer: &SkillOffer) -> String {
         let snapshot = self.snapshot();
-        let enabled: Vec<&Skill> = snapshot.iter().filter(|s| !s.disabled).collect();
+        let enabled: Vec<&Skill> = snapshot
+            .iter()
+            .filter(|s| !s.disabled && s.offered_by(offer))
+            .collect();
         let shown = enabled
             .iter()
             .take(max)
@@ -278,6 +287,8 @@ mod tests {
             protected: false,
             disabled: false,
             source: "user".into(),
+            platforms: Vec::new(),
+            requires_tools: Vec::new(),
         }]);
         assert_eq!(reg.get("fixed").unwrap().skill.instructions, "b");
         assert!(reg.catalog().contains("fixed"));
@@ -312,6 +323,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The whole point of offer gating: it trims the always-on prompt catalog
+    /// and nothing else. A gated-out skill must still resolve by name, or the
+    /// gate has quietly become a load gate.
+    #[test]
+    fn offer_gating_trims_the_catalog_but_never_the_lookup() {
+        let dir = std::env::temp_dir().join("komo_skill_offer_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, front) in [
+            ("plain", ""),
+            ("mac-only", "platforms: [macos]\n"),
+            ("needs-ha", "requires_tools: [homeassistant]\n"),
+        ] {
+            let d = dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n{front}---\nbody"),
+            )
+            .unwrap();
+        }
+
+        let reg = SkillRegistry::load_from_dirs(std::slice::from_ref(&dir));
+        let offer = SkillOffer {
+            platform: "linux".to_string(),
+            tools: HashSet::new(),
+        };
+        let catalog = reg.catalog_capped(10, &offer);
+        assert!(catalog.contains("plain"));
+        assert!(!catalog.contains("mac-only"), "{catalog}");
+        assert!(!catalog.contains("needs-ha"), "{catalog}");
+
+        // Still loadable by name, and still listed by the unfiltered catalog the
+        // `skill` tool's discovery action uses.
+        assert!(reg.get("mac-only").is_some());
+        assert!(reg.get("needs-ha").is_some());
+        assert!(reg.catalog().contains("needs-ha"));
+
+        // Supply the tool and the platform, and both come back.
+        let offer = SkillOffer {
+            platform: "macos".to_string(),
+            tools: HashSet::from(["homeassistant".to_string()]),
+        };
+        let catalog = reg.catalog_capped(10, &offer);
+        assert!(catalog.contains("mac-only"));
+        assert!(catalog.contains("needs-ha"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn all_disabled_counts_as_empty() {
         let reg = SkillRegistry::new(vec![Skill {
@@ -321,6 +381,8 @@ mod tests {
             protected: false,
             disabled: true,
             source: "user".into(),
+            platforms: Vec::new(),
+            requires_tools: Vec::new(),
         }]);
         assert!(reg.is_empty());
         assert!(reg.catalog().is_empty());

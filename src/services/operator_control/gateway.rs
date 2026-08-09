@@ -42,6 +42,9 @@ impl GatewayOperatorAdapter {
             OperatorQuery::SkillAudit { name } => {
                 OperatorQueryResult::SkillAudit(self.client.skill_audit(&name).await?)
             }
+            OperatorQuery::SkillUsage => {
+                OperatorQueryResult::SkillUsage(self.client.skill_usage().await?)
+            }
             OperatorQuery::HomeOverride => {
                 OperatorQueryResult::HomeOverride(self.client.home_override().await?)
             }

@@ -349,14 +349,23 @@ pub trait RunRepository: Send + Sync {
 /// the ledger — a skill "used" is exactly a skill viewed; no usage counters are
 /// stored anywhere (roadmap §9 / "no dead fields").
 pub fn step_views_skill(step: &RunStep, skill_name: &str) -> bool {
+    skill_viewed(step).is_some_and(|name| name == skill_name)
+}
+
+/// The skill a ledger step loaded, or `None` when the step is not a `skill`
+/// `view`. The aggregate usage report bucket-sorts on this, so it must stay the
+/// single definition of "used" that [`step_views_skill`] also answers with.
+pub fn skill_viewed(step: &RunStep) -> Option<String> {
     if step.tool_name != "skill" {
-        return false;
+        return None;
     }
-    let Ok(args) = serde_json::from_str::<serde_json::Value>(&step.args) else {
-        return false;
-    };
-    args.get("action").and_then(|v| v.as_str()) == Some("view")
-        && args.get("name").and_then(|v| v.as_str()) == Some(skill_name)
+    let args = serde_json::from_str::<serde_json::Value>(&step.args).ok()?;
+    if args.get("action").and_then(|v| v.as_str()) != Some("view") {
+        return None;
+    }
+    args.get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

@@ -26,6 +26,8 @@ struct ReadableSkill {
     status: &'static str,
     path: PathBuf,
     history: Vec<String>,
+    /// Prior active bodies a promote overwrote (`.history/<name>/`).
+    prior_active: Vec<String>,
 }
 
 fn find_readable_skill(
@@ -39,6 +41,7 @@ fn find_readable_skill(
             status: "active",
             path: managed.active_path(name),
             history: managed.candidate_history(name),
+            prior_active: managed.active_history(name),
         });
     }
     if let Some(found) = shared.and_then(|shared| {
@@ -47,15 +50,26 @@ fn find_readable_skill(
             status: "shared (read-only)",
             path: shared.active_path(name),
             history: Vec::new(),
+            prior_active: Vec::new(),
         })
     }) {
         return Some(found);
     }
-    managed.find_candidate(name).map(|skill| ReadableSkill {
+    if let Some(skill) = managed.find_candidate(name) {
+        return Some(ReadableSkill {
+            skill,
+            status: "candidate",
+            path: managed.candidate_path(name),
+            history: managed.candidate_history(name),
+            prior_active: managed.active_history(name),
+        });
+    }
+    managed.find_archived(name).map(|skill| ReadableSkill {
         skill,
-        status: "candidate",
-        path: managed.candidate_path(name),
-        history: managed.candidate_history(name),
+        status: "archived",
+        path: managed.archived_path(name),
+        history: Vec::new(),
+        prior_active: managed.active_history(name),
     })
 }
 
@@ -67,6 +81,7 @@ pub fn list() -> anyhow::Result<()> {
     let shared = shared_store();
     let active = managed.list_active();
     let candidates = managed.list_candidates();
+    let archived = managed.list_archived();
     let managed_names = active
         .iter()
         .map(|skill| skill.name.as_str())
@@ -79,7 +94,8 @@ pub fn list() -> anyhow::Result<()> {
         .filter(|skill| !managed_names.contains(skill.name.as_str()))
         .collect::<Vec<_>>();
 
-    if active.is_empty() && candidates.is_empty() && shared_skills.is_empty() {
+    if active.is_empty() && candidates.is_empty() && shared_skills.is_empty() && archived.is_empty()
+    {
         println!(
             "No skills in {} or ~/.agents/skills.",
             managed.root().display()
@@ -111,6 +127,12 @@ pub fn list() -> anyhow::Result<()> {
                 skill.source,
                 oneline(&skill.description, 80)
             );
+        }
+    }
+    if !archived.is_empty() {
+        println!("archived (`komo skills restore <name>`):");
+        for skill in &archived {
+            println!("  {}  {}", skill.name, oneline(&skill.description, 80));
         }
     }
     Ok(())
@@ -182,6 +204,28 @@ pub fn reject(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Retire an active skill without deleting it: the whole directory moves to
+/// `.archive/`, out of every scan. `disable` is the lighter form (the skill
+/// stays in place); archive is for skills you're done with but won't discard.
+pub fn archive(name: &str) -> anyhow::Result<()> {
+    let managed = store();
+    let skill = managed.archive(name)?;
+    println!(
+        "Archived `{}` → {}. Bring it back with `komo skills restore {}`. {RELOAD_HINT}",
+        skill.name,
+        managed.archive_root().display(),
+        skill.name
+    );
+    Ok(())
+}
+
+/// Move an archived skill back into the active catalog.
+pub fn restore(name: &str) -> anyhow::Result<()> {
+    let skill = store().restore(name)?;
+    println!("Restored `{}` to active. {RELOAD_HINT}", skill.name);
+    Ok(())
+}
+
 /// Set or clear `protected`: a protected skill is operator-edit-only — the
 /// reviewer stops writing even candidate proposals for it.
 pub fn protect(name: &str, on: bool) -> anyhow::Result<()> {
@@ -239,11 +283,34 @@ pub fn inspect(name: &str) -> anyhow::Result<()> {
     if !skill.description.is_empty() {
         println!("describes  {}", skill.description);
     }
+    // Offer gating trims the agent's always-on catalog only, so say so — an
+    // operator seeing `platforms` here should not think the skill is unusable.
+    if !skill.platforms.is_empty() || !skill.requires_tools.is_empty() {
+        let mut gates = Vec::new();
+        if !skill.platforms.is_empty() {
+            gates.push(format!("platforms {}", skill.platforms.join("/")));
+        }
+        if !skill.requires_tools.is_empty() {
+            gates.push(format!("needs tool {}", skill.requires_tools.join(" + ")));
+        }
+        println!(
+            "offered    {} — catalog only; always loadable by name",
+            gates.join(", ")
+        );
+    }
     if !found.history.is_empty() {
         println!(
-            "history    {} prior version(s): {}",
+            "proposals  {} prior candidate version(s): {}",
             found.history.len(),
             found.history.join(", ")
+        );
+    }
+    if !found.prior_active.is_empty() {
+        println!(
+            "replaced   {} prior active body(ies) kept in {}: {}",
+            found.prior_active.len(),
+            managed.root().join(".history").join(&skill.name).display(),
+            found.prior_active.join(", ")
         );
     }
     println!("audit      `komo skills audit {name}` shows which turns loaded it");
@@ -252,8 +319,12 @@ pub fn inspect(name: &str) -> anyhow::Result<()> {
 }
 
 /// Which turns loaded this skill — derived from the run ledger (`skill view`
-/// steps), so it needs the db, i.e. the operator surface.
-pub async fn audit(control: &OperatorControl, name: &str) -> anyhow::Result<()> {
+/// steps), so it needs the db, i.e. the operator surface. Without a name,
+/// the whole catalog ranked coldest-first.
+pub async fn audit(control: &OperatorControl, name: Option<&str>) -> anyhow::Result<()> {
+    let Some(name) = name else {
+        return usage(control).await;
+    };
     let OperatorQueryResult::SkillAudit(invocations) = control
         .query(OperatorQuery::SkillAudit {
             name: name.to_string(),
@@ -277,6 +348,44 @@ pub async fn audit(control: &OperatorControl, name: &str) -> anyhow::Result<()> 
         );
     }
     println!("\n(`komo run inspect <id>` shows the full turn.)");
+    Ok(())
+}
+
+/// Every active skill, coldest first. Nothing stores a usage counter — this is
+/// re-derived from the run ledger on every call, so it only sees as far back as
+/// the ledger still reaches (and `state.db` is disposable by design).
+async fn usage(control: &OperatorControl) -> anyhow::Result<()> {
+    let OperatorQueryResult::SkillUsage(rows) = control.query(OperatorQuery::SkillUsage).await?
+    else {
+        unreachable!("SkillUsage query answers with SkillUsage");
+    };
+    if rows.is_empty() {
+        println!("No active skills.");
+        return Ok(());
+    }
+    let width = rows
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(4);
+    for row in &rows {
+        let last = match row.last_at {
+            Some(at) => local_time(at),
+            None => "never".to_string(),
+        };
+        println!(
+            "  {:width$}  {:>4} view(s)  last {}",
+            row.name,
+            row.views,
+            last,
+            width = width
+        );
+    }
+    println!(
+        "\n(Derived from the run ledger, not a stored counter — `never` means \
+         \"not in the ledger's window\", not \"never in its life\".)\n\
+         (`komo skills audit <name>` shows the individual turns.)"
+    );
     Ok(())
 }
 

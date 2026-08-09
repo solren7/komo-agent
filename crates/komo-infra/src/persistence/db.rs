@@ -1367,6 +1367,10 @@ fn skill_from_record(record: SkillRecord) -> Skill {
         // Every db-era skill was a reviewer extraction (there was no other
         // writer); tag it so the imported candidate shows its provenance.
         source: komo_core::domain::skill::SOURCE_REVIEWER.to_string(),
+        // The db schema predates offer gating: ungated, like any skill that
+        // declares neither key.
+        platforms: Vec::new(),
+        requires_tools: Vec::new(),
     }
 }
 

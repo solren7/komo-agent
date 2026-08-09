@@ -10,6 +10,10 @@
 ///   catalog; `skill view` reports it as disabled instead of loading it.
 /// - `source`: provenance — `user` (hand-written, the default) or `reviewer`
 ///   (extracted by the reflective reviewer).
+///
+/// Two further keys gate where a skill is *offered* — see [`SkillOffer`]:
+/// - `platforms`: OS list (`[macos]`, `[linux, macos]`).
+/// - `requires_tools`: tool names the skill's procedure depends on.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Skill {
     pub name: String,
@@ -21,6 +25,49 @@ pub struct Skill {
     pub disabled: bool,
     #[serde(default = "default_source")]
     pub source: String,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    #[serde(default)]
+    pub requires_tools: Vec<String>,
+}
+
+/// What this runtime can offer, for **offer-time** skill gating.
+///
+/// This filters the always-on system-prompt catalog only — the surface where an
+/// irrelevant skill costs tokens every single turn. It is deliberately NOT a
+/// load gate: `skill view`, the `skill` tool's `list`, and every `komo skills`
+/// command ignore it, because asking for a skill by name is explicit consent.
+/// A skill gated out of the prompt still works the moment someone names it.
+pub struct SkillOffer {
+    /// `std::env::consts::OS` — `macos` / `linux` / `windows`.
+    pub platform: String,
+    /// Tool names this runtime actually registered (post policy-deny drop).
+    pub tools: std::collections::HashSet<String>,
+}
+
+impl SkillOffer {
+    /// The offer for the current process over `tools`.
+    pub fn here(tools: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            platform: std::env::consts::OS.to_string(),
+            tools: tools.into_iter().collect(),
+        }
+    }
+
+    fn platform_matches(&self, declared: &str) -> bool {
+        normalize_platform(declared) == normalize_platform(&self.platform)
+    }
+}
+
+/// `darwin` is what the rest of the world calls Rust's `macos`; accept both so a
+/// skill copied from another agent's collection still gates correctly.
+fn normalize_platform(value: &str) -> String {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "darwin" => "macos".to_string(),
+        "win32" | "windows" => "windows".to_string(),
+        _ => value,
+    }
 }
 
 /// Provenance values for [`Skill::source`].
@@ -66,7 +113,12 @@ impl Skill {
         let mut protected = false;
         let mut disabled = false;
         let mut source = default_source();
-        for line in front.lines() {
+        let mut platforms = Vec::new();
+        let mut requires_tools = Vec::new();
+        let lines: Vec<&str> = front.lines().collect();
+        let mut cursor = 0;
+        while let Some(line) = lines.get(cursor) {
+            cursor += 1;
             if let Some(v) = line.strip_prefix("name:") {
                 name = Some(unquote(v.trim()));
             } else if let Some(v) = line.strip_prefix("description:") {
@@ -77,6 +129,10 @@ impl Skill {
                 disabled = v.trim() == "true";
             } else if let Some(v) = line.strip_prefix("source:") {
                 source = unquote(v.trim());
+            } else if let Some(v) = line.strip_prefix("platforms:") {
+                platforms = parse_list(v, &lines, &mut cursor);
+            } else if let Some(v) = line.strip_prefix("requires_tools:") {
+                requires_tools = parse_list(v, &lines, &mut cursor);
             }
         }
 
@@ -91,8 +147,55 @@ impl Skill {
             protected,
             disabled,
             source,
+            platforms,
+            requires_tools,
         })
     }
+
+    /// Whether this skill belongs in `offer`'s always-on catalog.
+    ///
+    /// Platforms are OR (any declared match wins); required tools are AND (the
+    /// procedure needs all of them to be followable). An absent or empty list is
+    /// no constraint, so every existing skill keeps behaving exactly as before.
+    pub fn offered_by(&self, offer: &SkillOffer) -> bool {
+        if !self.platforms.is_empty()
+            && !self
+                .platforms
+                .iter()
+                .any(|declared| offer.platform_matches(declared))
+        {
+            return false;
+        }
+        self.requires_tools
+            .iter()
+            .all(|tool| offer.tools.contains(tool.as_str()))
+    }
+}
+
+/// A frontmatter list value, in either YAML shape: inline (`platforms: [a, b]`)
+/// or a following block of `- item` lines, which `cursor` is advanced past.
+/// Anything else yields an empty list — no constraint.
+fn parse_list(inline: &str, lines: &[&str], cursor: &mut usize) -> Vec<String> {
+    let inline = inline.trim();
+    let items: Vec<String> = if inline.is_empty() {
+        let mut block = Vec::new();
+        while let Some(item) = lines
+            .get(*cursor)
+            .and_then(|line| line.trim_start().strip_prefix("- "))
+        {
+            block.push(unquote(item.trim()));
+            *cursor += 1;
+        }
+        block
+    } else {
+        inline
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|item| unquote(item.trim()))
+            .collect()
+    };
+    items.into_iter().filter(|item| !item.is_empty()).collect()
 }
 
 fn unquote(s: &str) -> String {
@@ -123,6 +226,73 @@ mod tests {
         assert!(skill.protected);
         assert!(skill.disabled);
         assert_eq!(skill.source, SOURCE_REVIEWER);
+    }
+
+    fn offer(platform: &str, tools: &[&str]) -> SkillOffer {
+        SkillOffer {
+            platform: platform.to_string(),
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn parses_offer_lists_in_both_yaml_shapes() {
+        let inline = Skill::parse(
+            "---\nname: a\nplatforms: [macos, linux]\nrequires_tools: [\"homeassistant\"]\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(inline.platforms, ["macos", "linux"]);
+        assert_eq!(inline.requires_tools, ["homeassistant"]);
+
+        let block = Skill::parse(
+            "---\nname: a\nplatforms:\n  - macos\n  - linux\ndescription: after the list\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(block.platforms, ["macos", "linux"]);
+        // The block scan stops at the first non-item line, so later keys survive.
+        assert_eq!(block.description, "after the list");
+    }
+
+    #[test]
+    fn a_skill_declaring_nothing_is_offered_everywhere() {
+        let skill = Skill::parse("---\nname: a\n---\nbody").unwrap();
+        assert!(skill.offered_by(&offer("macos", &[])));
+        assert!(skill.offered_by(&offer("windows", &[])));
+    }
+
+    #[test]
+    fn platforms_gate_on_any_match_and_accept_the_darwin_alias() {
+        let skill = Skill::parse("---\nname: a\nplatforms: [darwin]\n---\nbody").unwrap();
+        assert!(skill.offered_by(&offer("macos", &[])));
+        assert!(!skill.offered_by(&offer("linux", &[])));
+    }
+
+    #[test]
+    fn required_tools_must_all_be_present() {
+        let skill = Skill::parse("---\nname: a\nrequires_tools: [homeassistant, shell]\n---\nbody")
+            .unwrap();
+        assert!(skill.offered_by(&offer("macos", &["homeassistant", "shell", "read"])));
+        assert!(!skill.offered_by(&offer("macos", &["homeassistant"])));
+        assert!(!skill.offered_by(&offer("macos", &[])));
+    }
+
+    /// An empty value has no items to gate on, so the skill stays offered —
+    /// gating is opt-in and a half-written key must not hide a skill.
+    #[test]
+    fn an_empty_list_is_no_constraint() {
+        let skill = Skill::parse("---\nname: a\nplatforms:\ndescription: d\n---\nbody").unwrap();
+        assert!(skill.platforms.is_empty());
+        assert!(skill.offered_by(&offer("linux", &[])));
+    }
+
+    /// A bare scalar (`platforms: macos`) is a common hand-written slip; read it
+    /// as a one-item list rather than as a constraint that matches nothing.
+    #[test]
+    fn a_scalar_reads_as_a_one_item_list() {
+        let skill = Skill::parse("---\nname: a\nplatforms: macos\n---\nbody").unwrap();
+        assert_eq!(skill.platforms, ["macos"]);
+        assert!(skill.offered_by(&offer("macos", &[])));
+        assert!(!skill.offered_by(&offer("linux", &[])));
     }
 
     #[test]

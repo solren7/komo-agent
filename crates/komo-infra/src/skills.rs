@@ -14,6 +14,13 @@
 //!   prefix keeps the registry's directory scan from ever loading it.
 //! - `.candidates/<name>/.history/<ts>.md` — prior candidate versions, rolled
 //!   on overwrite so a re-extraction never silently destroys the last proposal.
+//! - `.history/<name>/<ts>.md` — prior **active** bodies, rolled when a promote
+//!   overwrites one. Kept at the root rather than inside the skill directory
+//!   because the skill dir is a copied tree: `install_active_dir` clears it, and
+//!   `skill view` samples its files into the model's context.
+//! - `.archive/<name>/` — an archived skill's whole tree. Archiving is the
+//!   heaviest thing the operator can do to an active skill and it is reversible
+//!   (`komo skills restore`); nothing in this store deletes an active skill.
 //!
 //! The [`SkillRepository`] impl is the automated write path (the reflective
 //! reviewer): `save` only ever writes a candidate — it never touches an active
@@ -33,8 +40,11 @@ use komo_core::domain::{
 
 /// Directory (under the store root) holding reviewer proposals.
 const CANDIDATES_DIR: &str = ".candidates";
-/// Directory (under a candidate) holding rolled prior versions.
+/// Directory holding rolled prior versions — under a candidate for proposals,
+/// under the store root (keyed by skill name) for overwritten active bodies.
 const HISTORY_DIR: &str = ".history";
+/// Directory (under the store root) holding archived skills.
+const ARCHIVE_DIR: &str = ".archive";
 /// Marker file: the one-time import of legacy `komo.db` skills already ran.
 const DB_IMPORT_MARKER: &str = ".imported-from-db";
 
@@ -81,6 +91,10 @@ impl FsSkillStore {
         self.root.join(CANDIDATES_DIR)
     }
 
+    pub fn archive_root(&self) -> PathBuf {
+        self.root.join(ARCHIVE_DIR)
+    }
+
     pub fn active_path(&self, name: &str) -> PathBuf {
         self.root.join(name).join("SKILL.md")
     }
@@ -89,20 +103,21 @@ impl FsSkillStore {
         self.candidates_root().join(name).join("SKILL.md")
     }
 
+    pub fn archived_path(&self, name: &str) -> PathBuf {
+        self.archive_root().join(name).join("SKILL.md")
+    }
+
     /// Rolled prior versions of a candidate (file names, oldest first) — the
     /// lightweight edit history `skills inspect` shows. Only the reviewer path
     /// rolls history; hand-edited active files are the user's own to version.
     pub fn candidate_history(&self, name: &str) -> Vec<String> {
-        let dir = self.candidates_root().join(name).join(HISTORY_DIR);
-        let Ok(entries) = fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = entries
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
+        history_entries(&self.candidates_root().join(name).join(HISTORY_DIR))
+    }
+
+    /// Prior **active** bodies of a skill (file names, oldest first), rolled by
+    /// [`promote`](Self::promote) when a proposal overwrote one.
+    pub fn active_history(&self, name: &str) -> Vec<String> {
+        history_entries(&self.root.join(HISTORY_DIR).join(name))
     }
 
     /// Active skills (the governed subset the registry loads from this root —
@@ -114,6 +129,17 @@ impl FsSkillStore {
     /// Reviewer proposals awaiting triage.
     pub fn list_candidates(&self) -> Vec<Skill> {
         scan_dir(&self.candidates_root())
+    }
+
+    /// Archived skills — retired from the catalog but recoverable.
+    pub fn list_archived(&self) -> Vec<Skill> {
+        scan_dir(&self.archive_root())
+    }
+
+    pub fn find_archived(&self, name: &str) -> Option<Skill> {
+        valid_skill_name(name)
+            .then(|| read_skill(&self.archived_path(name)))
+            .flatten()
     }
 
     pub fn find_active(&self, name: &str) -> Option<Skill> {
@@ -130,12 +156,68 @@ impl FsSkillStore {
 
     /// Promote a candidate to active (accepting an update proposal overwrites
     /// the active file). The candidate directory is removed afterwards.
+    ///
+    /// An overwritten active body is rolled into `.history/<name>/` first. The
+    /// automated write path proposes a *whole* body, so promoting a weak
+    /// proposal over a hand-written skill would otherwise destroy it with no
+    /// copy anywhere — candidates keep history, active files did not.
     pub fn promote(&self, name: &str) -> anyhow::Result<Skill> {
         let Some(skill) = self.find_candidate(name) else {
             anyhow::bail!("no candidate skill named `{name}`");
         };
+        self.roll_active_history(name)?;
         self.write_active(&skill)?;
         fs::remove_dir_all(self.candidates_root().join(name))?;
+        Ok(skill)
+    }
+
+    /// Copy the current active `SKILL.md` into `.history/<name>/<ts>.md`.
+    /// No active file ⇒ nothing to preserve, so this is a no-op.
+    fn roll_active_history(&self, name: &str) -> anyhow::Result<()> {
+        let current = self.active_path(name);
+        if !current.is_file() {
+            return Ok(());
+        }
+        let dir = self.root.join(HISTORY_DIR).join(name);
+        fs::create_dir_all(&dir)?;
+        let ts = time::OffsetDateTime::now_utc().unix_timestamp();
+        fs::copy(&current, dir.join(format!("{ts}.md")))?;
+        Ok(())
+    }
+
+    /// Retire an active skill: move its whole tree to `.archive/<name>/`. The
+    /// dot prefix hides it from every scan, so the agent stops seeing it while
+    /// the operator keeps the files. Reversible via [`restore`](Self::restore) —
+    /// this store never deletes an active skill.
+    pub fn archive(&self, name: &str) -> anyhow::Result<Skill> {
+        let Some(skill) = self.find_active(name) else {
+            anyhow::bail!("no active skill named `{name}` in {}", self.root.display());
+        };
+        let dest = self.archive_root().join(name);
+        if dest.exists() {
+            anyhow::bail!(
+                "`{name}` is already archived at {} — restore or remove that copy first",
+                dest.display()
+            );
+        }
+        fs::create_dir_all(self.archive_root())?;
+        fs::rename(self.root.join(name), &dest)?;
+        Ok(skill)
+    }
+
+    /// Bring an archived skill back into the active catalog. Refuses to clobber
+    /// an active skill of the same name — the operator resolves that themselves.
+    pub fn restore(&self, name: &str) -> anyhow::Result<Skill> {
+        let Some(skill) = self.find_archived(name) else {
+            anyhow::bail!("no archived skill named `{name}`");
+        };
+        let dest = self.root.join(name);
+        if dest.exists() {
+            anyhow::bail!(
+                "an active skill named `{name}` already exists — archive or rename it first"
+            );
+        }
+        fs::rename(self.archive_root().join(name), &dest)?;
         Ok(skill)
     }
 
@@ -292,6 +374,20 @@ fn read_skill(path: &Path) -> Option<Skill> {
     Skill::parse(&content)
 }
 
+/// Rolled version file names in `dir` (oldest first — the names are unix
+/// timestamps, so lexical order is chronological). Missing dir ⇒ no history.
+fn history_entries(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Recursively copy `src` into `dst` (created if absent), skipping any nested
 /// `.git` directory (defensive — install stages from a subdir, not a clone
 /// root, but a vendored skill could still carry one). Returns the number of
@@ -358,6 +454,17 @@ fn render(skill: &Skill) -> String {
     if skill.disabled {
         front.push_str("disabled: true\n");
     }
+    // Round-tripped so an operator action that rewrites the file (protect,
+    // disable, promote) can never silently drop a skill's offer gating.
+    if !skill.platforms.is_empty() {
+        front.push_str(&format!("platforms: [{}]\n", skill.platforms.join(", ")));
+    }
+    if !skill.requires_tools.is_empty() {
+        front.push_str(&format!(
+            "requires_tools: [{}]\n",
+            skill.requires_tools.join(", ")
+        ));
+    }
     front.push_str(&format!(
         "updated_at: {}\n",
         time::OffsetDateTime::now_utc()
@@ -408,6 +515,8 @@ mod tests {
             protected: false,
             disabled: false,
             source: SOURCE_REVIEWER.to_string(),
+            platforms: Vec::new(),
+            requires_tools: Vec::new(),
         }
     }
 
@@ -462,6 +571,83 @@ mod tests {
         );
         let history = store.candidates_root().join("sync-cal").join(HISTORY_DIR);
         assert_eq!(fs::read_dir(history).unwrap().count(), 1);
+    }
+
+    /// The loss path this guards: the reviewer proposes a whole body, so
+    /// promoting over a hand-written active skill used to destroy it outright.
+    #[tokio::test]
+    async fn promote_rolls_the_overwritten_active_body_into_history() {
+        let store = store("komo_skillstore_active_history");
+        let mut v1 = skill("sync-cal");
+        v1.instructions = "hand-written body".to_string();
+        store.save(&v1).await.unwrap();
+        store.promote("sync-cal").unwrap();
+        // First promote had nothing to overwrite.
+        assert!(store.active_history("sync-cal").is_empty());
+
+        let mut v2 = skill("sync-cal");
+        v2.instructions = "reviewer rewrite".to_string();
+        store.save(&v2).await.unwrap();
+        store.promote("sync-cal").unwrap();
+
+        let history = store.active_history("sync-cal");
+        assert_eq!(history.len(), 1);
+        let rolled = fs::read_to_string(
+            store
+                .root()
+                .join(HISTORY_DIR)
+                .join("sync-cal")
+                .join(&history[0]),
+        )
+        .unwrap();
+        assert!(rolled.contains("hand-written body"));
+        assert!(
+            store
+                .find_active("sync-cal")
+                .unwrap()
+                .instructions
+                .contains("reviewer rewrite")
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_hides_the_skill_and_restore_brings_it_back() {
+        let store = store("komo_skillstore_archive");
+        store.save(&skill("sync-cal")).await.unwrap();
+        store.promote("sync-cal").unwrap();
+        // A supporting file rides along with the tree.
+        fs::write(store.root().join("sync-cal").join("notes.md"), "aside").unwrap();
+
+        store.archive("sync-cal").unwrap();
+        assert!(store.find_active("sync-cal").is_none());
+        assert!(store.list_active().is_empty());
+        assert_eq!(store.list_archived().len(), 1);
+        assert!(store.find_archived("sync-cal").is_some());
+
+        store.restore("sync-cal").unwrap();
+        assert!(store.find_active("sync-cal").is_some());
+        assert!(store.list_archived().is_empty());
+        assert!(store.root().join("sync-cal").join("notes.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn archive_and_restore_refuse_to_clobber() {
+        let store = store("komo_skillstore_archive_clobber");
+        store.save(&skill("sync-cal")).await.unwrap();
+        store.promote("sync-cal").unwrap();
+        store.archive("sync-cal").unwrap();
+
+        assert!(
+            store.archive("sync-cal").is_err(),
+            "nothing active to archive"
+        );
+        // A new active skill of the same name blocks the restore rather than
+        // silently replacing it.
+        store.save(&skill("sync-cal")).await.unwrap();
+        store.promote("sync-cal").unwrap();
+        let err = store.restore("sync-cal").unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert!(store.find_archived("sync-cal").is_some());
     }
 
     #[tokio::test]

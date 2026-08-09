@@ -178,6 +178,24 @@ impl DirectOperatorAdapter {
                     actions::AUDIT_RESULT_CAP,
                 ))
             }
+            // The skill store is files, not a locked db, so the direct adapter
+            // reads it straight rather than routing — same store the gateway's
+            // `OperatorActions` holds.
+            OperatorQuery::SkillUsage => {
+                let steps = RunRepository::steps_by_tool(
+                    self.db().await?.as_ref(),
+                    "skill",
+                    actions::AUDIT_SCAN_LIMIT,
+                )
+                .await?;
+                let names = komo_infra::skills::FsSkillStore::new(
+                    komo_infra::skills::FsSkillStore::default_root(),
+                )
+                .list_active()
+                .into_iter()
+                .map(|skill| skill.name);
+                OperatorQueryResult::SkillUsage(actions::skill_usage(names, steps))
+            }
             OperatorQuery::HomeOverride => OperatorQueryResult::HomeOverride(
                 HomeRepository::get(self.db().await?.as_ref()).await?,
             ),
