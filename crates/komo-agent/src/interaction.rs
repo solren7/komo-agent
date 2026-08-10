@@ -20,7 +20,7 @@
 //! the task-local in `services::tool_execution`.
 
 use komo_services::clarify::ClarifyState;
-use komo_services::tool_execution::{SessionContext, current_session, with_session};
+use komo_services::tool_execution::{SessionContext, SessionOrigin, current_session, with_session};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -793,6 +793,9 @@ impl GatewayDispatcher {
                 dispatcher: this.clone(),
                 session: session.clone(),
             })),
+            // A chat turn is user-driven: policy evaluates it against the
+            // channel, and a human is reachable for an approval prompt.
+            origin: SessionOrigin::User,
         };
         tokio::spawn(async move {
             // Armed until normal completion below. If the task is cancelled

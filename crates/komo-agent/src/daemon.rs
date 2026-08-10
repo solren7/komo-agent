@@ -23,6 +23,7 @@ use chrono::Utc;
 use tracing::{error, info, warn};
 
 use komo_core::domain::{
+    context::{SessionContext, SessionOrigin},
     cron::{CronAction, CronJob, CronJobRepository, CronRunStatus, next_occurrence_local},
     gateway::MessageHandler,
     llm::LlmClient,
@@ -33,6 +34,7 @@ use komo_core::domain::{
     session::Session,
     task::{Task, TaskRepository},
 };
+use komo_services::tool_execution::with_session;
 
 /// Trip the circuit breaker once this many maintenance cycles fail back-to-back.
 /// Tripping no longer kills the service — it forces a cooldown before retrying
@@ -456,9 +458,16 @@ impl CronJobSweep {
             );
         };
         let session_id = format!("cron:{name}:{now}");
-        match handler
-            .handle(&session_id, cron_agent_prompt(prompt, skills))
-            .await
+        // Establish the turn's session *here*, marked unattended, rather than
+        // letting `handle_input` build a plain detached one: that default is
+        // `SessionOrigin::User`, which would hand the policy engine a `cron`
+        // channel and quietly skip its unattended branch.
+        let session = SessionContext::detached(&session_id).with_origin(SessionOrigin::Cron);
+        match with_session(
+            session,
+            handler.handle(&session_id, cron_agent_prompt(prompt, skills)),
+        )
+        .await
         {
             Ok(reply) => {
                 let reply = reply.trim();
@@ -823,9 +832,14 @@ impl Maintenance for BriefingSweep {
         let text = match &self.runtime {
             Some(handler) => {
                 let session_id = format!("briefing:{}", chrono::Local::now().format("%Y-%m-%d"));
-                match handler
-                    .handle(&session_id, agentic_briefing_prompt(&prompt))
-                    .await
+                // Unattended, for the same reason as the cron sweep above.
+                let session =
+                    SessionContext::detached(&session_id).with_origin(SessionOrigin::Briefing);
+                match with_session(
+                    session,
+                    handler.handle(&session_id, agentic_briefing_prompt(&prompt)),
+                )
+                .await
                 {
                     Ok(text) => text,
                     Err(error) => {
@@ -1424,6 +1438,54 @@ mod tests {
                 .push((session_id.to_string(), message));
             Ok(self.reply.clone())
         }
+    }
+
+    /// Records the ambient session the sweep invoked it under. The approver
+    /// reads exactly this, so it is what pins the sweep's half of the
+    /// unattended contract — the `PolicyApprover` tests cover the other half.
+    #[derive(Default)]
+    struct OriginProbe {
+        seen: Mutex<Option<Option<SessionOrigin>>>,
+    }
+
+    #[async_trait]
+    impl MessageHandler for OriginProbe {
+        async fn handle(&self, _session_id: &str, _message: String) -> anyhow::Result<String> {
+            *self.seen.lock().unwrap() =
+                Some(komo_services::tool_execution::current_session().map(|c| c.origin));
+            Ok("done".to_string())
+        }
+    }
+
+    /// A cron turn must reach the runtime already marked unattended. Left to
+    /// `handle_input`'s fallback it would get a plain detached context, whose
+    /// origin is `User` — and the policy engine would read `cron` as a channel.
+    #[tokio::test]
+    async fn cron_agent_job_runs_under_an_unattended_session() {
+        let probe = Arc::new(OriginProbe::default());
+        let (sweep, _repo, _notifier) = cron_sweep_full(
+            vec![agent_job("brief", "do it", vec![])],
+            false,
+            Some(probe.clone()),
+        );
+        sweep.run().await.unwrap();
+        assert_eq!(*probe.seen.lock().unwrap(), Some(Some(SessionOrigin::Cron)));
+    }
+
+    #[tokio::test]
+    async fn briefing_agent_turn_runs_under_an_unattended_session() {
+        let probe = Arc::new(OriginProbe::default());
+        let (mut sweep, _notifier) = briefing_with(
+            vec![Task::new("write report".into())],
+            vec![],
+            "plain compose (must not be used)",
+        );
+        sweep.runtime = Some(probe.clone());
+        sweep.run().await.unwrap();
+        assert_eq!(
+            *probe.seen.lock().unwrap(),
+            Some(Some(SessionOrigin::Briefing))
+        );
     }
 
     fn agent_job(name: &str, prompt: &str, skills: Vec<String>) -> CronJob {

@@ -85,7 +85,14 @@ impl PolicyApprover {
 #[async_trait]
 impl Approver for PolicyApprover {
     async fn decide(&self, request: &ApprovalRequest) -> Decision {
-        let channel = current_session().map(|c| channel_of(&c.session_id));
+        // An unattended turn (cron / briefing) is evaluated channel-lessly even
+        // though it *has* a session: `SessionOrigin` is what says nobody is
+        // watching, and only that makes the engine's unattended branch run —
+        // reading `cron:<job>:<unix>` as a channel would let `default_normal =
+        // allow` and plain (non-`unattended`) allow rules grant there.
+        let channel = current_session()
+            .filter(|c| !c.is_unattended())
+            .map(|c| channel_of(&c.session_id));
 
         // Read-only actions get deny-only evaluation: a deny rule can block a
         // network fetch / file read, but nothing escalates one to a prompt — an
@@ -152,8 +159,14 @@ mod tests {
     use super::*;
     use komo_core::domain::approval::ActionRef;
     use komo_core::domain::policy::{Category, Effect, Matcher, Rule};
-    use komo_services::tool_execution::{SessionContext, with_session};
+    use komo_services::tool_execution::{SessionContext, SessionOrigin, with_session};
     use std::sync::Mutex;
+
+    /// A cron job's turn as the sweep really builds it: it **has** a session
+    /// (id, ledger, session-scoped tools) and is nonetheless unattended.
+    fn cron_ctx() -> SessionContext {
+        SessionContext::detached("cron:ac-temp:1700000000").with_origin(SessionOrigin::Cron)
+    }
 
     struct Recording {
         asked: Mutex<bool>,
@@ -231,6 +244,100 @@ mod tests {
         let allowed = approver.approve(&shell_req()).await;
         assert!(allowed);
         assert!(!*inner.asked.lock().unwrap(), "inner must not be consulted");
+    }
+
+    /// The regression this whole change exists for: a cron turn carries a
+    /// session id (`cron:<job>:<unix>`), so reading a channel off it made the
+    /// engine's unattended branch unreachable. A plain allow rule — no
+    /// `unattended` opt-in — must not grant there.
+    #[tokio::test]
+    async fn a_plain_allow_rule_does_not_grant_in_a_cron_turn() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let approver = PolicyApprover::wrap(
+            Policy::new(vec![allow_rule("cargo ")], Verdict::Ask),
+            inner.clone(),
+        );
+        let allowed = with_session(cron_ctx(), approver.approve(&shell_req())).await;
+        assert!(!allowed);
+        assert!(
+            *inner.asked.lock().unwrap(),
+            "a non-unattended allow must fall through, not auto-grant"
+        );
+    }
+
+    /// The other half of the same hole: `default_normal = allow` is a *default*,
+    /// and a default may never be an unattended grant.
+    #[tokio::test]
+    async fn default_normal_allow_does_not_grant_in_a_cron_turn() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let approver = PolicyApprover::wrap(Policy::new(Vec::new(), Verdict::Allow), inner.clone());
+        assert!(!with_session(cron_ctx(), approver.approve(&shell_req())).await);
+        assert!(*inner.asked.lock().unwrap());
+    }
+
+    /// …while the explicit opt-in still works, which is what keeps every
+    /// `unattended = true` rule people already configured doing its job.
+    #[tokio::test]
+    async fn an_unattended_rule_grants_in_a_cron_turn() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let mut rule = allow_rule("cargo ");
+        rule.unattended = true;
+        let approver = PolicyApprover::wrap(Policy::new(vec![rule], Verdict::Ask), inner.clone());
+        assert!(with_session(cron_ctx(), approver.approve(&shell_req())).await);
+        assert!(!*inner.asked.lock().unwrap(), "inner must not be consulted");
+    }
+
+    /// A channel-scoped rule must not match an unattended turn — the session id
+    /// prefix (`cron`) is not a channel, and treating it as one would let a rule
+    /// written for a chat channel leak into a scheduled job.
+    #[tokio::test]
+    async fn a_channel_scoped_rule_does_not_match_a_cron_turn() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let mut rule = allow_rule("cargo ");
+        rule.unattended = true;
+        rule.channels = Some(vec!["cron".to_string()]);
+        let approver = PolicyApprover::wrap(Policy::new(vec![rule], Verdict::Ask), inner.clone());
+        assert!(!with_session(cron_ctx(), approver.approve(&shell_req())).await);
+        assert!(*inner.asked.lock().unwrap());
+    }
+
+    /// The briefing sweep gets the same treatment as cron.
+    #[tokio::test]
+    async fn a_briefing_turn_is_unattended_too() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let approver = PolicyApprover::wrap(Policy::new(Vec::new(), Verdict::Allow), inner.clone());
+        let ctx =
+            SessionContext::detached("briefing:2026-08-10").with_origin(SessionOrigin::Briefing);
+        assert!(!with_session(ctx, approver.approve(&shell_req())).await);
+    }
+
+    /// …and an ordinary conversation is untouched: `default_normal = allow`
+    /// still grants where a human is behind the session.
+    #[tokio::test]
+    async fn a_user_turn_still_honors_default_normal_allow() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let approver = PolicyApprover::wrap(Policy::new(Vec::new(), Verdict::Allow), inner.clone());
+        let ctx = SessionContext::detached("feishu:oc_abc");
+        assert!(with_session(ctx, approver.approve(&shell_req())).await);
+        assert!(!*inner.asked.lock().unwrap());
     }
 
     #[tokio::test]

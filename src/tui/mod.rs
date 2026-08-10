@@ -32,7 +32,7 @@ mod ui;
 use komo_agent::runtime::AgentRuntime;
 use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
 use komo_services::clarify::ClarifyState;
-use komo_services::tool_execution::{SessionContext, with_session};
+use komo_services::tool_execution::{SessionContext, SessionOrigin, with_session};
 use std::{io, path::PathBuf, sync::Arc};
 
 use crossterm::{
@@ -514,6 +514,7 @@ async fn event_loop(
                             // down the whole process instead.
                             cancel: None,
                             interject: None,
+                            origin: SessionOrigin::User,
                         }
                     });
                     tokio::spawn(async move {

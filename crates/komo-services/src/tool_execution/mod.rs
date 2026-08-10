@@ -28,8 +28,8 @@ use std::time::Duration;
 use tracing::{Instrument, info, info_span, warn};
 
 pub use context::{
-    RunContext, SessionContext, SpinDetector, SpinVerdict, ToolContext, ToolTurnContext,
-    TurnResultBudget, current_session, with_session,
+    RunContext, SessionContext, SessionOrigin, SpinDetector, SpinVerdict, ToolContext,
+    ToolTurnContext, TurnResultBudget, current_session, with_session,
 };
 
 use crate::tool_output_store::{Bounded, ToolOutputStore};

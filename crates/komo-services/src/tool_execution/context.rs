@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-pub use komo_core::domain::context::{RunContext, SessionContext, ToolContext};
+pub use komo_core::domain::context::{RunContext, SessionContext, SessionOrigin, ToolContext};
 
 /// Everything the executor needs to know about the turn a round of tool calls
 /// belongs to. Built once per turn by `AgentRuntime::run_agent_loop`.
@@ -180,7 +180,12 @@ pub async fn with_session<F: std::future::Future>(ctx: SessionContext, future: F
 }
 
 /// The ambient session context, if the current task is running inside one.
-/// `None` for aux sub-agents and maintenance sweeps.
+/// `None` for aux sub-agents and the sweeps that never run an agent turn.
+///
+/// Note that the sweeps which *do* run one (cron, briefing) install a context
+/// here like any other caller — "unattended" is [`SessionContext::origin`], not
+/// the absence of a session. A consumer that cares whether a human is behind the
+/// turn must read the origin; `is_none()` does not answer that question.
 pub fn current_session() -> Option<SessionContext> {
     SESSION.try_with(|c| c.clone()).ok()
 }

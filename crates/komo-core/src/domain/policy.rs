@@ -150,10 +150,14 @@ pub struct Rule {
     pub effect: Effect,
     /// Allow rules don't grant `Risk::Dangerous` actions unless this is set.
     pub include_dangerous: bool,
-    /// Allow rules apply only within a real session turn unless this is set:
-    /// an `unattended = true` allow also grants in no-session contexts (the
-    /// briefing sweep's tool-capable turn). Deny rules ignore this — they are
+    /// Allow rules apply only to an attended turn unless this is set: an
+    /// `unattended = true` allow also grants where nobody is watching (the cron
+    /// and briefing sweeps' agent turns). Deny rules ignore this — they are
     /// unconditional everywhere. The narrow channel of roadmap §3.
+    ///
+    /// Those turns reach the engine with `channel = None`; what makes them
+    /// channel-less is `SessionOrigin`, not a missing session — see
+    /// `agent::policy_approver`.
     pub unattended: bool,
 }
 
@@ -411,9 +415,10 @@ impl Policy {
         self.default_normal
     }
 
-    /// Evaluate `request` for a turn on `channel` (`None` when no session is in
-    /// scope, e.g. a maintenance sweep), reporting which rule matched — also the
-    /// dry-run surface behind `komo policy check`.
+    /// Evaluate `request` for a turn on `channel` (`None` for an **unattended**
+    /// turn — a sweep with no session at all, or one whose `SessionOrigin` says
+    /// nobody is watching), reporting which rule matched — also the dry-run
+    /// surface behind `komo policy check`.
     ///
     /// Deny rules take precedence over allow rules regardless of order; with no
     /// rule matching, `Risk::Normal` falls to `default_normal` and
@@ -427,7 +432,7 @@ impl Policy {
     ///
     /// **Unattended contexts** (`channel = None`) only grant through an allow
     /// rule explicitly marked `unattended`; a `default_normal = allow` fallback
-    /// degrades to [`Verdict::Ask`] there — no-session grants are always an
+    /// degrades to [`Verdict::Ask`] there — an unattended grant is always an
     /// explicit opt-in, never a default.
     pub fn decide(&self, request: &ApprovalRequest, channel: Option<&str>) -> Decision {
         let Some(action) = request.action.as_ref() else {

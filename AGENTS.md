@@ -274,7 +274,11 @@ call the same functions, which is what keeps validation from forking.
   allow / `default_normal` > ask**. Saved grants (`permissions.json`, written
   only by `PolicyApprover`) never cover `Risk::Dangerous` and are never read
   unattended. Unattended contexts (cron/briefing/sweeps) grant only through
-  `unattended = true` allow rules. Read-only actions (`read`, `web_fetch`) are
+  `unattended = true` allow rules. **What marks a turn unattended is
+  `SessionContext::origin`** (`SessionOrigin::Cron` / `Briefing`, set by the
+  sweep that starts the turn), *not* the absence of an ambient session — those
+  turns have a real session id, and reading a channel off it is what used to
+  make the engine's unattended branch unreachable. Read-only actions (`read`, `web_fetch`) are
   deny-only — never prompted. Wholly-denied tools are dropped from the catalog
   at wiring (`drop_policy_denied`). Policy only tightens; hardline floors
   short-circuit inside the tool.

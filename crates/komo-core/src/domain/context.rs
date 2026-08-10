@@ -19,6 +19,39 @@ use crate::domain::events::ToolEventSink;
 use crate::domain::gateway::{InterjectSource, ReplySink};
 use crate::domain::run::RunRepository;
 
+/// What is driving a turn, as far as **approval** is concerned.
+///
+/// Deliberately *not* expressed as "has an ambient session or not". A cron job's
+/// turn genuinely has a session — a ledger run, a transcript, session-scoped
+/// tools — and encoding "nobody is watching" as "there is no session" made the
+/// two questions share one answer, so the policy engine's unattended branch
+/// never actually ran in production (it read a session id it was never supposed
+/// to see). This says the quiet part explicitly instead.
+///
+/// An enum rather than a `bool` because the callers already differ in more than
+/// attendance: a cron job's turn is scoped to *one job*, the briefing's is not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// A user-driven conversation — chat channel, CLI, TUI, HTTP API. Approval
+    /// is evaluated against the session's channel, and a human may be reachable
+    /// (that separate question is [`SessionContext::interactive`]).
+    #[default]
+    User,
+    /// A scheduled cron job's turn (`CronJobSweep`).
+    Cron,
+    /// The daily briefing sweep's turn (`BriefingSweep`).
+    Briefing,
+}
+
+impl SessionOrigin {
+    /// Whether no human is behind this turn, so the permission policy must
+    /// evaluate it channel-lessly (only an `unattended = true` allow rule
+    /// grants; no default and no saved grant ever does).
+    pub fn is_unattended(self) -> bool {
+        !matches!(self, Self::User)
+    }
+}
+
 /// The session a tool is executing within: which conversation it belongs to
 /// and how to talk back to that conversation. Set by the gateway dispatcher
 /// around a turn (`agent::interaction`) and read by a chat-channel approver
@@ -59,6 +92,11 @@ pub struct SessionContext {
     /// talk to while they run — sweeps, cron, aux sub-agents, the HTTP API.
     /// See [`InterjectSource`].
     pub interject: Option<Arc<dyn InterjectSource>>,
+    /// What is driving this turn. [`SessionOrigin::User`] for every ordinary
+    /// conversation; the sweeps that run agent turns with nobody watching set
+    /// their own variant via [`with_origin`](Self::with_origin), which is what
+    /// makes the permission policy treat them as unattended.
+    pub origin: SessionOrigin,
 }
 
 impl SessionContext {
@@ -76,6 +114,7 @@ impl SessionContext {
             event_sink: None,
             cancel: None,
             interject: None,
+            origin: SessionOrigin::User,
         }
     }
 
@@ -95,6 +134,7 @@ impl SessionContext {
             event_sink: None,
             cancel: None,
             interject: None,
+            origin: SessionOrigin::User,
         }
     }
 
@@ -115,7 +155,20 @@ impl SessionContext {
             event_sink: None,
             cancel: None,
             interject: None,
+            origin: SessionOrigin::User,
         }
+    }
+
+    /// Declare what is driving this turn. Only the unattended sweeps call this —
+    /// every ordinary construction is [`SessionOrigin::User`].
+    pub fn with_origin(mut self, origin: SessionOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Whether no human is behind this turn — see [`SessionOrigin`].
+    pub fn is_unattended(&self) -> bool {
+        self.origin.is_unattended()
     }
 
     /// Attach a live [`ToolEventSink`] so the tool executor emits `TurnEvent`s
