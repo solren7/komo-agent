@@ -36,6 +36,14 @@ pub enum ActionRef {
     /// server told us — a remote must never be able to rename itself into a
     /// policy rule written for a different one.
     Mcp { server: String, tool: String },
+    /// A note-vault index maintenance action (`wiki_index`), matched against the
+    /// action name (`status` / `refresh` / `rebuild`).
+    ///
+    /// The action, not the vault path: the vault is a single configured
+    /// location, so a rule scoped to it would say nothing, while the three
+    /// actions differ enormously in cost and consequence — `rebuild` drops the
+    /// index before refilling it.
+    Wiki { action: String },
 }
 
 /// A request for the user to approve a side-effecting action.

@@ -42,6 +42,7 @@ use komo_tools::time::TimeTool;
 use komo_tools::todo::TodoTool;
 use komo_tools::web_fetch::WebFetchTool;
 use komo_tools::web_search::WebSearchTool;
+use komo_tools::wiki_index::WikiIndexTool;
 use komo_tools::wiki_search::WikiSearchTool;
 use komo_tools::write::WriteTool;
 use std::sync::Arc;
@@ -339,7 +340,10 @@ pub async fn build(
     // (the catalog is frozen once this returns). Only a `[wiki]` that can never
     // work, which no amount of retrying fixes, drops the tool outright.
     let mut wiki_ops: Option<crate::services::operator_control::actions::WikiOps> = None;
-    let wiki_tool: Option<Arc<dyn komo_core::domain::tool::Tool>> = match &config.runtime.wiki {
+    // Two tools when a vault is usable: `wiki_search` (read) and `wiki_index`
+    // (maintain). They share the handles, and `wiki_index` shares the runner
+    // with the operator surface so no two runs overlap.
+    let wiki_tools: Vec<Arc<dyn komo_core::domain::tool::Tool>> = match &config.runtime.wiki {
         Some(wiki) => match wiki_handles(wiki) {
             Ok((index, embedder)) => {
                 // Probed once so a wrong url still shows up at boot instead of
@@ -357,11 +361,18 @@ pub async fn build(
                 // The same index backs `komo wiki` over the operator channel —
                 // the gateway holds the only handle, so the CLI has to borrow it
                 // rather than open its own.
+                // One runner shared by every indexing caller: this process's
+                // `wiki_index` tool, `komo wiki index` over the operator
+                // channel, and any cron job. Two concurrent runs over one store
+                // is not merely wasteful — a rebuild resets it.
+                let runner = Arc::new(komo_services::wiki_indexing::WikiIndexRunner::new(
+                    index.clone(),
+                    embedder.clone(),
+                    wiki.vault.clone(),
+                    wiki.embedding.model.clone(),
+                ));
                 wiki_ops = Some(crate::services::operator_control::actions::WikiOps {
-                    index: index.clone(),
-                    embedder: embedder.clone(),
-                    vault: wiki.vault.clone(),
-                    model: wiki.embedding.model.clone(),
+                    runner: runner.clone(),
                     backend: wiki.backend.clone(),
                     collection: wiki.collection.clone(),
                     location: if wiki.backend == "server" {
@@ -370,14 +381,17 @@ pub async fn build(
                         wiki.data_dir.join(&wiki.collection).display().to_string()
                     },
                 });
-                Some(Arc::new(WikiSearchTool::new(index, embedder)))
+                vec![
+                    Arc::new(WikiSearchTool::new(index, embedder)),
+                    Arc::new(WikiIndexTool::new(runner)),
+                ]
             }
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "wiki_search unavailable");
-                None
+                Vec::new()
             }
         },
-        None => None,
+        None => Vec::new(),
     };
 
     let build_full_tools =
@@ -399,9 +413,10 @@ pub async fn build(
             tools.register(Arc::new(ShellTool::new(workspace.clone())));
             tools.register(Arc::new(WebFetchTool::new()));
             tools.register(Arc::new(WebSearchTool::new()));
-            // Note-vault search, present only when `[wiki]` named a usable vault
-            // (opened once above — this closure is synchronous).
-            if let Some(tool) = wiki_tool.clone() {
+            // Note-vault search and index maintenance, present only when
+            // `[wiki]` named a usable vault (opened once above — this closure is
+            // synchronous).
+            for tool in wiki_tools.iter().cloned() {
                 tools.register(tool);
             }
             // komo's own tracing log, so a failed tool call can be diagnosed

@@ -36,8 +36,7 @@ use super::request::{
 };
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::wiki::{DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, WikiIndex, diversify};
-use komo_services::wiki_indexing::index_vault;
-use std::path::PathBuf;
+use komo_services::wiki_indexing::WikiIndexRunner;
 
 /// Cosine floor for a wiki hit, kept equal to the `wiki_search` tool's own so
 /// `komo wiki search` predicts what a turn would get rather than approximating it.
@@ -49,14 +48,33 @@ const WIKI_SCORE_FLOOR: f32 = 0.45;
 /// index open — that exclusive handle is exactly why these commands cannot run
 /// in the CLI's own process while the gateway is up.
 pub struct WikiOps {
-    pub index: Arc<dyn WikiIndex>,
-    pub embedder: Arc<dyn EmbeddingClient>,
-    pub vault: PathBuf,
-    pub model: String,
+    /// The one gate every indexing run goes through — this surface's, the
+    /// `wiki_index` tool's, and any scheduled job's. Shared so a rebuild started
+    /// from a conversation and one started with `komo wiki index --rebuild`
+    /// cannot interleave over the same store.
+    pub runner: Arc<WikiIndexRunner>,
     pub backend: String,
     pub collection: String,
     /// Human-facing location: the data directory, or the server URL.
     pub location: String,
+}
+
+impl WikiOps {
+    fn store(&self) -> &Arc<dyn WikiIndex> {
+        self.runner.index()
+    }
+
+    fn embedder(&self) -> &Arc<dyn EmbeddingClient> {
+        self.runner.embedder()
+    }
+
+    fn vault(&self) -> &std::path::Path {
+        self.runner.vault()
+    }
+
+    fn model(&self) -> &str {
+        self.runner.embedding_model()
+    }
 }
 
 /// The operator use-case implementation over the gateway's repositories: one
@@ -117,7 +135,7 @@ impl WikiOps {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let vectors = wiki.embedder.embed(&[query.to_string()]).await?;
+        let vectors = wiki.embedder().embed(&[query.to_string()]).await?;
         let vector = vectors
             .into_iter()
             .next()
@@ -125,7 +143,7 @@ impl WikiOps {
             .context("the embedding backend returned no vector")?;
         // Same over-fetch-then-cap as the tool, so this predicts what a turn gets.
         let candidates = wiki
-            .index
+            .store()
             .search(
                 &vector,
                 query,
@@ -146,16 +164,16 @@ impl WikiOps {
 
     pub async fn status(&self) -> anyhow::Result<WikiStatusView> {
         let wiki = self;
-        let indexed = wiki.index.indexed().await?;
-        let spec = wiki.index.vector_spec().await?;
+        let indexed = wiki.store().indexed().await?;
+        let spec = wiki.store().vector_spec().await?;
         Ok(WikiStatusView {
-            vault: wiki.vault.display().to_string(),
+            vault: wiki.vault().display().to_string(),
             backend: wiki.backend.clone(),
             collection: wiki.collection.clone(),
             location: wiki.location.clone(),
-            model: wiki.model.clone(),
+            model: wiki.model().to_string(),
             files: indexed.len(),
-            chunks: wiki.index.count().await?,
+            chunks: wiki.store().count().await?,
             dims: spec.as_ref().map(|(dims, _)| *dims),
             indexed_by: spec
                 .map(|(_, model)| model)
@@ -169,21 +187,17 @@ impl WikiOps {
     /// -f` already shows it.
     pub async fn index(&self, rebuild: bool) -> anyhow::Result<WikiIndexView> {
         let wiki = self;
-        tracing::info!(vault = %wiki.vault.display(), rebuild, "wiki index: starting");
-        let outcome = index_vault(
-            wiki.index.as_ref(),
-            wiki.embedder.as_ref(),
-            &wiki.vault,
-            &wiki.model,
-            rebuild,
-            |progress| tracing::info!(chunks = progress.chunks_written, "wiki index: embedding"),
-        )
-        .await?;
-        tracing::info!(
-            chunks = outcome.chunks_total,
-            written = outcome.chunks_written,
-            "wiki index: done"
-        );
+        // Through the shared runner, so this refuses rather than racing a run
+        // the agent (or a scheduled job) already has going. It logs its own
+        // progress and outcome.
+        let outcome = wiki.runner.run(rebuild, now()).await.map_err(|busy| {
+            anyhow::anyhow!(
+                "an index run is already in progress (started {}s ago{}) — wait for it, \
+                     or watch it with `komo logs -f`",
+                now().saturating_sub(busy.since),
+                if busy.rebuild { ", a full rebuild" } else { "" }
+            )
+        })??;
         Ok(WikiIndexView {
             files_seen: outcome.files_seen,
             files_changed: outcome.files_changed,

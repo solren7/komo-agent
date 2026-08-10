@@ -25,11 +25,13 @@ pub enum Category {
     HomeAssistant,
     /// Tool calls on external MCP servers, targeted as `server.tool`.
     Mcp,
+    /// Note-vault index maintenance (`wiki_index`), targeted by action name.
+    Wiki,
 }
 
 impl Category {
     /// Parse a config string (`shell` / `file` / `network` / `homeassistant` /
-    /// `mcp`).
+    /// `mcp` / `wiki`).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "shell" => Some(Self::Shell),
@@ -37,6 +39,7 @@ impl Category {
             "network" | "net" => Some(Self::Network),
             "homeassistant" | "ha" => Some(Self::HomeAssistant),
             "mcp" => Some(Self::Mcp),
+            "wiki" => Some(Self::Wiki),
             _ => None,
         }
     }
@@ -177,7 +180,8 @@ impl Rule {
     ///   read/write access kind, so approving a write under `src/` doesn't also
     ///   grant reads elsewhere;
     /// - `network` → the **host** as a dot-boundary suffix;
-    /// - `homeassistant` → the exact `domain.service`.
+    /// - `homeassistant` → the exact `domain.service`;
+    /// - `wiki` → the exact action name (`refresh` never implies `rebuild`).
     ///
     /// Always scoped to `channel`: an approval given at the CLI must not silently
     /// grant the same action to a chat channel where someone else is typing.
@@ -224,6 +228,7 @@ impl Rule {
                 format!("{server}.{tool}"),
                 None,
             ),
+            ActionRef::Wiki { action } => (Category::Wiki, Matcher::Exact, action.clone(), None),
         };
         Some(Rule {
             channels: Some(vec![channel.to_string()]),
@@ -323,6 +328,7 @@ impl Rule {
             ActionRef::Mcp { server, tool } => self
                 .matcher
                 .matches(&self.value, &format!("{server}.{tool}")),
+            ActionRef::Wiki { action } => self.matcher.matches(&self.value, action),
         }
     }
 }
@@ -695,6 +701,7 @@ pub fn category_str(c: Category) -> &'static str {
         Category::Network => "network",
         Category::HomeAssistant => "homeassistant",
         Category::Mcp => "mcp",
+        Category::Wiki => "wiki",
     }
 }
 
@@ -715,6 +722,7 @@ fn category_of(action: &ActionRef) -> Category {
         ActionRef::Network { .. } => Category::Network,
         ActionRef::Service { .. } => Category::HomeAssistant,
         ActionRef::Mcp { .. } => Category::Mcp,
+        ActionRef::Wiki { .. } => Category::Wiki,
     }
 }
 

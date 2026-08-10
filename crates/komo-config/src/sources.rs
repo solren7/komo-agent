@@ -418,7 +418,7 @@ pub struct PolicyFileConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct PolicyRuleFileConfig {
-    /// `shell` | `file` | `network` | `homeassistant`.
+    /// `shell` | `file` | `network` | `homeassistant` | `mcp` | `wiki`.
     pub category: String,
     /// `prefix` | `suffix` | `exact` | `contains`.
     #[serde(rename = "match")]

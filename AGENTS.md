@@ -24,7 +24,7 @@ komo doctor                        # config & gateway health
 komo health                        # liveness probe (exit 0 = healthy; Docker HEALTHCHECK)
 
 komo memory list|search|promote|reject|pin|triage|report|repair-scopes
-komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`)
+komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; index is incremental)
 komo dream [--apply]               # usage-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|resume|prune # run ledger (⟲ = recoverable)
@@ -118,7 +118,7 @@ fork — add new operator actions there, not in the CLI or api handlers.
 (default nightly `0 3 * * *`, `"off"` disables), `[channels.*]`, `[policy]`,
 `[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
 cross-language recall; no model = lexical-only —
-`[wiki]` — `vault` (the note directory; absent = no `wiki_search` tool),
+`[wiki]` — `vault` (the note directory; absent = no `wiki_search`/`wiki_index`),
 `backend` (`edge` default / `server`), `url` + `collection` for the server
 backend, and its own `embedding_model`/`embedding_url` (falling back to
 `[memory]`'s when unset); `QDRANT_API_KEY` lives in `.env` —
@@ -323,7 +323,7 @@ call the same functions, which is what keeps validation from forking.
   unrecallable from the next turn — those writes go `Global`. Memories written
   before this are repaired by `komo memory repair-scopes`.
 - `domain/wiki.rs` + `komo-wiki` + `komo-services`' `wiki_indexing` +
-  `komo-tools`' `wiki_search` — semantic search over the operator's note vault
+  `komo-tools`' `wiki_search` / `wiki_index` — semantic search over the note vault
   (`[wiki] vault`), **pulled on demand, never auto-injected** like memory recall:
   a vault dwarfs the memory store, so a turn that does not search pays nothing.
   Two interchangeable backends behind `WikiIndex`, chosen by `[wiki] backend`:
@@ -338,6 +338,19 @@ call the same functions, which is what keeps validation from forking.
   still booting, a local-network permission the launchd job lacks) get fixed
   while the gateway keeps running. The gateway holds the only handle, so
   `komo wiki` borrows it through `operator_control` rather than opening its own.
+  Indexing is **incremental by mtime** (embedding is the whole cost of a run, so
+  an unchanged file costs nothing) and `--rebuild` is the opt-out. **Nothing
+  reindexes on a schedule** — there is no wiki sweep; a cron job with a
+  `wiki:exact:refresh` grant is how you get one. Every indexing caller goes
+  through one `WikiIndexRunner`: `wiki_index`, `komo wiki index`, and any job.
+  Its `claim` is an RAII guard, so an abandoned run frees the slot instead of
+  locking indexing out for the process's life. `wiki_index`'s three actions are
+  three risk levels — `status` `Safe` (the diagnosis surface: an `indexed_by`
+  that differs from the configured model is *the* index anomaly), `refresh`
+  `Normal` and synchronous, `rebuild` `Dangerous` and **detached**: a rebuild
+  `reset()`s the store before refilling it and outlives any `max_duration`, so
+  running it inside the call would let a timeout abort it with the store already
+  emptied. Its outcome is read back with `status`.
 - `domain/run.rs` — run ledger: one `Run` per turn, one `RunStep` per call.
   `elapsed_ms` is the duration field (`started_at`/`ended_at` are whole
   seconds); 0 / empty `structured` read as *unknown/absent*, never

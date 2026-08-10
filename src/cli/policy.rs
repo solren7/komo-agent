@@ -140,7 +140,7 @@ pub fn check(
 ) -> anyhow::Result<()> {
     let Some(cat) = Category::parse(category) else {
         anyhow::bail!(
-            "unknown category `{category}` (expected shell | file | network | homeassistant | mcp)"
+            "unknown category `{category}` (expected shell | file | network | homeassistant | mcp | wiki)"
         );
     };
 
@@ -181,6 +181,19 @@ pub fn check(
                 Risk::Normal,
             )
         }
+        Category::Wiki => (
+            ActionRef::Wiki {
+                action: target.to_string(),
+            },
+            // Mirror `wiki_index`'s own classification: reading status costs
+            // nothing, refreshing is a normal write, rebuilding drops the index
+            // first and so is never auto-allowed without `include_dangerous`.
+            match target {
+                "status" => Risk::Safe,
+                "rebuild" => Risk::Dangerous,
+                _ => Risk::Normal,
+            },
+        ),
         Category::Mcp => {
             let Some((server, tool)) = target.split_once('.') else {
                 anyhow::bail!("mcp target must be `server.tool` (e.g. memos.create_memo)");

@@ -126,7 +126,7 @@ pub fn normalize_grants(grants: Vec<RuleSpec>) -> anyhow::Result<Vec<RuleSpec>> 
             if spec.to_rule().is_none() {
                 anyhow::bail!(
                     "invalid grant `{} {} {}`: category must be one of \
-                     shell/file/network/homeassistant/mcp, match one of \
+                     shell/file/network/homeassistant/mcp/wiki, match one of \
                      prefix/suffix/exact/contains/any, access one of read/write",
                     spec.category,
                     spec.matcher,

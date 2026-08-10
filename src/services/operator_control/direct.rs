@@ -106,10 +106,15 @@ impl DirectOperatorAdapter {
                     cfg.embedding.model.clone(),
                 )?;
                 Ok(Arc::new(super::actions::WikiOps {
-                    index,
-                    embedder: Arc::new(embedder),
-                    vault: cfg.vault.clone(),
-                    model: cfg.embedding.model.clone(),
+                    // This process is the only indexer when it opens the store
+                    // directly (the gateway is down, or there is none), so its
+                    // runner is unshared — the gate still holds within it.
+                    runner: Arc::new(komo_services::wiki_indexing::WikiIndexRunner::new(
+                        index,
+                        Arc::new(embedder),
+                        cfg.vault.clone(),
+                        cfg.embedding.model.clone(),
+                    )),
                     backend: cfg.backend.clone(),
                     collection: cfg.collection.clone(),
                     location: if cfg.backend == "server" {

@@ -199,7 +199,7 @@ impl Tool for CronTool {
                         "properties": {
                             "category": {
                                 "type": "string",
-                                "enum": ["shell", "file", "network", "homeassistant", "mcp"],
+                                "enum": ["shell", "file", "network", "homeassistant", "mcp", "wiki"],
                                 "description": "What kind of action to allow."
                             },
                             "match": {
@@ -209,7 +209,7 @@ impl Tool for CronTool {
                             },
                             "value": {
                                 "type": "string",
-                                "description": "The target: a command prefix for shell (\"git \"), a path prefix for file, a host for network, `domain.service` for homeassistant (\"climate.set_temperature\"), `server.tool` for mcp."
+                                "description": "The target: a command prefix for shell (\"git \"), a path prefix for file, a host for network, `domain.service` for homeassistant (\"climate.set_temperature\"), `server.tool` for mcp, the action name for wiki (\"refresh\" / \"rebuild\")."
                             },
                             "access": {
                                 "type": "string",
