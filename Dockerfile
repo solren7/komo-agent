@@ -14,8 +14,9 @@
 #             tzdata (reminders and the briefing run on local time — set TZ) +
 #             git (`komo skills install owner/repo` shells out to `git clone`;
 #             only the single-file `…/SKILL.md` form uses the built-in HTTP
-#             client) + curl (nothing in komo calls it — skills do, since a
-#             skill is largely "here is the command line for this API")
+#             client) + curl / python3 / uv (nothing in komo calls any of
+#             them — skills do, since a skill is largely "here is the command
+#             line for this API"; see the runtime stage for the size tradeoff)
 #
 # Build for the NAS's architecture, NOT your laptop's. On Apple Silicon:
 #   docker buildx build --platform linux/amd64 -t ghcr.io/solren7/komo:latest --push .
@@ -52,10 +53,23 @@ FROM debian:trixie-slim AS runtime
 # either way). --no-install-recommends saves a further 4 MB — worth keeping,
 # but git is the real cost. Drop git if you only ever install single-file
 # skills by raw SKILL.md URL, which uses the built-in HTTP client.
+#
+# python3 is the full interpreter, NOT python3-minimal: minimal omits the ssl
+# module, so every HTTPS call from a skill script would fail. It costs 11 MB
+# here (the expensive shared libs are already in for other reasons).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates tzdata libssl3 git curl \
+        ca-certificates tzdata libssl3 git curl python3 \
     && rm -rf /var/lib/apt/lists/*
+
+# uv, for skills that need third-party packages (the system python3 above only
+# covers stdlib-only scripts). Copied from the official image — two static musl
+# binaries, +21 MB, no installer script and no network fetch at run time. Bump
+# the tag to upgrade. If your registry mirror can't reach ghcr.io (fnOS's
+# docker.fnnas.com 401s on it, same reason the dockerfile frontend is avoided
+# above), swap this for a GitHub release tarball or drop the line — nothing in
+# komo itself depends on uv.
+COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /uvx /usr/local/bin/
 
 COPY --from=builder /usr/local/bin/komo /usr/local/bin/komo
 
