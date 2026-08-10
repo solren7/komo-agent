@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub use komo_core::domain::context::{RunContext, SessionContext, SessionOrigin, ToolContext};
+use komo_core::domain::policy::Rule;
 
 /// Everything the executor needs to know about the turn a round of tool calls
 /// belongs to. Built once per turn by `AgentRuntime::run_agent_loop`.
@@ -170,6 +171,28 @@ impl TurnResultBudget {
 
 tokio::task_local! {
     pub(super) static SESSION: SessionContext;
+    static JOB_GRANTS: Arc<Vec<Rule>>;
+}
+
+/// Run `future` with `grants` as the ambient job-grant list — the actions a
+/// human approved for one scheduled job when they created it.
+///
+/// Installed by `CronJobSweep` around the job's turn and read by
+/// `PolicyApprover`, the same shape as [`with_session`] and for the same reason:
+/// the domain `Approver` trait takes only the request, and threading a grant
+/// list through it would touch every approver for the sake of one caller.
+///
+/// Outside this scope there are no grants at all — that is what keeps one job's
+/// approvals from reaching another job, the briefing, or a conversation.
+pub async fn with_job_grants<F: std::future::Future>(grants: Vec<Rule>, future: F) -> F::Output {
+    JOB_GRANTS.scope(Arc::new(grants), future).await
+}
+
+/// The grants of the job whose turn is running; empty outside a job's turn.
+pub fn current_job_grants() -> Arc<Vec<Rule>> {
+    JOB_GRANTS
+        .try_with(|g| g.clone())
+        .unwrap_or_else(|_| Arc::new(Vec::new()))
 }
 
 /// Run `future` with `ctx` as the ambient session context. Called by the turn

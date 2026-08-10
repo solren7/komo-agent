@@ -19,7 +19,7 @@ use komo_core::domain::{
     policy::{Policy, Rule, Verdict, channel_of},
 };
 use komo_infra::permissions_store::PermissionsStore;
-use komo_services::tool_execution::current_session;
+use komo_services::tool_execution::{current_job_grants, current_session};
 
 /// Wraps an [`Approver`], applying a [`Policy`] before falling back to it.
 pub struct PolicyApprover {
@@ -93,6 +93,8 @@ impl Approver for PolicyApprover {
         let channel = current_session()
             .filter(|c| !c.is_unattended())
             .map(|c| channel_of(&c.session_id));
+        // The running job's own grants, if this is a scheduled job's turn.
+        let grants = current_job_grants();
 
         // Read-only actions get deny-only evaluation: a deny rule can block a
         // network fetch / file read, but nothing escalates one to a prompt — an
@@ -108,19 +110,23 @@ impl Approver for PolicyApprover {
             return Decision::Allow;
         }
 
-        let decision = self.policy.decide(request, channel.as_deref());
+        let decision = self
+            .policy
+            .decide_with_grants(request, channel.as_deref(), &grants);
         match decision.verdict {
             Verdict::Deny => {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
                       "policy: denied");
                 policy_denial(decision)
             }
-            // The engine already gates no-session grants: with `channel = None`
-            // only an explicitly `unattended` allow rule (never a default)
-            // produces `Allow`, so an Allow here is safe to honor as-is.
+            // The engine already gates unattended grants: with `channel = None`
+            // only an explicitly `unattended` allow rule or one of this job's
+            // own grants (never a default) produces `Allow`, so an Allow here is
+            // safe to honor as-is. The source is logged because it is the only
+            // way to answer "why did this go through" after the fact.
             Verdict::Allow => {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
-                      "policy: auto-allowed");
+                      source = ?decision.source, "policy: auto-allowed");
                 Decision::Allow
             }
             Verdict::Ask => match self.inner.decide(request).await {
@@ -159,7 +165,9 @@ mod tests {
     use super::*;
     use komo_core::domain::approval::ActionRef;
     use komo_core::domain::policy::{Category, Effect, Matcher, Rule};
-    use komo_services::tool_execution::{SessionContext, SessionOrigin, with_session};
+    use komo_services::tool_execution::{
+        SessionContext, SessionOrigin, with_job_grants, with_session,
+    };
     use std::sync::Mutex;
 
     /// A cron job's turn as the sweep really builds it: it **has** a session
@@ -311,6 +319,61 @@ mod tests {
         let approver = PolicyApprover::wrap(Policy::new(vec![rule], Verdict::Ask), inner.clone());
         assert!(!with_session(cron_ctx(), approver.approve(&shell_req())).await);
         assert!(*inner.asked.lock().unwrap());
+    }
+
+    /// A job's grant reaches the approver through the ambient scope, and
+    /// grants an action no config rule covers.
+    #[tokio::test]
+    async fn a_job_grant_allows_within_its_turn() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: false,
+        });
+        let approver = PolicyApprover::wrap(Policy::default(), inner.clone());
+        let mut grant = allow_rule("cargo ");
+        grant.unattended = true;
+        let allowed = with_job_grants(
+            vec![grant],
+            with_session(cron_ctx(), approver.approve(&shell_req())),
+        )
+        .await;
+        assert!(allowed);
+        assert!(!*inner.asked.lock().unwrap());
+    }
+
+    /// **The containment guarantee.** One job's grant must not reach anything
+    /// outside that job's turn — not another job, not the briefing, and not a
+    /// conversation. Without this the feature is just a global rule with extra
+    /// steps.
+    #[tokio::test]
+    async fn a_job_grant_does_not_escape_its_turn() {
+        let approver = PolicyApprover::wrap(
+            Policy::default(),
+            Arc::new(Recording {
+                asked: Mutex::new(false),
+                answer: false,
+            }),
+        );
+        let mut grant = allow_rule("cargo ");
+        grant.unattended = true;
+
+        // Granted inside…
+        assert!(
+            with_job_grants(
+                vec![grant],
+                with_session(cron_ctx(), approver.approve(&shell_req()))
+            )
+            .await
+        );
+
+        // …and gone the moment the scope ends: a later cron turn (a different
+        // job), the briefing, and an ordinary conversation all see nothing.
+        assert!(!with_session(cron_ctx(), approver.approve(&shell_req())).await);
+        let briefing =
+            SessionContext::detached("briefing:2026-08-10").with_origin(SessionOrigin::Briefing);
+        assert!(!with_session(briefing, approver.approve(&shell_req())).await);
+        let chat = SessionContext::detached("feishu:oc_abc");
+        assert!(!with_session(chat, approver.approve(&shell_req())).await);
     }
 
     /// The briefing sweep gets the same treatment as cron.

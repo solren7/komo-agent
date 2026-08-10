@@ -401,18 +401,27 @@ impl RuleSpec {
     }
 }
 
+/// Which rule list [`Decision::rule`] indexes into. The three lists are numbered
+/// independently, so the index alone is ambiguous without this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleSource {
+    /// The `[[policy.rule]]` list as configured — `komo policy list` shows the
+    /// same numbering, so a `check` result points at a real line.
+    Config,
+    /// The runtime-accumulated allow list (`komo policy saved list`).
+    Saved,
+    /// The running job's own grants, approved when the job was created.
+    JobGrant,
+}
+
 /// A verdict plus which rule produced it (`None` = fell through to a default).
-/// The rule index is into the policy's rule list as configured — `komo policy
-/// list` shows the same numbering, so a `check` result points at a real line —
-/// unless [`saved`](Self::saved) is set, in which case it indexes the
-/// runtime-accumulated allow list instead (`komo policy saved list`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Decision {
     pub verdict: Verdict,
     pub rule: Option<usize>,
-    /// Whether `rule` points at a saved entry rather than a config rule. Only an
-    /// `Allow` can come from the saved list — it holds allows only.
-    pub saved: bool,
+    /// Which list [`rule`](Self::rule) indexes. Only an `Allow` ever comes from
+    /// `Saved` or `JobGrant` — both hold allows only.
+    pub source: RuleSource,
 }
 
 impl Decision {
@@ -420,7 +429,7 @@ impl Decision {
         Self {
             verdict,
             rule: None,
-            saved: false,
+            source: RuleSource::Config,
         }
     }
 
@@ -428,7 +437,7 @@ impl Decision {
         Self {
             verdict,
             rule: Some(rule),
-            saved: false,
+            source: RuleSource::Config,
         }
     }
 }
@@ -509,6 +518,36 @@ impl Policy {
     /// degrades to [`Verdict::Ask`] there — an unattended grant is always an
     /// explicit opt-in, never a default.
     pub fn decide(&self, request: &ApprovalRequest, channel: Option<&str>) -> Decision {
+        self.decide_with_grants(request, channel, &[])
+    }
+
+    /// [`decide`](Self::decide), plus the running job's own `grants` — the
+    /// actions a human approved for *this* scheduled job when it was created.
+    ///
+    /// They sit between config deny and saved grants in the ladder:
+    ///
+    /// ```text
+    /// tool hardline floor > config deny > job grant > saved grant > config allow / default > ask
+    /// ```
+    ///
+    /// - **below config deny**, because a grant given at job-creation time must
+    ///   not overrule what the operator wrote in config.toml — same reason a
+    ///   saved grant doesn't;
+    /// - **above saved grants**, because a job grant was approved against a
+    ///   named, visible list, while a saved grant was *generalized* from one
+    ///   answer;
+    /// - **never `Risk::Dangerous`**, same rule as a saved grant:
+    ///   `include_dangerous` stays a config-only opt-in.
+    ///
+    /// Unlike a saved grant, a job grant *is* read unattended — that is its
+    /// entire purpose. Its scope is the job, which is narrower than the
+    /// `unattended = true` config rule it replaces, and it dies with the job.
+    pub fn decide_with_grants(
+        &self,
+        request: &ApprovalRequest,
+        channel: Option<&str>,
+        grants: &[Rule],
+    ) -> Decision {
         let Some(action) = request.action.as_ref() else {
             // No structured resource to match on; risk-only fallback.
             return Decision::fallback(self.default_for(request.risk, channel));
@@ -523,6 +562,23 @@ impl Policy {
         if request.risk == Risk::Safe {
             // Deny-only for read-only actions: no allow rules, no escalation.
             return Decision::fallback(Verdict::Allow);
+        }
+        if request.risk != Risk::Dangerous {
+            for (i, rule) in grants.iter().enumerate() {
+                // `applies` is called channel-lessly on purpose: a job grant is
+                // scoped by the job, not by a channel, and an unattended turn
+                // has none to match against anyway.
+                if rule.effect == Effect::Allow
+                    && rule.applies(action, None)
+                    && rule.matches(action)
+                {
+                    return Decision {
+                        verdict: Verdict::Allow,
+                        rule: Some(i),
+                        source: RuleSource::JobGrant,
+                    };
+                }
+            }
         }
         // Saved allows sit *below* every config deny (checked above) and *above*
         // config allows, so a remembered approval can shortcut a prompt but can
@@ -542,7 +598,7 @@ impl Policy {
                     return Decision {
                         verdict: Verdict::Allow,
                         rule: Some(i),
-                        saved: true,
+                        source: RuleSource::Saved,
                     };
                 }
             }
@@ -1024,7 +1080,11 @@ mod tests {
 
         let d = p.decide(&shell("cargo test", Risk::Normal), Some("cli"));
         assert_eq!(d.verdict, Verdict::Allow);
-        assert!(d.saved, "the decision must name the saved list");
+        assert_eq!(
+            d.source,
+            RuleSource::Saved,
+            "the decision must name the saved list"
+        );
         assert_eq!(d.rule, Some(0));
         // Scoped to the channel it was granted on.
         assert_eq!(
@@ -1105,6 +1165,106 @@ mod tests {
         );
     }
 
+    // ── job grants ──────────────────────────────────────────────────────────
+    //
+    // A scheduled job's own approved actions, granted when a human created it.
+
+    fn job_grant(value: &str) -> Rule {
+        let mut r = rule(Category::Shell, Matcher::Prefix, value, Effect::Allow);
+        r.unattended = true;
+        r
+    }
+
+    /// The point of the feature: a job grant is honored in the unattended turn
+    /// where nothing else would be, without any config rule existing.
+    #[test]
+    fn a_job_grant_allows_its_action_unattended() {
+        let p = Policy::new(Vec::new(), Verdict::Ask);
+        let grants = [job_grant("cargo ")];
+        let d = p.decide_with_grants(&shell("cargo build", Risk::Normal), None, &grants);
+        assert_eq!(d.verdict, Verdict::Allow);
+        assert_eq!(d.source, RuleSource::JobGrant);
+        assert_eq!(d.rule, Some(0));
+    }
+
+    /// …and only that action. A grant is a whitelist, not a mode switch.
+    #[test]
+    fn a_job_grant_does_not_cover_an_unlisted_action() {
+        let p = Policy::new(Vec::new(), Verdict::Ask);
+        let grants = [job_grant("cargo ")];
+        assert_eq!(
+            p.decide_with_grants(&shell("rm -rf /", Risk::Normal), None, &grants)
+                .verdict,
+            Verdict::Ask
+        );
+    }
+
+    /// A config deny outranks a job grant — the operator's config.toml is above
+    /// anything approved at job-creation time, exactly as it is above a saved
+    /// grant.
+    #[test]
+    fn a_config_deny_beats_a_job_grant() {
+        let p = Policy::new(
+            vec![rule(
+                Category::Shell,
+                Matcher::Contains,
+                "push",
+                Effect::Deny,
+            )],
+            Verdict::Ask,
+        );
+        let grants = [job_grant("git ")];
+        let d = p.decide_with_grants(&shell("git push origin", Risk::Normal), None, &grants);
+        assert_eq!(d.verdict, Verdict::Deny);
+        assert_eq!(d.source, RuleSource::Config);
+    }
+
+    /// `include_dangerous` stays a config-only opt-in: approving a job's action
+    /// list must not silently make a dangerous action unattended.
+    #[test]
+    fn a_job_grant_never_covers_a_dangerous_action() {
+        let p = Policy::new(Vec::new(), Verdict::Ask);
+        let mut grant = job_grant("rm ");
+        grant.include_dangerous = true; // even asking for it changes nothing
+        assert_eq!(
+            p.decide_with_grants(&shell("rm file", Risk::Dangerous), None, &[grant])
+                .verdict,
+            Verdict::Ask
+        );
+    }
+
+    /// A job grant sits above a saved grant: it was approved against a named,
+    /// visible list, where a saved grant was generalized from one prompt.
+    #[test]
+    fn a_job_grant_outranks_a_saved_grant() {
+        let saved_rule = Rule::narrowest_for(
+            &ActionRef::Shell {
+                command: "cargo build".into(),
+            },
+            "cli",
+        )
+        .unwrap();
+        let p = Policy::new(Vec::new(), Verdict::Ask).with_saved(saved(vec![saved_rule]));
+        let d = p.decide_with_grants(
+            &shell("cargo build", Risk::Normal),
+            Some("cli"),
+            &[job_grant("cargo ")],
+        );
+        assert_eq!(d.source, RuleSource::JobGrant);
+    }
+
+    /// `decide` is `decide_with_grants` with no grants — so every existing
+    /// caller keeps its exact behavior and nothing grants by accident.
+    #[test]
+    fn no_grants_decides_exactly_as_before() {
+        let p = Policy::new(Vec::new(), Verdict::Ask);
+        assert_eq!(
+            p.decide_with_grants(&shell("cargo build", Risk::Normal), None, &[])
+                .verdict,
+            p.decide(&shell("cargo build", Risk::Normal), None).verdict
+        );
+    }
+
     /// A grant saved mid-session applies to the very next decision: the store and
     /// the policy share one list, so nothing has to be rebuilt.
     #[test]
@@ -1176,7 +1336,7 @@ mod tests {
             write: false,
         });
         let p = Policy::new(Vec::new(), Verdict::Ask).with_saved(saved(vec![file_rule]));
-        assert!(!p.decide(&read_req, Some("cli")).saved);
+        assert_ne!(p.decide(&read_req, Some("cli")).source, RuleSource::Saved);
 
         let net_rule = Rule::narrowest_for(
             &ActionRef::Network {

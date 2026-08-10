@@ -29,7 +29,8 @@ use tracing::{Instrument, info, info_span, warn};
 
 pub use context::{
     RunContext, SessionContext, SessionOrigin, SpinDetector, SpinVerdict, ToolContext,
-    ToolTurnContext, TurnResultBudget, current_session, with_session,
+    ToolTurnContext, TurnResultBudget, current_job_grants, current_session, with_job_grants,
+    with_session,
 };
 
 use crate::tool_output_store::{Bounded, ToolOutputStore};

@@ -34,7 +34,7 @@ use komo_core::domain::{
     session::Session,
     task::{Task, TaskRepository},
 };
-use komo_services::tool_execution::with_session;
+use komo_services::tool_execution::{with_job_grants, with_session};
 
 /// Trip the circuit breaker once this many maintenance cycles fail back-to-back.
 /// Tripping no longer kills the service — it forces a cooldown before retrying
@@ -432,8 +432,7 @@ impl CronJobSweep {
                 .await
             }
             CronAction::Agent { prompt, skills } => {
-                self.execute_cron_agent(&job.name, prompt, skills, now)
-                    .await
+                self.execute_cron_agent(job, prompt, skills, now).await
             }
         }
     }
@@ -443,11 +442,12 @@ impl CronJobSweep {
     /// run an isolated, cleanly-ledgered turn — no cross-run contamination.
     async fn execute_cron_agent(
         &self,
-        name: &str,
+        job: &CronJob,
         prompt: &str,
         skills: &[String],
         now: i64,
     ) -> (String, String, bool) {
+        let name = &job.name;
         let fail_title = format!("Komo job「{name}」failed");
         let Some(handler) = &self.runtime else {
             return (
@@ -463,9 +463,16 @@ impl CronJobSweep {
         // `SessionOrigin::User`, which would hand the policy engine a `cron`
         // channel and quietly skip its unattended branch.
         let session = SessionContext::detached(&session_id).with_origin(SessionOrigin::Cron);
-        match with_session(
-            session,
-            handler.handle(&session_id, cron_agent_prompt(prompt, skills)),
+        // …and this job's own approved actions, scoped to exactly this turn.
+        // Installed around the whole turn (not per tool call) so the grants are
+        // in scope wherever the approver is consulted, and out of scope the
+        // moment the turn ends.
+        match with_job_grants(
+            job.granted_rules(),
+            with_session(
+                session,
+                handler.handle(&session_id, cron_agent_prompt(prompt, skills)),
+            ),
         )
         .await
         {

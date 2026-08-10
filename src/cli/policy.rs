@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use crate::domain::approval::{ActionRef, ApprovalRequest, Risk};
-use crate::domain::policy::{Category, Policy, Rule, Verdict};
+use crate::domain::policy::{Category, Policy, Rule, RuleSource, Verdict};
 use komo_config::{ConfigSnapshot, PolicyReport};
 use komo_infra::permissions_store::PermissionsStore;
 
@@ -152,12 +152,11 @@ pub fn check(
         .clone()
         .with_saved(store.rules());
     let decision = policy.decide(&request, channel);
-    let matched = |i: usize| {
-        if decision.saved {
-            format!("saved #{i} {}", describe_rule(&policy.saved_rules()[i]))
-        } else {
-            format!("#{i} {}", describe_rule(&policy.rules()[i]))
-        }
+    let matched = |i: usize| match decision.source {
+        RuleSource::Saved => format!("saved #{i} {}", describe_rule(&policy.saved_rules()[i])),
+        // `check` never evaluates a job's grants — it dry-runs config + saved.
+        RuleSource::JobGrant => format!("job grant #{i}"),
+        RuleSource::Config => format!("#{i} {}", describe_rule(&policy.rules()[i])),
     };
 
     let risk_str = match risk {
@@ -180,7 +179,7 @@ pub fn check(
         (Verdict::Allow, Some(i)) => {
             println!("verdict: ALLOW — auto-allowed inside a session turn (no prompt)");
             println!("matched: {}", matched(i));
-            if decision.saved {
+            if decision.source == RuleSource::Saved {
                 println!(
                     "note:    a saved grant (`komo policy saved list`); forget it to be asked again"
                 );
