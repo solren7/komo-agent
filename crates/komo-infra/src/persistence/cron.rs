@@ -11,6 +11,7 @@ use toasty_driver_turso::Turso;
 
 use crate::persistence::{DEFAULT_POOL_SIZE, prepare_turso_path, with_write_retry};
 use komo_core::domain::cron::{CronAction, CronJob, CronJobRepository, parse_cron_run_status};
+use komo_core::domain::policy::RuleSpec;
 
 // Optional i64 fields use 0 as the "unset" sentinel; `args` is a JSON array
 // string; `enabled` is 0/1; `last_status` is ""/"ok"/"failed" (same conventions
@@ -37,6 +38,9 @@ struct CronJobRecord {
     last_run_at: i64,
     last_status: String,
     last_error: String,
+    /// JSON array of `RuleSpec` — the actions this job may take unattended.
+    /// Empty string = no grants (every job written before the column existed).
+    grants: String,
     created_at: i64,
 }
 
@@ -59,6 +63,7 @@ impl CronDb {
                 ("kind", "\"kind\" text NOT NULL DEFAULT 'command'"),
                 ("prompt", "\"prompt\" text NOT NULL DEFAULT ''"),
                 ("skills", "\"skills\" text NOT NULL DEFAULT ''"),
+                ("grants", "\"grants\" text NOT NULL DEFAULT ''"),
             ];
             crate::persistence::ensure_columns(p, "cron_job_records", EXPECTED).await?;
         }
@@ -115,6 +120,7 @@ impl CronJobRepository for CronDb {
                     .unwrap_or_default(),
                 last_error: job.last_error.clone(),
                 created_at: job.created_at,
+                grants: encode_grants(&job.grants)?,
             })
             .exec(&mut conn)
             .await?;
@@ -171,6 +177,7 @@ impl CronJobRepository for CronDb {
                         .unwrap_or_default(),
                 )
                 .last_error(job.last_error.clone())
+                .grants(encode_grants(&job.grants)?)
                 .exec(&mut conn)
                 .await?;
             Ok(())
@@ -232,6 +239,15 @@ impl ActionColumns {
     }
 }
 
+/// Grants as the column stores them. An empty list is written as `''` rather
+/// than `'[]'` so a job without grants is byte-identical to a pre-column row.
+fn encode_grants(grants: &[RuleSpec]) -> anyhow::Result<String> {
+    if grants.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(serde_json::to_string(grants)?)
+}
+
 fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
     let nonzero = |v: i64| (v != 0).then_some(v);
     // Default to command for legacy rows written before `kind` existed.
@@ -259,6 +275,9 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
         last_status: parse_cron_run_status(&record.last_status),
         last_error: record.last_error,
         created_at: record.created_at,
+        // A row written before the column existed reads as empty, which is the
+        // same thing as "no grants" — never an error.
+        grants: serde_json::from_str(&record.grants).unwrap_or_default(),
     })
 }
 
@@ -386,6 +405,10 @@ mod tests {
         };
         assert_eq!(command, "/opt/rotate.py");
         assert_eq!(args, &vec!["--push".to_string()]);
+        assert!(
+            found.grants.is_empty(),
+            "a row written before the grants column must read as ungranted, not error"
+        );
 
         // 3. The added columns are usable: an agent job saves and reads back.
         db.save(&CronJob::new(
@@ -425,6 +448,60 @@ mod tests {
         assert_eq!(prompt, "总结我今天的日程");
         assert_eq!(skills, &vec!["calendar".to_string(), "weather".to_string()]);
         assert_eq!(found.next_run_at, 42);
+    }
+
+    /// Grants survive save → read → update → read, field for field. An
+    /// approval the operator gave once must not quietly widen or narrow because
+    /// the job's `last_run_at` was stamped.
+    #[tokio::test]
+    async fn job_grants_roundtrip_through_save_and_update() {
+        let db = CronDb::connect(&turso_url("komo_cron_grants_test.db"))
+            .await
+            .unwrap();
+        let grant = RuleSpec {
+            category: "homeassistant".into(),
+            matcher: "exact".into(),
+            value: "climate.set_temperature".into(),
+            access: None,
+            channels: None,
+            effect: "allow".into(),
+            include_dangerous: false,
+            unattended: true,
+        };
+        let job = CronJob::new(
+            "ac-temp",
+            "0 22 * * *",
+            CronAction::Agent {
+                prompt: "设到 26 度".into(),
+                skills: vec![],
+            },
+            0,
+        )
+        .with_grants(vec![grant]);
+        db.save(&job).await.unwrap();
+
+        let found = db.find_by_name("ac-temp").await.unwrap().unwrap();
+        assert_eq!(found.grants.len(), 1);
+        assert_eq!(found.grants[0].value, "climate.set_temperature");
+        assert!(found.grants[0].unattended);
+        // And it parses into the rule the policy engine will match on.
+        let rules = found.granted_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].value, "climate.set_temperature");
+
+        let mut updated = found;
+        updated.last_run_at = Some(999);
+        db.update(&updated).await.unwrap();
+        let again = db.find_by_name("ac-temp").await.unwrap().unwrap();
+        assert_eq!(again.grants.len(), 1, "update must not drop grants");
+        assert_eq!(again.last_run_at, Some(999));
+    }
+
+    /// A job without grants writes the empty column, so it is indistinguishable
+    /// from a pre-column row — no `'[]'` noise for an operator reading the db.
+    #[tokio::test]
+    async fn a_job_without_grants_stores_nothing() {
+        assert_eq!(encode_grants(&[]).unwrap(), "");
     }
 
     #[tokio::test]

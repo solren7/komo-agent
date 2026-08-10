@@ -18,6 +18,8 @@
 use async_trait::async_trait;
 use croner::Cron;
 
+use crate::domain::policy::{Rule, RuleSpec};
+
 /// Default wall-clock budget for a job command — hermes' cron-job budget
 /// (15 min), generous enough for a script that clones a repo and pushes an MR.
 pub const DEFAULT_CRON_JOB_TIMEOUT_SECS: u64 = 900;
@@ -115,6 +117,16 @@ pub struct CronJob {
     /// Failure detail from the most recent run (empty on success / never ran).
     pub last_error: String,
     pub created_at: i64,
+    /// Actions this job may take unattended, approved by a human when the job
+    /// was created. Empty = no side-effecting action is granted, which is what
+    /// every job created before grants existed carries.
+    ///
+    /// Scoped to *this job's* turns, so deleting the job revokes them — unlike a
+    /// global `unattended = true` `[[policy.rule]]`, which outlives whatever it
+    /// was written for. Only ever an allow list: a denial belongs in config,
+    /// where it applies to everything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<RuleSpec>,
 }
 
 impl CronJob {
@@ -133,7 +145,14 @@ impl CronJob {
             last_status: None,
             last_error: String::new(),
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            grants: Vec::new(),
         }
+    }
+
+    /// Attach the grants a human approved when this job was created.
+    pub fn with_grants(mut self, grants: Vec<RuleSpec>) -> Self {
+        self.grants = grants;
+        self
     }
 
     /// Convenience constructor for a command-mode job with default timeout.
@@ -154,6 +173,31 @@ impl CronJob {
     /// Due = enabled and the scheduled fire time has arrived.
     pub fn is_due(&self, now: i64) -> bool {
         self.enabled && self.next_run_at <= now
+    }
+
+    /// This job's grants as policy rules.
+    ///
+    /// An entry that no longer parses is **dropped with a warning** rather than
+    /// failing the run: grants are validated where a job is created, so the only
+    /// way to get one here is a hand-edited db or a downgrade, and in both cases
+    /// the safe reading of "I don't understand this permission" is to withhold
+    /// it — never to fail the job in a way that looks like the schedule broke.
+    pub fn granted_rules(&self) -> Vec<Rule> {
+        self.grants
+            .iter()
+            .filter_map(|spec| match spec.to_rule() {
+                Some(rule) => Some(rule),
+                None => {
+                    tracing::warn!(
+                        job = %self.name,
+                        category = %spec.category,
+                        value = %spec.value,
+                        "unparseable job grant ignored"
+                    );
+                    None
+                }
+            })
+            .collect()
     }
 }
 

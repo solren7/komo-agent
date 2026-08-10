@@ -327,6 +327,80 @@ impl Rule {
     }
 }
 
+/// The serde form of a [`Rule`], field-for-field with a `[[policy.rule]]` table.
+///
+/// A [`Rule`] holds parsed enums, so it cannot round-trip through JSON on its
+/// own; this is the wire/at-rest shape for the stores that persist rules —
+/// today a cron job's grants (`cron.db`). Field names deliberately match the
+/// config table, so what an operator reads in a store is what they would write
+/// in `config.toml`.
+///
+/// `permissions.json` keeps its own narrower `Entry` shape (single `channel`,
+/// plus `created_at` / `source` provenance): a saved grant is always
+/// single-channel and carries metadata a rule does not. That is a *narrowing*
+/// of this shape, not a competing one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuleSpec {
+    pub category: String,
+    #[serde(rename = "match")]
+    pub matcher: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<Vec<String>>,
+    pub effect: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_dangerous: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unattended: bool,
+}
+
+impl RuleSpec {
+    /// Parse into a [`Rule`]. `None` when a field does not name a known variant —
+    /// the caller decides whether that is "skip this entry" (a store reading
+    /// something an older/newer komo wrote) or an error.
+    pub fn to_rule(&self) -> Option<Rule> {
+        Some(Rule {
+            channels: self.channels.clone().filter(|c| !c.is_empty()),
+            category: Category::parse(&self.category)?,
+            matcher: Matcher::parse(&self.matcher)?,
+            value: self.value.clone(),
+            access: match &self.access {
+                Some(a) => Some(Access::parse(a)?),
+                None => None,
+            },
+            effect: Effect::parse(&self.effect)?,
+            include_dangerous: self.include_dangerous,
+            unattended: self.unattended,
+        })
+    }
+
+    /// The serde form of `rule` — the inverse of [`to_rule`](Self::to_rule).
+    pub fn from_rule(rule: &Rule) -> Self {
+        Self {
+            category: category_str(rule.category).to_string(),
+            matcher: matcher_str(rule.matcher).to_string(),
+            value: rule.value.clone(),
+            access: rule.access.map(|a| {
+                match a {
+                    Access::Read => "read",
+                    Access::Write => "write",
+                }
+                .to_string()
+            }),
+            channels: rule.channels.clone(),
+            effect: match rule.effect {
+                Effect::Allow => "allow",
+                Effect::Deny => "deny",
+            }
+            .to_string(),
+            include_dangerous: rule.include_dangerous,
+            unattended: rule.unattended,
+        }
+    }
+}
+
 /// A verdict plus which rule produced it (`None` = fell through to a default).
 /// The rule index is into the policy's rule list as configured — `komo policy
 /// list` shows the same numbering, so a `check` result points at a real line —
