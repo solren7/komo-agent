@@ -249,7 +249,8 @@ enum CronAction {
     },
     /// Add an agent job: the gateway runs a prompt through an unattended,
     /// tool-capable agent turn on schedule and delivers the reply. Side effects
-    /// are gated by [policy] (only `unattended = true` rules grant them).
+    /// are refused unless granted — per job with `--grant`, or globally with an
+    /// `unattended = true` [policy] rule.
     AddAgent {
         /// Unique job name
         name: String,
@@ -260,6 +261,12 @@ enum CronAction {
         /// Skill(s) to load before running the prompt (repeatable)
         #[arg(long = "skill")]
         skills: Vec<String>,
+        /// Action this job may take unattended, as `<category>:<match>:<value>`
+        /// (e.g. `homeassistant:exact:climate.set_temperature`, `shell:prefix:git `,
+        /// `file:prefix:/srv/backups/:write`). Repeatable; scoped to this job
+        /// only, and removed with it.
+        #[arg(long = "grant")]
+        grants: Vec<String>,
     },
     /// Remove a scheduled job by name
     Remove { name: String },
@@ -535,6 +542,9 @@ pub async fn run() -> anyhow::Result<()> {
                             workdir,
                             timeout_secs: timeout_secs.unwrap_or(0),
                         },
+                        // A command job runs the program directly with no
+                        // approver in the loop — nothing to grant.
+                        grants: Vec::new(),
                     },
                 )
                 .await
@@ -544,13 +554,19 @@ pub async fn run() -> anyhow::Result<()> {
                 schedule,
                 prompt,
                 skills,
+                grants,
             } => {
+                let grants = grants
+                    .iter()
+                    .map(|g| policy::parse_grant(g))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 inspect::cron_add(
                     &operator(&config).await?,
                     crate::domain::cron::CronJobSpec {
                         name,
                         schedule,
                         action: crate::domain::cron::CronAction::Agent { prompt, skills },
+                        grants,
                     },
                 )
                 .await

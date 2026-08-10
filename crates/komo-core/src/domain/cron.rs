@@ -60,8 +60,8 @@ pub fn parse_cron_run_status(s: &str) -> Option<CronRunStatus> {
 ///   and deliver the reply. Optional `skills` are loaded first. The agent runs
 ///   with the full tool set but side effects are gated by the permission
 ///   policy: with no human to prompt, a `Risk::Normal` action passes only
-///   through an `unattended = true` `[policy]` rule (identical model to the
-///   daily briefing).
+///   through this job's own [`CronJob::grants`] (approved when it was created)
+///   or an `unattended = true` `[policy]` rule.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronAction {
@@ -227,6 +227,10 @@ pub struct CronJobSpec {
     pub name: String,
     pub schedule: String,
     pub action: CronAction,
+    /// Actions this job should be allowed to take unattended. Normalized and
+    /// validated by the shared create action — see `cron_actions`.
+    #[serde(default)]
+    pub grants: Vec<RuleSpec>,
 }
 
 #[async_trait]

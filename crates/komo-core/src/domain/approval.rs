@@ -95,6 +95,14 @@ impl ApprovalRequest {
         self.action = Some(action);
         self
     }
+
+    /// Attach the expanded explanation shown under the summary. `dangerous`
+    /// requires one up front; this is for a `normal` request that still has
+    /// something the operator must read before answering.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
 }
 
 /// The answer to an [`ApprovalRequest`]: proceed, or don't — and when the user

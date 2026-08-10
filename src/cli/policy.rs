@@ -20,6 +20,46 @@ fn describe_rule(r: &Rule) -> String {
     r.describe()
 }
 
+/// Parse a `--grant` argument: `<category>:<match>:<value>`, with an optional
+/// `:read` / `:write` access suffix for `file`.
+///
+/// Split from the left on the first two colons only, because a value can
+/// legitimately contain them (`network:suffix:api.example.com:8443`). The
+/// access suffix is taken from the right, and only when it is literally `read`
+/// or `write` — so a path ending in `/write` is still a path.
+///
+/// Shape is validated here; whether the rule *means* anything is
+/// `cron_actions::normalize_grants`' job, so the CLI and the `cron` tool cannot
+/// disagree about what a valid grant is.
+pub fn parse_grant(arg: &str) -> anyhow::Result<komo_core::domain::policy::RuleSpec> {
+    let mut parts = arg.splitn(3, ':');
+    let (Some(category), Some(matcher), rest) = (parts.next(), parts.next(), parts.next()) else {
+        anyhow::bail!(
+            "invalid --grant `{arg}`: expected <category>:<match>:<value>, e.g. \
+             homeassistant:exact:climate.set_temperature (use <category>:any for a \
+             whole category)"
+        );
+    };
+    // `shell:any` and friends carry no value.
+    let rest = rest.unwrap_or_default();
+    let (value, access) = match rest.rsplit_once(':') {
+        Some((head, "read")) => (head, Some("read".to_string())),
+        Some((head, "write")) => (head, Some("write".to_string())),
+        _ => (rest, None),
+    };
+    Ok(komo_core::domain::policy::RuleSpec {
+        category: category.to_string(),
+        matcher: matcher.to_string(),
+        value: value.to_string(),
+        access,
+        channels: None,
+        // Fixed by `normalize_grants`; stated here only to build the value.
+        effect: String::new(),
+        include_dangerous: false,
+        unattended: false,
+    })
+}
+
 /// Render the resolved policy: defaults, rules in evaluation order, and any
 /// config entries that failed to parse.
 pub fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
@@ -278,5 +318,43 @@ fn print_saved(store: &PermissionsStore) {
     );
     for (i, r) in rules.iter().enumerate() {
         println!("  #{i} {}", describe_rule(r));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_grant_reads_category_match_value() {
+        let g = parse_grant("homeassistant:exact:climate.set_temperature").unwrap();
+        assert_eq!(g.category, "homeassistant");
+        assert_eq!(g.matcher, "exact");
+        assert_eq!(g.value, "climate.set_temperature");
+        assert_eq!(g.access, None);
+    }
+
+    /// A value may contain colons (a host:port, a Windows-ish path), so only
+    /// the first two separators are structural.
+    #[test]
+    fn parse_grant_keeps_colons_inside_the_value() {
+        let g = parse_grant("network:suffix:api.example.com:8443").unwrap();
+        assert_eq!(g.value, "api.example.com:8443");
+    }
+
+    #[test]
+    fn parse_grant_takes_a_trailing_access_kind() {
+        let g = parse_grant("file:prefix:/srv/backups/:write").unwrap();
+        assert_eq!(g.value, "/srv/backups/");
+        assert_eq!(g.access.as_deref(), Some("write"));
+        // …and a path that merely ends in a word like `write` is still a path.
+        let g = parse_grant("file:prefix:/srv/write").unwrap();
+        assert_eq!(g.value, "/srv/write");
+        assert_eq!(g.access, None);
+    }
+
+    #[test]
+    fn parse_grant_rejects_a_missing_matcher() {
+        assert!(parse_grant("homeassistant").is_err());
     }
 }

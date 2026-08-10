@@ -10,9 +10,13 @@
 //! whoever ran `komo cron add` already had shell on the host. A chat-authored
 //! job is *model*-authored, so every mutation is gated through the `Approver`:
 //!
-//! - **agent mode** (a prompt) is `Risk::Normal`, scope `cron:add` — the turn it
-//!   schedules still runs unattended, where side effects pass only through an
-//!   `unattended = true` `[policy]` rule.
+//! - **agent mode** (a prompt) is `Risk::Normal`. The turn it schedules runs
+//!   unattended, so its side effects pass only through this job's own `grants`
+//!   or an `unattended = true` `[policy]` rule. The grants are approved in the
+//!   **same** prompt as the job — one interaction covering both "what it does"
+//!   and "what it may do" — which is why an `add` carrying grants drops the
+//!   `cron:add` scope key: a scope key means "approve this kind of thing once
+//!   per session", and every job's permission list is different.
 //! - **command mode** (a program) is `Risk::Dangerous` and carries an
 //!   `ActionRef::Shell`, so a `[policy]` deny rule fences it and no ordinary
 //!   shell *allow* rule can silently grant it (`include_dangerous` is required).
@@ -33,6 +37,7 @@ use komo_core::domain::{
         CronAction, CronJob, CronJobRepository, CronJobSpec, CronRunStatus,
         DEFAULT_CRON_JOB_TIMEOUT_SECS,
     },
+    policy::RuleSpec,
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 use komo_services::cron_actions as actions;
@@ -52,6 +57,10 @@ struct CronArgs {
     prompt: Option<String>,
     #[serde(default)]
     skills: Vec<String>,
+    /// Agent-mode: the actions this job needs to be allowed to take when it
+    /// runs with nobody watching. Approved as one list, together with the job.
+    #[serde(default)]
+    grants: Vec<GrantArg>,
     // Command-mode fields.
     #[serde(default)]
     command: Option<String>,
@@ -61,6 +70,36 @@ struct CronArgs {
     workdir: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+/// One requested grant, as the model may state it: *what* to allow, and nothing
+/// about the rule's shape. `effect`, `unattended`, `include_dangerous` and the
+/// channel scope are fixed by `cron_actions::normalize_grants` — the model has
+/// no say in how wide a grant's shape is, only in which action it names.
+#[derive(Deserialize)]
+struct GrantArg {
+    category: String,
+    #[serde(default, rename = "match")]
+    matcher: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    access: Option<String>,
+}
+
+impl From<GrantArg> for RuleSpec {
+    fn from(arg: GrantArg) -> Self {
+        RuleSpec {
+            category: arg.category,
+            matcher: arg.matcher,
+            value: arg.value,
+            access: arg.access,
+            channels: None,
+            effect: String::new(),
+            include_dangerous: false,
+            unattended: false,
+        }
+    }
 }
 
 /// Lets the model create and manage the gateway's scheduled jobs (`cron.db`) —
@@ -109,6 +148,9 @@ impl Tool for CronTool {
          unattended agent turn with your full tool set, optionally preloading \
          `skills` — or `command` (+ `args`/`workdir`/`timeout_secs`) for a fixed \
          program); \
+         an agent job that must *do* something — control a device, write a file, \
+         run a command — also needs `grants` naming those actions, or every one \
+         of them is refused when it runs; \
          action=\"disable\" / \"enable\" pauses and resumes a job by `name`; \
          action=\"remove\" deletes it; action=\"run\" fires it once now. \
          Jobs fire only while `komo gateway` runs, and each run's output is \
@@ -148,6 +190,35 @@ impl Tool for CronTool {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Skills the agent job loads before acting (action=add, agent mode)."
+                },
+                "grants": {
+                    "type": "array",
+                    "description": "Actions this agent job must be allowed to take when it runs with nobody watching (action=add, agent mode). Without a grant, every side-effecting call the job makes is refused at run time. Declare only what the task plainly needs — the user approves this list together with the job, and an unneeded entry is a permission they did not want to give. If you are unsure an action is needed, leave it out: a missing grant fails loudly at run time and the user is told, whereas an extra one is silent.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "enum": ["shell", "file", "network", "homeassistant", "mcp"],
+                                "description": "What kind of action to allow."
+                            },
+                            "match": {
+                                "type": "string",
+                                "enum": ["exact", "prefix", "suffix", "contains", "any"],
+                                "description": "How `value` is compared against the action's target. Prefer the narrowest that works — `exact` where you know the target. `any` means the whole category and needs no `value`; use it only when the job genuinely cannot be pinned down."
+                            },
+                            "value": {
+                                "type": "string",
+                                "description": "The target: a command prefix for shell (\"git \"), a path prefix for file, a host for network, `domain.service` for homeassistant (\"climate.set_temperature\"), `server.tool` for mcp."
+                            },
+                            "access": {
+                                "type": "string",
+                                "enum": ["read", "write"],
+                                "description": "file only: restrict the grant to reads or to writes."
+                            }
+                        },
+                        "required": ["category"]
+                    }
                 },
                 "command": {
                     "type": "string",
@@ -203,7 +274,7 @@ impl Tool for CronTool {
                     })?
                     .to_string();
 
-                let (action, request) = match (args.prompt, args.command) {
+                let (action, request, grants) = match (args.prompt, args.command) {
                     (Some(_), Some(_)) => {
                         return Err(ToolError::InvalidInput(
                             "pass either `prompt` (agent job) or `command` (program job), not both"
@@ -211,17 +282,38 @@ impl Tool for CronTool {
                         ));
                     }
                     (Some(prompt), None) => {
-                        let request = ApprovalRequest::normal(format!(
+                        // Normalize *before* prompting: what the operator reads
+                        // has to be exactly what gets stored, and a malformed
+                        // entry should fail here rather than after they said yes.
+                        let grants = actions::normalize_grants(
+                            args.grants.into_iter().map(RuleSpec::from).collect(),
+                        )
+                        .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+                        let summary = format!(
                             "Schedule agent job `{name}` [{schedule}]: {}",
                             oneline(&prompt, PROMPT_PREVIEW)
-                        ))
-                        .with_scope_key("cron:add".to_string());
+                        );
+                        let request = if grants.is_empty() {
+                            ApprovalRequest::normal(summary).with_scope_key("cron:add".to_string())
+                        } else {
+                            // Deliberately no scope key: a scope key means
+                            // "approve this kind of thing once per session", and
+                            // every job's grant list is different — reusing one
+                            // would let the second job's permissions through on
+                            // the first job's approval.
+                            ApprovalRequest::normal(summary).with_detail(format!(
+                                "This job will be allowed to take these actions unattended, \
+                                 every time it runs (only this job — removing it revokes them):\n{}",
+                                describe_grants(&grants)
+                            ))
+                        };
                         (
                             CronAction::Agent {
                                 prompt,
                                 skills: args.skills,
                             },
                             request,
+                            grants,
                         )
                     }
                     (None, Some(command)) => {
@@ -247,6 +339,10 @@ impl Tool for CronTool {
                                     .unwrap_or(DEFAULT_CRON_JOB_TIMEOUT_SECS),
                             },
                             request,
+                            // A command job fires the program directly with no
+                            // approver in the loop, so there is no gate for a
+                            // grant to open — approving the job *is* the grant.
+                            Vec::new(),
                         )
                     }
                     (None, None) => {
@@ -276,6 +372,7 @@ impl Tool for CronTool {
                         name,
                         schedule,
                         action,
+                        grants,
                     },
                     now,
                 )
@@ -436,6 +533,21 @@ fn describe_job(job: &CronJob) -> String {
     line
 }
 
+/// The grant list as the operator reads it at the approval prompt, one rule per
+/// line. Uses `Rule::describe()` — the same rendering `komo policy list` prints,
+/// so what is approved here and what is inspected later read identically.
+///
+/// Pure, and takes already-normalized specs, so the prompt cannot drift from
+/// what gets stored.
+fn describe_grants(grants: &[RuleSpec]) -> String {
+    grants
+        .iter()
+        .filter_map(|spec| spec.to_rule())
+        .map(|rule| format!("  {}", rule.describe()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn command_line(command: &str, args: &[String]) -> String {
     std::iter::once(command)
         .chain(args.iter().map(String::as_str))
@@ -502,10 +614,14 @@ mod tests {
         }
     }
 
-    /// Records what it was asked and answers with a fixed verdict.
+    /// Records what it was asked and answers with a fixed verdict. Keeps the
+    /// detail and scope key too — for an `add` carrying grants they are the
+    /// substance of the prompt, not decoration.
     struct Recorder {
         allow: bool,
         seen: Mutex<Vec<(String, komo_core::domain::approval::Risk)>>,
+        details: Mutex<Vec<Option<String>>>,
+        scope_keys: Mutex<Vec<Option<String>>>,
     }
 
     impl Recorder {
@@ -513,6 +629,8 @@ mod tests {
             Arc::new(Self {
                 allow,
                 seen: Mutex::new(Vec::new()),
+                details: Mutex::new(Vec::new()),
+                scope_keys: Mutex::new(Vec::new()),
             })
         }
     }
@@ -524,6 +642,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((request.summary.clone(), request.risk));
+            self.details.lock().unwrap().push(request.detail.clone());
+            self.scope_keys
+                .lock()
+                .unwrap()
+                .push(request.scope_key.clone());
             self.allow.into()
         }
     }
@@ -569,6 +692,113 @@ mod tests {
         let seen = rec.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1, komo_core::domain::approval::Risk::Normal);
+    }
+
+    /// The whole point of the feature: creating the job and approving what it
+    /// may do are **one** interaction, and the prompt spells the permissions out.
+    #[tokio::test]
+    async fn creating_a_job_approves_its_grants_in_the_same_prompt() {
+        let (t, jobs, rec) = tool(true);
+        let out = run(
+            &t,
+            json!({
+                "action": "add", "name": "ac-temp", "schedule": "0 22 * * *",
+                "prompt": "把卧室空调设到 26 度",
+                "grants": [{"category": "homeassistant", "match": "exact",
+                            "value": "climate.set_temperature"}]
+            }),
+            &rec,
+        )
+        .await
+        .unwrap()
+        .text;
+        assert!(out.contains("ac-temp"), "{out}");
+
+        // Exactly one prompt, and it names the action being granted.
+        let seen = rec.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "creating the job must ask exactly once");
+        let detail = rec.details.lock().unwrap()[0]
+            .clone()
+            .expect("a grant list must be shown before it is approved");
+        assert!(detail.contains("climate.set_temperature"), "{detail}");
+        assert!(detail.contains("homeassistant"), "{detail}");
+
+        // A grant list must not ride on a session scope key: the next job's
+        // permissions would then ride in on this job's approval.
+        assert_eq!(rec.scope_keys.lock().unwrap()[0], None);
+
+        // Stored, with the rule shape fixed rather than taken from the caller.
+        let stored = jobs.jobs.lock().unwrap();
+        assert_eq!(stored[0].grants.len(), 1);
+        let rule = &stored[0].granted_rules()[0];
+        assert!(
+            rule.unattended,
+            "a job grant must work with nobody watching"
+        );
+        assert!(!rule.include_dangerous);
+        assert_eq!(rule.channels, None);
+    }
+
+    /// Denying the prompt leaves nothing behind — no job, and so no grants.
+    #[tokio::test]
+    async fn denying_the_prompt_creates_no_job_and_no_grants() {
+        let (t, jobs, rec) = tool(false);
+        let out = run(
+            &t,
+            json!({
+                "action": "add", "name": "ac-temp", "schedule": "0 22 * * *",
+                "prompt": "设到 26 度",
+                "grants": [{"category": "homeassistant", "match": "exact",
+                            "value": "climate.set_temperature"}]
+            }),
+            &rec,
+        )
+        .await
+        .unwrap()
+        .text;
+        assert!(out.contains("rejected"), "{out}");
+        assert!(jobs.jobs.lock().unwrap().is_empty());
+    }
+
+    /// A malformed grant fails **before** the prompt: approving a list and then
+    /// silently storing a different one is the failure this guards against.
+    #[tokio::test]
+    async fn an_invalid_grant_fails_before_asking() {
+        let (t, jobs, rec) = tool(true);
+        let err = run(
+            &t,
+            json!({
+                "action": "add", "name": "x", "schedule": "0 22 * * *", "prompt": "do it",
+                "grants": [{"category": "teleport", "match": "exact", "value": "somewhere"}]
+            }),
+            &rec,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)), "{err:?}");
+        assert!(
+            rec.seen.lock().unwrap().is_empty(),
+            "must not prompt for a list it cannot store"
+        );
+        assert!(jobs.jobs.lock().unwrap().is_empty());
+    }
+
+    /// An `add` without grants keeps its session scope key — the old behavior,
+    /// where approving "schedule jobs" once per session is the right trade.
+    #[tokio::test]
+    async fn an_add_without_grants_keeps_its_scope_key() {
+        let (t, _jobs, rec) = tool(true);
+        run(
+            &t,
+            json!({"action": "add", "name": "brief", "schedule": "0 8 * * *", "prompt": "summarize"}),
+            &rec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rec.scope_keys.lock().unwrap()[0].as_deref(),
+            Some("cron:add")
+        );
     }
 
     #[tokio::test]
