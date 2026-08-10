@@ -19,7 +19,10 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
-use komo_core::domain::wiki::{IndexedFile, WikiChunk, WikiHit, WikiIndex, reciprocal_rank_fusion};
+use komo_core::domain::wiki::{
+    DIVERSIFY_OVERFETCH, IndexedFile, MAX_CHUNKS_PER_FILE, WikiChunk, WikiHit, WikiIndex,
+    diversify, reciprocal_rank_fusion,
+};
 use qdrant_edge::bm25_embed::{EdgeBm25, EdgeBm25Config};
 use qdrant_edge::{
     Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams, EdgeVectorParams, Modifier,
@@ -319,6 +322,10 @@ impl WikiIndex for EdgeIndex {
             .then(|| self.bm25.embed_query(query_text))
             .filter(|sparse| !sparse.indices.is_empty());
 
+        // Each arm is fetched deeper than it will contribute, because the cap
+        // below throws hits away: without the headroom, a note that fills an
+        // arm's top-k just yields a shorter run instead of a wider one.
+        let depth = limit.saturating_mul(DIVERSIFY_OVERFETCH);
         let dense_query = query.to_vec();
         let (dense, sparse) = tokio::task::spawn_blocking(move || {
             let dense = run_query(
@@ -327,20 +334,20 @@ impl WikiIndex for EdgeIndex {
                     query: VectorInternal::Dense(dense_query),
                     using: Some(VECTOR_NAME.into()),
                 }),
-                limit,
+                depth,
                 Some(min_score),
             )?;
             let sparse = match sparse_query {
                 // No floor on the lexical arm: BM25 scores are unbounded and
                 // corpus-dependent, so a cosine threshold would be meaningless
-                // here — `limit` is what bounds it.
+                // here — depth and the per-note cap are what bound it.
                 Some(sparse_query) => run_query(
                     &shard,
                     QueryEnum::Nearest(NamedQuery {
                         query: VectorInternal::Sparse(sparse_query),
                         using: Some(SPARSE_VECTOR_NAME.into()),
                     }),
-                    limit,
+                    depth,
                     None,
                 )?,
                 None => Vec::new(),
@@ -350,13 +357,18 @@ impl WikiIndex for EdgeIndex {
         .await?
         .map_err(|e| anyhow!("searching wiki index: {e}"))?;
 
-        let dense = to_hits(dense);
+        // Cap each arm before fusing: a note that owns most of one arm's top-k
+        // is spending slots that fusion never gets to choose among. RRF scores
+        // by rank, so discarding a note's 3rd chunk here promotes everything
+        // below it rather than leaving a hole.
+        let dense = diversify(to_hits(dense), limit, MAX_CHUNKS_PER_FILE);
+        let sparse = diversify(to_hits(sparse), limit, MAX_CHUNKS_PER_FILE);
         // Dense-only: return cosine scores unchanged, so a vault without a
         // lexical arm behaves exactly as it did before hybrid existed.
         if sparse.is_empty() {
             return Ok(dense.into_iter().take(limit).collect());
         }
-        Ok(reciprocal_rank_fusion(vec![dense, to_hits(sparse)], limit))
+        Ok(reciprocal_rank_fusion(vec![dense, sparse], limit))
     }
 
     async fn indexed(&self) -> anyhow::Result<HashMap<String, IndexedFile>> {
@@ -638,6 +650,38 @@ mod tests {
             paths.contains(&"orders.md"),
             "lexical arm did not surface the exact id: {paths:?}"
         );
+    }
+
+    /// Measured on the real vault: one note held 9 of the dense arm's top 15,
+    /// so fusion never saw the notes ranked behind it. Capping per arm is what
+    /// puts them in front of it.
+    #[tokio::test]
+    async fn one_note_cannot_monopolize_an_arm_before_fusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index(&dir);
+        let mut chunks: Vec<WikiChunk> = (0..6)
+            .map(|i| {
+                let mut c = chunk("hog.md", i, vec![1.0, 0.0]);
+                c.text = "结账 服务 编排".into();
+                c
+            })
+            .collect();
+        chunks.push(chunk_with_text(
+            "rival.md",
+            "结账 服务 地图",
+            vec![0.99, 0.01],
+        ));
+        index.upsert(&chunks).await.unwrap();
+
+        // Dense-only, so this isolates the arm cap from anything lexical.
+        let hits = index.search(&[1.0, 0.0], "", 5, -1.0).await.unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.chunk.path.as_str()).collect();
+        assert_eq!(
+            paths.iter().filter(|p| **p == "hog.md").count(),
+            MAX_CHUNKS_PER_FILE,
+            "{paths:?}"
+        );
+        assert!(paths.contains(&"rival.md"), "{paths:?}");
     }
 
     /// CJK must tokenize, or the lexical arm is dead weight on this vault —

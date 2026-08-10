@@ -59,7 +59,9 @@ impl WikiChunk {
 #[derive(Debug, Clone)]
 pub struct WikiHit {
     pub chunk: WikiChunk,
-    /// Cosine similarity against the query vector, in `[-1, 1]`.
+    /// Cosine similarity against the query vector (`[-1, 1]`) from a single
+    /// retrieval arm, or — once [`reciprocal_rank_fusion`] has run — the fused
+    /// rank-agreement score in `[0, 1]`.
     pub score: f32,
 }
 
@@ -79,12 +81,17 @@ pub const RRF_K: f32 = 60.0;
 /// A chunk found by both runs accumulates both contributions, so agreement
 /// between lexical and semantic retrieval is what floats a result to the top.
 ///
-/// The returned `score` is the fused RRF value (roughly 0.008–0.033), **not** a
-/// similarity — callers that display it must not present it as one.
+/// The returned `score` is **not** a similarity: it is the fused value divided
+/// by the most any chunk could score, so `1.0` means every run ranked it first
+/// and `0.5` (with two runs) means only one arm found it at all. Raw RRF values
+/// live in a range that reads as garbage next to a cosine — 0.033 for a perfect
+/// hit — and the same field carries a real cosine on the dense-only path, so
+/// normalizing is what keeps one displayed column from carrying two scales.
 pub fn reciprocal_rank_fusion(runs: Vec<Vec<WikiHit>>, limit: usize) -> Vec<WikiHit> {
     if limit == 0 {
         return Vec::new();
     }
+    let best_possible = runs.len() as f32 / (RRF_K + 1.0);
     let mut fused: HashMap<String, (f32, WikiHit)> = HashMap::new();
     for run in runs {
         for (rank, hit) in run.into_iter().enumerate() {
@@ -98,7 +105,7 @@ pub fn reciprocal_rank_fusion(runs: Vec<Vec<WikiHit>>, limit: usize) -> Vec<Wiki
     let mut out: Vec<WikiHit> = fused
         .into_values()
         .map(|(score, mut hit)| {
-            hit.score = score;
+            hit.score = score / best_possible;
             hit
         })
         .collect();
@@ -136,6 +143,13 @@ pub const DIVERSIFY_OVERFETCH: usize = 3;
 /// Applied to an over-fetched result set: search ranks chunks, but a *reader*
 /// wants coverage — five passages from five notes beat five from two. Ties are
 /// resolved by the incoming order, so this never reorders equally-ranked hits.
+///
+/// Also applied to each retrieval arm *before* fusion, where it is doing a
+/// different job: keeping the candidate pool wide. Measured on the real vault,
+/// one note took 5 of the dense arm's top 15 for `checkout` and 9 of 15 for
+/// `TiDB 连接数打满`, so fusion was choosing among three or four distinct notes
+/// no matter how many candidates it was handed. Capping per arm spends those
+/// slots on notes that would otherwise never reach the fusion at all.
 pub fn diversify(hits: Vec<WikiHit>, limit: usize, max_per_file: usize) -> Vec<WikiHit> {
     if limit == 0 {
         return Vec::new();
@@ -263,6 +277,26 @@ mod tests {
         assert_eq!(out.len(), 2);
         // Both were rank 0 in their run, so both get the same contribution.
         assert!((out[0].score - out[1].score).abs() < 1e-6, "{out:?}");
+    }
+
+    /// The score reaches a reader, so it has to mean something there: full
+    /// agreement is 1.0, and a hit only one of two arms found is 0.5. Raw RRF
+    /// would have made these 0.033 and 0.016.
+    #[test]
+    fn fused_scores_are_normalized_against_full_agreement() {
+        let dense = vec![hit("both.md", 0, 0.9), hit("only_dense.md", 0, 0.8)];
+        let lexical = vec![hit("both.md", 0, 12.0)];
+        let out = reciprocal_rank_fusion(vec![dense, lexical], 3);
+        assert_eq!(out[0].chunk.path, "both.md");
+        assert!((out[0].score - 1.0).abs() < 1e-6, "{out:?}");
+        let single = out
+            .iter()
+            .find(|h| h.chunk.path == "only_dense.md")
+            .unwrap();
+        assert!(
+            single.score < 0.5,
+            "rank-1 alone is the 0.5 ceiling: {single:?}"
+        );
     }
 
     #[test]
