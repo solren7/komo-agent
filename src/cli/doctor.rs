@@ -40,7 +40,7 @@ pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyho
     issue_health(config);
     model_health(config);
     schedule_health(config);
-    policy_health(config);
+    policy_health(config, control).await;
     println!("\nchannels:");
     channel_health(config);
     home_channel_health(control, config).await;
@@ -179,8 +179,9 @@ fn schedule_health(config: &ConfigSnapshot) {
     println!("  cron jobs    every minute (see `komo cron list`)");
 }
 
-/// The permission policy: configured?, rule count, load errors.
-fn policy_health(config: &ConfigSnapshot) {
+/// The permission policy: configured?, rule count, load errors, and the two
+/// runtime grant sources (saved prompts, scheduled jobs).
+async fn policy_health(config: &ConfigSnapshot, control: &OperatorControl) {
     use crate::domain::policy::Verdict;
     let report = &config.runtime.policy;
     println!("\npolicy:");
@@ -192,6 +193,17 @@ fn policy_health(config: &ConfigSnapshot) {
             "  {OK} {} saved grant(s) from approval prompts  (see `komo policy saved list`)",
             saved.len()
         );
+    }
+    // Job grants likewise: a job created purely in conversation carries
+    // unattended permissions with no [policy] table anywhere.
+    if let Ok(OperatorQueryResult::CronJobs(jobs)) = control.query(OperatorQuery::CronJobs).await {
+        let granting = jobs.iter().filter(|j| !j.grants.is_empty()).count();
+        if granting > 0 {
+            println!(
+                "  {OK} {granting} job(s) with their own unattended grants  \
+                 (see `komo policy list`)"
+            );
+        }
     }
     if !report.configured {
         println!("  {OFF} no [policy] table — Normal/Dangerous actions ask interactively");

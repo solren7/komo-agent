@@ -26,10 +26,10 @@ komo health                        # liveness probe (exit 0 = healthy; Docker HE
 komo memory list|search|promote|reject|pin|triage|report|repair-scopes
 komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`)
 komo dream [--apply]               # usage-driven candidate consolidation (preview by default)
-komo cron list|add|add-agent|run|enable|disable|remove
+komo cron list|add|add-agent [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|resume|prune # run ledger (⟲ = recoverable)
 komo skills list|install|inspect|promote|reject|protect|unprotect|enable|disable|audit
-komo policy list|check|saved       # permission policy + saved grants
+komo policy list|check|saved       # permission policy: config rules + job grants + saved grants
 komo journey                       # learning timeline (memories + skills)
 komo channel list|probe|setup      # channel inventory / verification / interactive setup
 komo channel wechat login          # provision WeChat creds via QR (on the host)
@@ -274,7 +274,11 @@ call the same functions, which is what keeps validation from forking.
   allow / `default_normal` > ask**. Saved grants (`permissions.json`, written
   only by `PolicyApprover`) never cover `Risk::Dangerous` and are never read
   unattended. Unattended contexts (cron/briefing/sweeps) grant only through
-  `unattended = true` allow rules. **What marks a turn unattended is
+  `unattended = true` allow rules **or the running job's own `grants`**
+  (`CronJob.grants`, approved in the same prompt that created the job; carried
+  into the turn by `with_job_grants`, scoped to that turn, revoked with the job).
+  Full ladder: **tool hardline floor > config deny > job grant > saved grant >
+  config allow / `default_normal` > ask**. **What marks a turn unattended is
   `SessionContext::origin`** (`SessionOrigin::Cron` / `Briefing`, set by the
   sweep that starts the turn), *not* the absence of an ambient session — those
   turns have a real session id, and reading a channel off it is what used to
@@ -388,7 +392,10 @@ call the same functions, which is what keeps validation from forking.
   (operator-authored, runs directly, no approver) and **agent** (unattended
   turn on `cron_runtime`, side effects need `unattended = true` policy rules).
   Chat-created jobs (`tools/cron.rs`) are approval-gated at creation; a
-  command job from chat is `Risk::Dangerous`. Recurring *work* = cron job,
+  command job from chat is `Risk::Dangerous`. An agent job declares the actions
+  it needs as `grants`, approved in that **same** prompt (which is why a
+  grant-carrying `add` drops the `cron:add` scope key) — narrower than a global
+  `unattended` rule and revoked when the job is removed. Recurring *work* = cron job,
   recurring *message* = reminder.
 - `apps/` — bun workspace: `apps/app` (shared React renderer) mounted by
   `apps/desktop` (Electron) and `apps/web` (SPA served via `web_dir`). Talks

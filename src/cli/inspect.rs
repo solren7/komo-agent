@@ -94,6 +94,11 @@ fn print_cron_job(job: &CronJob) {
         state,
         target
     );
+    // Spelled out, not counted: "2 grants" would make the operator run another
+    // command to learn what they approved, and this listing is where they look.
+    for rule in job.granted_rules() {
+        println!("      grant {}", rule.describe());
+    }
     if let (Some(at), Some(status)) = (job.last_run_at, &job.last_status) {
         let mut line = format!("      last run {} {}", local_time(at), status.as_str());
         if *status == CronRunStatus::Failed && !job.last_error.is_empty() {

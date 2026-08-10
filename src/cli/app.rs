@@ -649,7 +649,26 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Policy { action }) => match action {
-            PolicyAction::List => policy::list(&config),
+            PolicyAction::List => {
+                // Job grants live in cron.db, which the gateway may hold open —
+                // so they come through operator control like every other job
+                // read. A failure here degrades the listing (one section marked
+                // unavailable) rather than failing a command whose config and
+                // saved sections are perfectly readable.
+                let jobs = match operator(&config).await {
+                    Ok(control) => match control
+                        .query(crate::services::operator_control::OperatorQuery::CronJobs)
+                        .await
+                    {
+                        Ok(crate::services::operator_control::OperatorQueryResult::CronJobs(
+                            jobs,
+                        )) => Some(jobs),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                };
+                policy::list(&config, jobs.as_deref())
+            }
             PolicyAction::Check {
                 category,
                 target,

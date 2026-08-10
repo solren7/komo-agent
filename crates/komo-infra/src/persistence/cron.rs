@@ -504,6 +504,48 @@ mod tests {
         assert_eq!(encode_grants(&[]).unwrap(), "");
     }
 
+    /// **Revocation.** Deleting a job takes its permissions with it. This is
+    /// the whole advantage over a global `unattended = true` config rule, which
+    /// outlives whatever it was written for, so it gets its own test rather
+    /// than being left as a property of `delete` nobody checks.
+    #[tokio::test]
+    async fn removing_a_job_revokes_its_grants() {
+        let db = CronDb::connect(&turso_url("komo_cron_revoke_test.db"))
+            .await
+            .unwrap();
+        let job = CronJob::new(
+            "ac-temp",
+            "0 22 * * *",
+            CronAction::Agent {
+                prompt: "设到 26 度".into(),
+                skills: vec![],
+            },
+            0,
+        )
+        .with_grants(vec![RuleSpec {
+            category: "homeassistant".into(),
+            matcher: "exact".into(),
+            value: "climate.set_temperature".into(),
+            access: None,
+            channels: None,
+            effect: "allow".into(),
+            include_dangerous: false,
+            unattended: true,
+        }]);
+        db.save(&job).await.unwrap();
+        assert!(db.delete("ac-temp").await.unwrap());
+
+        // Nothing anywhere in the store still grants it — no orphaned rule.
+        let remaining: Vec<_> = db
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|j| j.granted_rules())
+            .collect();
+        assert!(remaining.is_empty());
+    }
+
     #[tokio::test]
     async fn find_by_name_returns_none_for_unknown() {
         let db = CronDb::connect(&turso_url("komo_cron_find_test.db"))

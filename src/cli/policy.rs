@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use crate::domain::approval::{ActionRef, ApprovalRequest, Risk};
+use crate::domain::cron::CronJob;
 use crate::domain::policy::{Category, Policy, Rule, RuleSource, Verdict};
 use komo_config::{ConfigSnapshot, PolicyReport};
 use komo_infra::permissions_store::PermissionsStore;
@@ -60,9 +61,19 @@ pub fn parse_grant(arg: &str) -> anyhow::Result<komo_core::domain::policy::RuleS
     })
 }
 
-/// Render the resolved policy: defaults, rules in evaluation order, and any
-/// config entries that failed to parse.
-pub fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
+/// Render the resolved policy: defaults, rules in evaluation order, the
+/// operator's saved grants, every scheduled job's grants, and any config
+/// entries that failed to parse.
+///
+/// All three grant sources in one place on purpose. "What have I actually
+/// authorized" is the question this command exists to answer, and splitting the
+/// answer across `policy list` and `cron list` reproduces the very problem
+/// job-scoped grants were meant to fix.
+///
+/// `jobs` comes from the operator-control surface (the gateway may hold cron.db
+/// open). `None` when that could not be reached — the config and saved sections
+/// still print, with the gap stated rather than passed off as "nothing".
+pub fn list(config: &ConfigSnapshot, jobs: Option<&[CronJob]>) -> anyhow::Result<()> {
     let PolicyReport {
         policy,
         invalid,
@@ -70,7 +81,12 @@ pub fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
     } = &config.runtime.policy;
 
     let saved = PermissionsStore::load(&config.runtime.home);
-    if !configured && saved.is_empty() {
+    let granting_jobs: Vec<&CronJob> = jobs
+        .unwrap_or(&[])
+        .iter()
+        .filter(|j| !j.grants.is_empty())
+        .collect();
+    if !configured && saved.is_empty() && granting_jobs.is_empty() && jobs.is_some() {
         println!(
             "No [policy] table in {} — every Normal/Dangerous action asks interactively.",
             config.runtime.home.join("config.toml").display()
@@ -90,8 +106,11 @@ pub fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
         }
     }
 
-    // Saved grants are listed apart from config rules, and after them, because
-    // that is the order they are evaluated in — a config deny still wins.
+    // Sections follow evaluation order, strongest first — a config deny beats a
+    // job grant beats a saved grant — so reading down the page is reading the
+    // ladder.
+    println!();
+    print_job_grants(jobs, &granting_jobs);
     println!();
     print_saved(&saved);
 
@@ -303,6 +322,36 @@ pub fn saved_forget(
         (None, false) => anyhow::bail!("pass an index (see `komo policy saved list`) or --all"),
     }
     Ok(())
+}
+
+/// The grants attached to scheduled jobs, grouped by job.
+///
+/// A job's grants only ever apply to that job's own turns, so the job name is
+/// part of the entry, not a heading detail — and removing the job removes them,
+/// which is stated here because it is the answer to "how do I take this back".
+fn print_job_grants(jobs: Option<&[CronJob]>, granting: &[&CronJob]) {
+    let Some(_) = jobs else {
+        println!(
+            "job grants: unavailable (could not read cron.db — the sections above are complete, \
+             this one is not)"
+        );
+        return;
+    };
+    if granting.is_empty() {
+        println!("job grants: none (add one with `komo cron add-agent … --grant`)");
+        return;
+    }
+    println!(
+        "job grants ({} job(s), approved when the job was created — evaluated after config \
+         rules, only within that job's own runs, and removed with `komo cron remove <name>`):",
+        granting.len()
+    );
+    for job in granting {
+        println!("  {}", job.name);
+        for rule in job.granted_rules() {
+            println!("    {}", describe_rule(&rule));
+        }
+    }
 }
 
 fn print_saved(store: &PermissionsStore) {

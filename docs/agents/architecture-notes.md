@@ -54,7 +54,7 @@ komo skills promote|reject <name>  # triage a reviewer candidate (accept into ac
 komo skills protect|unprotect <name>  # operator-edit-only: reviewer stops proposing changes
 komo skills enable|disable <name>  # hide from the agent without deleting (and back)
 komo skills audit <name>           # which turns loaded this skill (derived from the run ledger)
-komo policy list                  # resolved permission-policy rules (as the approver applies them) + saved grants
+komo policy list                  # every grant source in one view: config rules + job grants + saved grants
 komo policy check <cat> <target>  # dry-run one action: verdict + deciding rule ([--channel c] [--dangerous] [--write])
 komo policy saved list            # grants accumulated by answering `a` at an approval prompt (permissions.json)
 komo policy saved forget <n>|--all  # stop honoring one/every saved grant — that action asks again
