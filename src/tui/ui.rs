@@ -178,20 +178,23 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(Color::Cyan),
             ),
             Span::styled(
-                "等待输入期间，当前 turn 保持挂起",
+                "等待输入期间，当前 turn 保持挂起 · Esc 中断",
                 Style::new().fg(Color::DarkGray),
             ),
         ])
     } else if app.in_flight && app.active_tool.is_some() {
         let tool = app.active_tool.as_deref().unwrap_or_default();
-        Line::from(vec![Span::styled(
-            format!(
-                " {} {tool} 运行中 · {} ",
-                SPINNER[app.spinner % SPINNER.len()],
-                elapsed_label(app)
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} {tool} 运行中 · {} ",
+                    SPINNER[app.spinner % SPINNER.len()],
+                    elapsed_label(app)
+                ),
+                Style::new().fg(Color::Cyan),
             ),
-            Style::new().fg(Color::Cyan),
-        )])
+            Span::styled("· Esc 中断 ", Style::new().fg(Color::DarkGray)),
+        ])
     } else if app.in_flight {
         // A reasoning model can spend most of a round thinking before any
         // visible text exists; showing how much it has produced turns that
@@ -201,14 +204,17 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             " 正在思考".to_string()
         };
-        Line::from(vec![Span::styled(
-            format!(
-                " {}{thinking} · {} ",
-                SPINNER[app.spinner % SPINNER.len()],
-                elapsed_label(app)
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    " {}{thinking} · {} ",
+                    SPINNER[app.spinner % SPINNER.len()],
+                    elapsed_label(app)
+                ),
+                Style::new().fg(Color::Yellow),
             ),
-            Style::new().fg(Color::Yellow),
-        )])
+            Span::styled("· Esc 中断 ", Style::new().fg(Color::DarkGray)),
+        ])
     } else {
         Line::from(Span::styled(
             " ● 就绪  · Enter 发送 · Shift-Enter/Ctrl-J 换行 · /new 新会话 · ↑↓ 滚动 · Ctrl-C 退出",

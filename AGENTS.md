@@ -395,7 +395,14 @@ call the same functions, which is what keeps validation from forking.
   key handling terminal-free in `tui/app.rs`. `komo resume <id>` (or the
   compatible `komo session resume <id>`) re-enters a session; a bare API UUID
   resolves its internal `api:<uuid>` id and hydrates the transcript. Input:
-  Enter sends, Shift/Alt-Enter (kitty protocol) or Ctrl-J newline; `tui/paste.rs`
+  Enter sends, Shift/Alt-Enter (kitty protocol) or Ctrl-J newline, **Esc stops
+  the turn in flight** (nothing when idle — a stop key that sometimes discards the
+  draft is worse than one extra keystroke; under the approval modal Esc keeps
+  meaning "deny"). Local turns carry a `CancelState` signal on their
+  `SessionContext`; remote turns cancel over
+  `POST /api/interactions/{session}/cancel`, which also denies a pending approval
+  and answers a pending `ask_user` — a turn parked on either never reaches
+  another await, so the signal alone would not reach it. `tui/paste.rs`
   holds both paste mechanisms — a chip folds a ≥4-line / >10 KB paste to a label
   (`input` still holds the full text; the chip's byte range is what keeps
   rendering off the folded content) and `coalesce_rapid_keys` rebuilds a paste

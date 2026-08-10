@@ -29,7 +29,9 @@ mod markdown;
 mod paste;
 mod ui;
 
+use komo_agent::interaction::CancelState;
 use komo_agent::runtime::AgentRuntime;
+use komo_core::domain::cancel::{CANCELLED_REPLY, is_cancelled};
 use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
 use komo_services::clarify::ClarifyState;
 use komo_services::tool_execution::{SessionContext, SessionOrigin, with_session};
@@ -326,6 +328,11 @@ async fn event_loop(
     // Live tool-call events for the activity feed (both backends). The sender is
     // cloned per turn; this original stays alive so the arm never closes.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TurnEvent>();
+    // Cancellation slots for local turns, the same registry the api channel uses
+    // — reused rather than reimplemented so "stop" means one thing whichever
+    // surface asked. Remote turns are cancelled server-side over HTTP, where
+    // their slot already lives.
+    let cancels = Arc::new(CancelState::new());
 
     let history = if resuming {
         resume_messages(&backend, &session).await?
@@ -510,18 +517,27 @@ async fn event_loop(
                             interactive: true,
                             auto_approve: false,
                             event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
-                            // The TUI has no stop key (yet); Ctrl-C tears
-                            // down the whole process instead.
-                            cancel: None,
+                            // Esc stops the turn: the loop flips this signal and
+                            // the agent loop gives up at its next await.
+                            cancel: Some(cancels.register(&session_id)),
                             interject: None,
                             origin: SessionOrigin::User,
                         }
                     });
+                    let turn_cancels = cancels.clone();
                     tokio::spawn(async move {
-                        let result = backend
-                            .turn(&session_id, text, ctx, events)
-                            .await
-                            .map_err(|e| format!("{e:#}"));
+                        let result = match backend.turn(&session_id, text, ctx, events).await {
+                            Ok(reply) => Ok(reply),
+                            // Classified **before** the error is stringified:
+                            // `is_cancelled` downcasts, and `{e:#}` would leave a
+                            // deliberate stop looking like a failure. The remote
+                            // arm never lands here — the gateway already answers
+                            // a cancelled turn with this same text.
+                            Err(error) if is_cancelled(&error) => Ok(CANCELLED_REPLY.to_string()),
+                            Err(error) => Err(format!("{error:#}")),
+                        };
+                        // Drop the slot so a later Esc can't hit a finished turn.
+                        turn_cancels.finish(&session_id);
                         let _ = turn_tx.send(result);
                     });
                 }
@@ -550,6 +566,36 @@ async fn event_loop(
                     } else {
                         app.push(Role::Info, "问题已失效（超时或会话已重置）。".to_string());
                     }
+                }
+                Some(Action::Interrupt) => {
+                    // Three ways a turn can be stuck, and the signal alone only
+                    // covers one: a turn parked in `ask_user` never reaches
+                    // another await, so the question has to be resolved first or
+                    // Esc looks inert until the clarify timeout. Same order the
+                    // api channel's `cancel_turn` uses.
+                    let stopped = match &backend {
+                        Backend::Remote { gateway, .. } => {
+                            gateway.cancel_turn(&app.session_id).await.unwrap_or(false)
+                        }
+                        Backend::Local { .. } => {
+                            if let Some(cl) = &clarify {
+                                cl.resolve(&app.session_id, CANCELLED_REPLY);
+                            }
+                            app.awaiting_answer = false;
+                            cancels.cancel(&app.session_id)
+                        }
+                    };
+                    // Said out loud either way: "nothing happened" and "stopping,
+                    // give it a moment" look identical otherwise, and the turn
+                    // ends at its *next* await, not instantly.
+                    app.push(
+                        Role::Info,
+                        if stopped {
+                            "正在中断…（工具调用可能要跑完当前这一步）".to_string()
+                        } else {
+                            "没有正在运行的回合可中断。".to_string()
+                        },
+                    );
                 }
                 Some(Action::Answered(_)) | None => {}
             }

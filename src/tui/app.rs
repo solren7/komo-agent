@@ -73,6 +73,9 @@ pub enum Action {
         text: String,
         shown: String,
     },
+    /// Stop the turn in flight (Esc). Only produced while one *is* in flight —
+    /// see [`App::on_key`].
+    Interrupt,
     Quit,
 }
 
@@ -351,6 +354,14 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(Action::Quit)
             }
+            // Esc interrupts the turn in flight, and does nothing at all when
+            // idle. Deliberately *not* "clear the input" when idle: the whole
+            // point of a stop key is that it can be hit without thinking, and a
+            // key that sometimes discards the draft instead is worse than one
+            // extra keystroke. (Under the approval modal Esc still means "deny"
+            // — that branch returned above; a turn parked on a prompt is not
+            // going anywhere until the prompt is answered anyway.)
+            KeyCode::Esc if self.in_flight => Some(Action::Interrupt),
             // Ctrl-D quits only on an empty input, shell-style.
             KeyCode::Char('d')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && self.input.is_empty() =>
@@ -951,6 +962,63 @@ mod tests {
         type_str(&mut app, "queued?");
         assert_eq!(app.on_key(key(KeyCode::Enter)), None, "one turn at a time");
         assert_eq!(app.input, "queued?", "draft preserved");
+    }
+
+    /// Esc is the stop key, and only while there is something to stop.
+    #[test]
+    fn esc_interrupts_only_while_a_turn_is_in_flight() {
+        let mut app = App::new("s".into());
+        assert_eq!(
+            app.on_key(key(KeyCode::Esc)),
+            None,
+            "idle Esc must do nothing at all"
+        );
+
+        app.start_turn();
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Some(Action::Interrupt));
+    }
+
+    /// Idle Esc must not double as "clear the input": a stop key that sometimes
+    /// discards the draft instead is worse than one extra keystroke.
+    #[test]
+    fn idle_esc_leaves_the_draft_alone() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "半句话");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+        assert_eq!(app.input, "半句话");
+    }
+
+    /// A turn parked on an `ask_user` question is still in flight, so Esc has to
+    /// reach it — that is the case where the cancel signal alone is not enough
+    /// (the loop is not at an await), and the event loop resolves the question.
+    #[test]
+    fn esc_interrupts_a_turn_waiting_on_a_question() {
+        let mut app = App::new("s".into());
+        app.in_flight = true;
+        app.awaiting_answer = true;
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Some(Action::Interrupt));
+    }
+
+    /// Precedence: a modal is only ever shown *during* a turn, so both Esc
+    /// meanings are live at once. The modal wins — denying is the way out of it,
+    /// and the turn it belongs to cannot advance until the prompt is answered
+    /// anyway, so nothing is lost by not interrupting on the first press.
+    #[test]
+    fn esc_under_the_modal_denies_rather_than_interrupting() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut app = App::new("s".into());
+        app.in_flight = true;
+        app.modal = Some(ApprovalPrompt {
+            summary: "rm -rf build".into(),
+            detail: None,
+            dangerous: true,
+            always_rule: None,
+            reply: Some(tx),
+        });
+        assert_eq!(
+            app.on_key(key(KeyCode::Esc)),
+            Some(Action::Answered(Answer::Deny(None)))
+        );
     }
 
     #[test]

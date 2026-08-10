@@ -376,6 +376,24 @@ impl GatewayClient {
         Ok(serde_json::from_value(val)?)
     }
 
+    /// Stop the turn in flight on `session`. `true` when a turn was actually
+    /// signalled; `false` when there was nothing to stop (it had already
+    /// finished, or never started).
+    ///
+    /// One request covers all three ways a turn can be stuck: the endpoint
+    /// denies a pending approval and answers a pending `ask_user` question
+    /// before flipping the cancel signal. A turn parked on either of those would
+    /// not observe the signal at all until it was resolved, so the order matters
+    /// and is the server's to own — see `api::cancel_turn`.
+    pub async fn cancel_turn(&self, session: &str) -> anyhow::Result<bool> {
+        self.post_field(
+            &format!("/api/interactions/{session}/cancel"),
+            json!({}),
+            "cancelled",
+        )
+        .await
+    }
+
     /// Prune runs started before `cutoff` server-side; returns the count removed.
     pub async fn prune_runs(&self, cutoff: i64) -> anyhow::Result<usize> {
         self.post_field(
