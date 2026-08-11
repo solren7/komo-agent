@@ -34,7 +34,7 @@ use komo_core::domain::{
     approval::{ActionRef, ApprovalRequest, Decision},
     context::ToolContext,
     cron::{
-        CronAction, CronJob, CronJobRepository, CronJobSpec, CronRunStatus,
+        CronAction, CronJob, CronJobRepository, CronJobSpec, CronJobStatus,
         DEFAULT_CRON_JOB_TIMEOUT_SECS,
     },
     policy::RuleSpec,
@@ -139,24 +139,28 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &'static str {
-        "Manage the gateway's scheduled jobs — recurring *work*, unlike \
+        "Manage the gateway's scheduled jobs — scheduled *work*, unlike \
          `reminder`, which only re-delivers a message. \
-         action=\"list\" returns every job with its schedule, next run and last \
-         outcome; \
-         action=\"add\" creates one (requires `name` + a 5-field `schedule` in \
-         the user's local timezone, plus either `prompt` for an agent job — an \
-         unattended agent turn with your full tool set, optionally preloading \
-         `skills` — or `command` (+ `args`/`workdir`/`timeout_secs`) for a fixed \
-         program); \
+         action=\"list\" returns every job with its schedule, status, next run \
+         and last outcome; \
+         action=\"add\" creates one (requires `name` + `schedule` — a 5-field \
+         cron expression for recurring work, or `@at YYYY-MM-DD HH:MM` for a \
+         one-shot, both in the user's local timezone — plus either `prompt` for \
+         an agent job — an unattended agent turn with your full tool set, \
+         optionally preloading `skills` — or `command` \
+         (+ `args`/`workdir`/`timeout_secs`) for a fixed program); \
          an agent job that must *do* something — control a device, write a file, \
          run a command — also needs `grants` naming those actions, or every one \
          of them is refused when it runs; \
          action=\"disable\" / \"enable\" pauses and resumes a job by `name`; \
          action=\"remove\" deletes it; action=\"run\" fires it once now. \
+         A one-shot job completes after firing (status `done`) and stays listed \
+         with its output — do not remove it to \"clean up\", the row is the \
+         record of what ran. \
          Jobs fire only while `komo gateway` runs, and each run's output is \
          delivered to the user's home channel, not into this conversation. \
          Creating or changing a job asks the user for approval. Use this for \
-         \"every morning summarize X\" / \"每周五跑一下这个脚本\"; use `reminder` \
+         \"every morning summarize X\" / \"明早 8 点跑一次这个\"; use `reminder` \
          for a plain nudge and `task` for one-off work with no clock."
     }
 
@@ -180,7 +184,7 @@ impl Tool for CronTool {
                 },
                 "schedule": {
                     "type": "string",
-                    "description": "5-field cron expression in the user's local timezone, e.g. \"0 8 * * *\" for 8 AM daily or \"0 14 * * 5\" for Friday 2 PM (action=add)."
+                    "description": "When the job fires, in the user's local timezone (action=add). Recurring: a 5-field cron expression, e.g. \"0 8 * * *\" for 8 AM daily or \"0 14 * * 5\" for Friday 2 PM. One-shot: \"@at YYYY-MM-DD HH:MM\", e.g. \"@at 2026-08-12 08:30\" — fires once, then the job completes (a past time is rejected)."
                 },
                 "prompt": {
                     "type": "string",
@@ -496,10 +500,10 @@ fn missing_job(name: &str) -> ToolError {
 /// One job as a line the model can relay: name, kind, schedule, state, target,
 /// and the last outcome when there is one.
 fn describe_job(job: &CronJob) -> String {
-    let state = if job.enabled {
-        format!("next {}", local_time(job.next_run_at))
-    } else {
-        "disabled".to_string()
+    let state = match job.status {
+        CronJobStatus::Active => format!("next {}", local_time(job.next_run_at)),
+        CronJobStatus::Paused => "paused".to_string(),
+        CronJobStatus::Done => "done".to_string(),
     };
     let target = match &job.action {
         CronAction::Command { command, args, .. } => command_line(command, args),
@@ -526,9 +530,15 @@ fn describe_job(job: &CronJob) -> String {
             local_time(at),
             status.as_str()
         ));
-        if *status == CronRunStatus::Failed && !job.last_error.is_empty() {
-            line.push_str(&format!(" — {}", oneline(&job.last_error, PROMPT_PREVIEW)));
+        if !job.last_output.is_empty() {
+            line.push_str(&format!(" — {}", oneline(&job.last_output, PROMPT_PREVIEW)));
         }
+    }
+    if !job.last_error.is_empty() {
+        line.push_str(&format!(
+            " | schedule error: {}",
+            oneline(&job.last_error, PROMPT_PREVIEW)
+        ));
     }
     line
 }
@@ -574,6 +584,7 @@ fn local_time(unix: i64) -> String {
 mod tests {
     use super::*;
     use komo_core::domain::approval::Decision;
+    use komo_core::domain::cron::CronRunStatus;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -916,7 +927,7 @@ mod tests {
             .unwrap()
             .text;
         assert!(out.contains("Disabled"), "{out}");
-        assert!(!jobs.jobs.lock().unwrap()[0].enabled);
+        assert_eq!(jobs.jobs.lock().unwrap()[0].status, CronJobStatus::Paused);
 
         let out = run(&t, json!({"action": "enable", "name": "j"}), &rec)
             .await
@@ -924,7 +935,7 @@ mod tests {
             .text;
         assert!(out.contains("next"), "{out}");
         let stored = jobs.jobs.lock().unwrap();
-        assert!(stored[0].enabled);
+        assert_eq!(stored[0].status, CronJobStatus::Active);
         assert!(stored[0].next_run_at > time::OffsetDateTime::now_utc().unix_timestamp());
     }
 
@@ -1004,7 +1015,7 @@ mod tests {
             let mut stored = jobs.jobs.lock().unwrap();
             stored[0].last_run_at = Some(1_700_000_000);
             stored[0].last_status = Some(CronRunStatus::Failed);
-            stored[0].last_error = "boom\nsecond line".into();
+            stored[0].last_output = "boom\nsecond line".into();
         }
         let out = run(&t, json!({"action": "list"}), &rec).await.unwrap().text;
         assert!(out.contains("j (agent) [0 8 * * *]"), "{out}");

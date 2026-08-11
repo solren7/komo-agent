@@ -9,6 +9,7 @@ use crate::persistence::{
 };
 
 use komo_core::domain::{
+    briefing::BriefingMarkRepository,
     home::HomeRepository,
     message::{Message, Role},
     pairing::{
@@ -209,6 +210,8 @@ struct RunStepRecord {
 
 /// Setting key for the runtime home channel (`/sethome`).
 const HOME_SETTING_KEY: &str = "home_chat";
+/// Setting key for the briefing watermark (local date last handled).
+const BRIEFING_MARK_KEY: &str = "briefing_last_handled";
 
 // ── Db ───────────────────────────────────────────────────────────────────────
 
@@ -1040,33 +1043,34 @@ impl PairingRepository for Db {
     }
 }
 
-// ── HomeRepository ────────────────────────────────────────────────────────────
+// ── Settings (HomeRepository, BriefingMarkRepository) ────────────────────────
 
-#[async_trait]
-impl HomeRepository for Db {
-    async fn get(&self) -> anyhow::Result<Option<String>> {
+impl Db {
+    /// Read one settings row; empty value reads as unset.
+    async fn setting_get(&self, key: &str) -> anyhow::Result<Option<String>> {
         let mut conn = self.inner.connection().await?;
-        match SettingRecord::get_by_id(&mut conn, HOME_SETTING_KEY).await {
+        match SettingRecord::get_by_id(&mut conn, key).await {
             Ok(record) => Ok(Some(record.value).filter(|v| !v.is_empty())),
             Err(_) => Ok(None),
         }
     }
 
-    async fn set(&self, session_id: &str) -> anyhow::Result<()> {
+    /// Upsert one settings row.
+    async fn setting_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
-            match SettingRecord::get_by_id(&mut conn, HOME_SETTING_KEY).await {
+            match SettingRecord::get_by_id(&mut conn, key).await {
                 Ok(mut record) => {
                     record
                         .update()
-                        .value(session_id.to_string())
+                        .value(value.to_string())
                         .exec(&mut conn)
                         .await?;
                 }
                 Err(_) => {
                     toasty::create!(SettingRecord {
-                        id: HOME_SETTING_KEY.to_string(),
-                        value: session_id.to_string(),
+                        id: key.to_string(),
+                        value: value.to_string(),
                     })
                     .exec(&mut conn)
                     .await?;
@@ -1075,6 +1079,28 @@ impl HomeRepository for Db {
             Ok(())
         })
         .await
+    }
+}
+
+#[async_trait]
+impl HomeRepository for Db {
+    async fn get(&self) -> anyhow::Result<Option<String>> {
+        self.setting_get(HOME_SETTING_KEY).await
+    }
+
+    async fn set(&self, session_id: &str) -> anyhow::Result<()> {
+        self.setting_set(HOME_SETTING_KEY, session_id).await
+    }
+}
+
+#[async_trait]
+impl BriefingMarkRepository for Db {
+    async fn last_handled(&self) -> anyhow::Result<Option<String>> {
+        self.setting_get(BRIEFING_MARK_KEY).await
+    }
+
+    async fn mark_handled(&self, date: &str) -> anyhow::Result<()> {
+        self.setting_set(BRIEFING_MARK_KEY, date).await
     }
 }
 

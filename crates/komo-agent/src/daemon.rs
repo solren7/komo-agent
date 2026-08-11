@@ -23,8 +23,12 @@ use chrono::Utc;
 use tracing::{error, info, warn};
 
 use komo_core::domain::{
+    briefing::BriefingMarkRepository,
     context::{SessionContext, SessionOrigin},
-    cron::{CronAction, CronJob, CronJobRepository, CronRunStatus, next_occurrence_local},
+    cron::{
+        CronAction, CronJob, CronJobRepository, CronJobStatus, CronRunStatus, next_occurrence_in,
+        next_occurrence_local,
+    },
     gateway::MessageHandler,
     llm::LlmClient,
     memory::{Memory, MemoryRepository},
@@ -57,25 +61,31 @@ const BREAKER_COOLDOWNS: [Duration; 4] = [
 /// cooldown.
 const BREAKER_ALERT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A parsed cron schedule. Wraps `croner` so the supervisor never touches the
-/// cron crate directly and the "when does it next fire" math stays testable.
+/// A parsed cron schedule. Validated with `croner` at parse time; the "when
+/// does it next fire" math goes through `domain::cron::next_occurrence_local`
+/// — the **same** function cron jobs use — so a sweep's `30 8 * * *` and a
+/// job's mean the identical local-time moment. (Matching against `Utc::now()`
+/// here is the bug that made a briefing configured for 8:30 fire at 16:30 on
+/// a UTC+8 machine.)
 pub struct Schedule {
-    cron: Cron,
+    expr: String,
 }
 
 impl Schedule {
     /// Parse a 5-field Unix cron expression (e.g. `0 * * * *` for hourly).
     pub fn parse(expr: &str) -> anyhow::Result<Self> {
-        let cron = expr
-            .parse::<Cron>()
+        expr.parse::<Cron>()
             .map_err(|e| anyhow::anyhow!("invalid cron expression `{expr}`: {e}"))?;
-        Ok(Self { cron })
+        Ok(Self {
+            expr: expr.to_string(),
+        })
     }
 
-    /// Duration from `now` until the next scheduled fire (strictly after `now`).
+    /// Duration from `now` until the next scheduled fire (strictly after `now`),
+    /// matched against the **local** calendar.
     fn next_after(&self, now: chrono::DateTime<Utc>) -> anyhow::Result<Duration> {
-        let next = self.cron.find_next_occurrence(&now, false)?;
-        Ok((next - now).to_std().unwrap_or(Duration::ZERO))
+        let next = next_occurrence_local(&self.expr, now.timestamp())?;
+        Ok(Duration::from_secs((next - now.timestamp()).max(0) as u64))
     }
 }
 
@@ -362,14 +372,23 @@ impl Maintenance for CronJobSweep {
         let mut delivery_failures = 0usize;
         for mut job in due {
             // Claim the slot before executing (see the type docs). A broken
-            // expression (bypassed add-time validation) disables the job with
+            // expression (bypassed add-time validation) pauses the job with
             // the reason recorded, rather than erroring every tick.
-            match next_occurrence_local(&job.schedule, now) {
-                Ok(next) => job.next_run_at = next,
-                Err(e) => {
-                    warn!(job = %job.name, error = %e, "broken cron schedule; disabling job");
-                    job.enabled = false;
-                    job.last_error = format!("invalid schedule: {e}");
+            let mut broken_schedule = false;
+            if job.is_once() {
+                // A one-shot completes at claim time — the same crash-safety
+                // as advancing `next_run_at`, and the row stays behind as the
+                // queryable record of what ran.
+                job.status = CronJobStatus::Done;
+            } else {
+                match next_occurrence_local(&job.schedule, now) {
+                    Ok(next) => job.next_run_at = next,
+                    Err(e) => {
+                        warn!(job = %job.name, error = %e, "broken cron schedule; pausing job");
+                        job.status = CronJobStatus::Paused;
+                        job.last_error = format!("invalid schedule: {e}");
+                        broken_schedule = true;
+                    }
                 }
             }
             job.last_run_at = Some(now);
@@ -378,12 +397,12 @@ impl Maintenance for CronJobSweep {
                 warn!(%error, job = %job.name, "failed to claim cron job; skipping this run");
                 continue;
             }
-            if !job.enabled {
+            if broken_schedule {
                 continue;
             }
 
             let started = std::time::Instant::now();
-            let (title, body, ok) = self.execute(&job, now).await;
+            let (title, body, ok, session) = self.execute(&job, now).await;
             if ok {
                 info!(job = %job.name, kind = job.action.kind(), elapsed_s = started.elapsed().as_secs(), "cron job succeeded");
                 summary.jobs_run += 1;
@@ -395,12 +414,17 @@ impl Maintenance for CronJobSweep {
                 delivery_failures += 1;
             }
             // Record the outcome best-effort (the run itself already happened).
+            // The delivered body lands in `last_output` — success and failure
+            // alike — so what ran stays queryable after the notification is
+            // gone; `last_error` is reserved for schedule/config problems.
             job.last_status = Some(if ok {
                 CronRunStatus::Ok
             } else {
                 CronRunStatus::Failed
             });
-            job.last_error = if ok { String::new() } else { body };
+            job.last_error = String::new();
+            job.last_output = body;
+            job.last_run_session = session;
             if let Err(error) = self.jobs.update(&job).await {
                 warn!(%error, job = %job.name, "failed to record cron job outcome");
             }
@@ -413,8 +437,9 @@ impl Maintenance for CronJobSweep {
 }
 
 impl CronJobSweep {
-    /// Dispatch one due job to its action, returning (title, body, success).
-    async fn execute(&self, job: &CronJob, now: i64) -> (String, String, bool) {
+    /// Dispatch one due job to its action, returning (title, body, success,
+    /// ledger session of an agent run — `None` for command jobs).
+    async fn execute(&self, job: &CronJob, now: i64) -> (String, String, bool, Option<String>) {
         match &job.action {
             CronAction::Command {
                 command,
@@ -422,14 +447,15 @@ impl CronJobSweep {
                 workdir,
                 timeout_secs,
             } => {
-                execute_cron_command(
+                let (title, body, ok) = execute_cron_command(
                     &job.name,
                     command,
                     args,
                     workdir.as_deref(),
                     Duration::from_secs(*timeout_secs),
                 )
-                .await
+                .await;
+                (title, body, ok, None)
             }
             CronAction::Agent { prompt, skills } => {
                 self.execute_cron_agent(job, prompt, skills, now).await
@@ -439,14 +465,15 @@ impl CronJobSweep {
 
     /// Run an agent-mode job: one unattended turn on the cron runtime, its reply
     /// delivered. A per-run session (`cron:<name>:<unix>`) keeps each scheduled
-    /// run an isolated, cleanly-ledgered turn — no cross-run contamination.
+    /// run an isolated, cleanly-ledgered turn — no cross-run contamination — and
+    /// is returned so the job can record where its transcript lives.
     async fn execute_cron_agent(
         &self,
         job: &CronJob,
         prompt: &str,
         skills: &[String],
         now: i64,
-    ) -> (String, String, bool) {
+    ) -> (String, String, bool, Option<String>) {
         let name = &job.name;
         let fail_title = format!("Komo job「{name}」failed");
         let Some(handler) = &self.runtime else {
@@ -455,6 +482,7 @@ impl CronJobSweep {
                 "agent-mode cron jobs need the gateway's cron runtime, which is not wired"
                     .to_string(),
                 false,
+                None,
             );
         };
         let session_id = format!("cron:{name}:{now}");
@@ -483,9 +511,14 @@ impl CronJobSweep {
                 } else {
                     truncate_head(reply, JOB_OUTPUT_CAP)
                 };
-                (format!("Komo job「{name}」"), body, true)
+                (format!("Komo job「{name}」"), body, true, Some(session_id))
             }
-            Err(e) => (fail_title, format!("agent turn failed: {e}"), false),
+            Err(e) => (
+                fail_title,
+                format!("agent turn failed: {e}"),
+                false,
+                Some(session_id),
+            ),
         }
     }
 }
@@ -798,6 +831,9 @@ pub struct BriefingSweep {
     /// tool-less `llm.complete` path on any error, so the briefing always goes
     /// out. `None` keeps the plain compose (tests, minimal wiring).
     pub runtime: Option<Arc<dyn MessageHandler>>,
+    /// Watermark of the last local day handled, for the startup catch-up
+    /// ([`briefing_catchup_due`]). `None` = no catch-up wired (tests).
+    pub marks: Option<Arc<dyn BriefingMarkRepository>>,
 }
 
 impl BriefingSweep {
@@ -819,6 +855,20 @@ impl BriefingSweep {
     }
 }
 
+impl BriefingSweep {
+    /// Stamp today's local date as handled — the catch-up's watermark.
+    /// Best-effort: a failed stamp risks one redundant catch-up check, which is
+    /// not worth failing the cycle over.
+    async fn stamp_handled(&self) {
+        if let Some(marks) = &self.marks {
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            if let Err(error) = marks.mark_handled(&today).await {
+                warn!(%error, "failed to record the briefing watermark");
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Maintenance for BriefingSweep {
     async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
@@ -827,8 +877,11 @@ impl Maintenance for BriefingSweep {
         let memories = self.memories.list().await?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
-        // Nothing on the plate → stay silent rather than ping an empty note.
+        // Nothing on the plate → stay silent rather than ping an empty note —
+        // but the slot was still handled: without the stamp, every restart
+        // today would re-evaluate it.
         let Some(prompt) = briefing_prompt(&tasks, &memories, now) else {
+            self.stamp_handled().await;
             return Ok(summary);
         };
 
@@ -859,11 +912,49 @@ impl Maintenance for BriefingSweep {
         };
         let text = text.trim();
         if text.is_empty() {
+            self.stamp_handled().await;
             return Ok(summary);
         }
         self.notifier.notify("Komo daily briefing", text).await.ok();
         summary.briefings_sent = 1;
+        self.stamp_handled().await;
         Ok(summary)
+    }
+}
+
+/// Should a starting gateway run the briefing immediately? True when today's
+/// slot has already passed and no briefing was handled today — the same
+/// "asleep over a slot → run it late, once" rule a cron job gets from its
+/// stored `next_run_at`. Only today's slot counts: yesterday's briefing is
+/// stale news, not a debt. Timezone-generic (like `next_occurrence_in`) so the
+/// decision is testable without the host's clock.
+pub fn briefing_catchup_due<Tz>(
+    expr: &str,
+    handled: Option<&str>,
+    now: chrono::DateTime<Tz>,
+) -> bool
+where
+    Tz: chrono::TimeZone + Clone,
+    Tz::Offset: std::fmt::Display,
+{
+    let today = now.format("%Y-%m-%d").to_string();
+    if handled == Some(today.as_str()) {
+        return false;
+    }
+    // Today's first slot: strictly after one second before local midnight,
+    // i.e. the earliest occurrence at or after 00:00:00 today.
+    let Some(midnight) = now.date_naive().and_hms_opt(0, 0, 0) else {
+        return false;
+    };
+    let midnight = match now.timezone().from_local_datetime(&midnight) {
+        chrono::LocalResult::Single(dt) => dt,
+        chrono::LocalResult::Ambiguous(dt, _) => dt,
+        chrono::LocalResult::None => return false,
+    };
+    match next_occurrence_in(expr, midnight - chrono::Duration::seconds(1)) {
+        Ok(slot) => slot <= now,
+        // An unparseable expression already disabled the sweep with a warning.
+        Err(_) => false,
     }
 }
 
@@ -1349,16 +1440,24 @@ mod tests {
         assert!(calls[0].1.contains("boom"));
         let job = repo.jobs.lock().unwrap()[0].clone();
         assert_eq!(job.last_status, Some(CronRunStatus::Failed));
-        assert!(job.last_error.contains("boom"));
+        assert!(
+            job.last_output.contains("boom"),
+            "the failure body is queryable after the notification: {}",
+            job.last_output
+        );
+        assert!(
+            job.last_error.is_empty(),
+            "last_error is reserved for schedule problems"
+        );
     }
 
     #[tokio::test]
-    async fn cron_job_skips_future_and_disabled_jobs() {
+    async fn cron_job_skips_future_and_paused_jobs() {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut future = due_job("future", "echo nope");
         future.next_run_at = now + 3600;
         let mut disabled = due_job("disabled", "echo nope");
-        disabled.enabled = false;
+        disabled.status = CronJobStatus::Paused;
         let (sweep, repo, notifier) = cron_sweep_with(vec![future, disabled], false);
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.jobs_run, 0);
@@ -1374,7 +1473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cron_job_broken_schedule_is_disabled_not_run() {
+    async fn cron_job_broken_schedule_is_paused_not_run() {
         let mut job = due_job("broken", "echo nope");
         job.schedule = "not a cron".into();
         let (sweep, repo, notifier) = cron_sweep_with(vec![job], false);
@@ -1385,8 +1484,38 @@ mod tests {
             "the command never ran"
         );
         let job = repo.jobs.lock().unwrap()[0].clone();
-        assert!(!job.enabled, "a broken schedule disables the job");
+        assert_eq!(
+            job.status,
+            CronJobStatus::Paused,
+            "a broken schedule pauses the job"
+        );
         assert!(job.last_error.contains("invalid schedule"));
+    }
+
+    #[tokio::test]
+    async fn one_shot_job_runs_once_and_completes() {
+        let mut job = due_job("once", "echo done-and-dusted");
+        job.schedule = "@at 2030-01-02 08:30".into();
+        let (sweep, repo, notifier) = cron_sweep_with(vec![job], false);
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.jobs_run, 1);
+        assert_eq!(notifier.calls.lock().unwrap().len(), 1, "outcome delivered");
+
+        let job = repo.jobs.lock().unwrap()[0].clone();
+        assert_eq!(job.status, CronJobStatus::Done, "one-shot completes");
+        assert!(job.last_run_at.is_some());
+        assert_eq!(job.last_status, Some(CronRunStatus::Ok));
+        assert!(
+            job.last_output.contains("done-and-dusted"),
+            "the output stays queryable on the row: {}",
+            job.last_output
+        );
+        assert!(!job.is_due(i64::MAX), "a completed one-shot never re-fires");
+
+        // A later sweep leaves it alone.
+        let summary = sweep.run().await.unwrap();
+        assert_eq!(summary.jobs_run, 0);
+        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1535,12 +1664,13 @@ mod tests {
             seen[0].1
         );
         assert!(seen[0].1.contains("总结告警轮换"));
-        // The reply was delivered and recorded.
+        // The reply was delivered and recorded — output and ledger session on
+        // the row, so the run stays traceable after the notification is gone.
         assert_eq!(notifier.calls.lock().unwrap()[0].1, "本周值班：Alice");
-        assert_eq!(
-            repo.jobs.lock().unwrap()[0].last_status,
-            Some(CronRunStatus::Ok)
-        );
+        let job = repo.jobs.lock().unwrap()[0].clone();
+        assert_eq!(job.last_status, Some(CronRunStatus::Ok));
+        assert_eq!(job.last_output, "本周值班：Alice");
+        assert_eq!(job.last_run_session.as_deref(), Some(seen[0].0.as_str()));
     }
 
     #[tokio::test]
@@ -2036,8 +2166,87 @@ mod tests {
             llm: Arc::new(FixedLlm(reply.to_string())),
             notifier: notifier.clone(),
             runtime: None,
+            marks: None,
         };
         (sweep, notifier)
+    }
+
+    #[derive(Default)]
+    struct FakeMarks(Mutex<Option<String>>);
+
+    #[async_trait]
+    impl BriefingMarkRepository for FakeMarks {
+        async fn last_handled(&self) -> anyhow::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn mark_handled(&self, date: &str) -> anyhow::Result<()> {
+            *self.0.lock().unwrap() = Some(date.to_string());
+            Ok(())
+        }
+    }
+
+    /// The sweep scheduler and the cron-job store must mean the same local
+    /// moment by the same expression — this is the alignment that keeps a
+    /// `briefing_schedule = "30 8 * * *"` from firing at 16:30 on a UTC+8 host.
+    #[test]
+    fn schedule_next_after_matches_cron_job_local_semantics() {
+        let now = Utc::now();
+        let schedule = Schedule::parse("30 8 * * *").unwrap();
+        let wait = schedule.next_after(now).unwrap();
+        let expected = next_occurrence_local("30 8 * * *", now.timestamp()).unwrap();
+        assert_eq!(now.timestamp() + wait.as_secs() as i64, expected);
+    }
+
+    #[test]
+    fn catchup_due_only_when_todays_slot_passed_unhandled() {
+        use chrono::TimeZone;
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        // 2026-08-11 is a Tuesday.
+        let now = tz.with_ymd_and_hms(2026, 8, 11, 9, 0, 0).unwrap();
+
+        // Slot 08:30 passed, nothing handled → run it late, once.
+        assert!(briefing_catchup_due("30 8 * * *", None, now));
+        // Handled yesterday counts as unhandled today.
+        assert!(briefing_catchup_due("30 8 * * *", Some("2026-08-10"), now));
+        // Already handled today → no double delivery.
+        assert!(!briefing_catchup_due("30 8 * * *", Some("2026-08-11"), now));
+        // Slot still ahead today → the supervisor will reach it on its own.
+        assert!(!briefing_catchup_due("30 18 * * *", None, now));
+        // No slot today at all (Friday-only schedule) → nothing was missed.
+        assert!(!briefing_catchup_due("30 8 * * 5", None, now));
+        // Exactly at the slot counts as passed (<=), not skipped.
+        let at_slot = tz.with_ymd_and_hms(2026, 8, 11, 8, 30, 0).unwrap();
+        assert!(briefing_catchup_due("30 8 * * *", None, at_slot));
+        // A broken expression never triggers a surprise delivery.
+        assert!(!briefing_catchup_due("not a cron", None, now));
+    }
+
+    #[tokio::test]
+    async fn briefing_stamps_the_watermark_even_when_silent() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // Something to say → delivered and stamped.
+        let (mut sweep, _notifier) =
+            briefing_with(vec![Task::new("write report".into())], vec![], "brief");
+        let marks = Arc::new(FakeMarks::default());
+        sweep.marks = Some(marks.clone());
+        sweep.run().await.unwrap();
+        assert_eq!(
+            marks.last_handled().await.unwrap().as_deref(),
+            Some(today.as_str())
+        );
+
+        // Nothing to say → silent, but the slot still counts as handled, or
+        // every restart today would re-evaluate it.
+        let (mut sweep, notifier) = briefing_with(vec![], vec![], "unused");
+        let marks = Arc::new(FakeMarks::default());
+        sweep.marks = Some(marks.clone());
+        sweep.run().await.unwrap();
+        assert!(notifier.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            marks.last_handled().await.unwrap().as_deref(),
+            Some(today.as_str())
+        );
     }
 
     /// A MessageHandler that either answers fixedly or errors, recording calls.

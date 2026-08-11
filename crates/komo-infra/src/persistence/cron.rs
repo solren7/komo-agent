@@ -10,12 +10,14 @@ use async_trait::async_trait;
 use toasty_driver_turso::Turso;
 
 use crate::persistence::{DEFAULT_POOL_SIZE, prepare_turso_path, with_write_retry};
-use komo_core::domain::cron::{CronAction, CronJob, CronJobRepository, parse_cron_run_status};
+use komo_core::domain::cron::{
+    CronAction, CronJob, CronJobRepository, parse_cron_job_status, parse_cron_run_status,
+};
 use komo_core::domain::policy::RuleSpec;
 
 // Optional i64 fields use 0 as the "unset" sentinel; `args` is a JSON array
-// string; `enabled` is 0/1; `last_status` is ""/"ok"/"failed" (same conventions
-// as the other stores).
+// string; `status` is "active"/"paused"/"done"; `last_status` is
+// ""/"ok"/"failed" (same conventions as the other stores).
 #[derive(Debug, toasty::Model)]
 struct CronJobRecord {
     #[key]
@@ -33,11 +35,13 @@ struct CronJobRecord {
     // Agent-mode columns (empty for command jobs).
     prompt: String,
     skills: String,
-    enabled: i64,
+    status: String,
     next_run_at: i64,
     last_run_at: i64,
     last_status: String,
     last_error: String,
+    last_output: String,
+    last_run_session: String,
     /// JSON array of `RuleSpec` — the actions this job may take unattended.
     /// Empty string = no grants (every job written before the column existed).
     grants: String,
@@ -64,8 +68,15 @@ impl CronDb {
                 ("prompt", "\"prompt\" text NOT NULL DEFAULT ''"),
                 ("skills", "\"skills\" text NOT NULL DEFAULT ''"),
                 ("grants", "\"grants\" text NOT NULL DEFAULT ''"),
+                ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
+                ("last_output", "\"last_output\" text NOT NULL DEFAULT ''"),
+                (
+                    "last_run_session",
+                    "\"last_run_session\" text NOT NULL DEFAULT ''",
+                ),
             ];
             crate::persistence::ensure_columns(p, "cron_job_records", EXPECTED).await?;
+            migrate_enabled_to_status(p).await?;
         }
         let driver = match &path {
             Some(p) => Turso::file(p).concurrent_writes(),
@@ -93,6 +104,54 @@ impl CronDb {
     }
 }
 
+/// One-time migration from the pre-status schema: `enabled` (0/1) becomes the
+/// stored `status` ('active'/'paused'), and the old column is dropped so it
+/// cannot fork from the new authority (and so inserts, which no longer supply
+/// it, don't trip its NOT NULL). Idempotent: a db without `enabled` is a no-op.
+/// Runs on a direct turso handle before toasty's pool connects, like
+/// `ensure_columns`.
+async fn migrate_enabled_to_status(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+        .build()
+        .await
+        .with_context(|| format!("opening {} for status migration", path.display()))?;
+    let conn = db.connect()?;
+    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+
+    let mut has_enabled = false;
+    let mut rows = conn
+        .query("PRAGMA table_info(\"cron_job_records\")", ())
+        .await
+        .context("reading cron_job_records columns")?;
+    while let Some(row) = rows.next().await? {
+        if let turso::Value::Text(name) = row.get_value(1)?
+            && name == "enabled"
+        {
+            has_enabled = true;
+        }
+    }
+    if !has_enabled {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE \"cron_job_records\" SET \"status\" = \
+         CASE WHEN \"enabled\" = 0 THEN 'paused' ELSE 'active' END",
+        (),
+    )
+    .await
+    .context("backfilling status from enabled")?;
+    conn.execute(
+        "ALTER TABLE \"cron_job_records\" DROP COLUMN \"enabled\"",
+        (),
+    )
+    .await
+    .context("dropping the legacy enabled column")?;
+    tracing::info!("migrated cron.db: enabled column replaced by status");
+    Ok(())
+}
+
 #[async_trait]
 impl CronJobRepository for CronDb {
     async fn save(&self, job: &CronJob) -> anyhow::Result<()> {
@@ -110,7 +169,7 @@ impl CronJobRepository for CronDb {
                 timeout_secs: cols.timeout_secs,
                 prompt: cols.prompt.clone(),
                 skills: cols.skills.clone(),
-                enabled: job.enabled as i64,
+                status: job.status.as_str().to_string(),
                 next_run_at: job.next_run_at,
                 last_run_at: job.last_run_at.unwrap_or(0),
                 last_status: job
@@ -119,6 +178,8 @@ impl CronJobRepository for CronDb {
                     .map(|s| s.as_str().to_string())
                     .unwrap_or_default(),
                 last_error: job.last_error.clone(),
+                last_output: job.last_output.clone(),
+                last_run_session: job.last_run_session.clone().unwrap_or_default(),
                 created_at: job.created_at,
                 grants: encode_grants(&job.grants)?,
             })
@@ -167,7 +228,7 @@ impl CronJobRepository for CronDb {
                 .timeout_secs(cols.timeout_secs)
                 .prompt(cols.prompt.clone())
                 .skills(cols.skills.clone())
-                .enabled(job.enabled as i64)
+                .status(job.status.as_str().to_string())
                 .next_run_at(job.next_run_at)
                 .last_run_at(job.last_run_at.unwrap_or(0))
                 .last_status(
@@ -177,6 +238,8 @@ impl CronJobRepository for CronDb {
                         .unwrap_or_default(),
                 )
                 .last_error(job.last_error.clone())
+                .last_output(job.last_output.clone())
+                .last_run_session(job.last_run_session.clone().unwrap_or_default())
                 .grants(encode_grants(&job.grants)?)
                 .exec(&mut conn)
                 .await?;
@@ -269,11 +332,13 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
         name: record.name,
         schedule: record.schedule,
         action,
-        enabled: record.enabled != 0,
+        status: parse_cron_job_status(&record.status),
         next_run_at: record.next_run_at,
         last_run_at: nonzero(record.last_run_at),
         last_status: parse_cron_run_status(&record.last_status),
         last_error: record.last_error,
+        last_output: record.last_output,
+        last_run_session: (!record.last_run_session.is_empty()).then_some(record.last_run_session),
         created_at: record.created_at,
         // A row written before the column existed reads as empty, which is the
         // same thing as "no grants" — never an error.
@@ -284,7 +349,7 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_core::domain::cron::CronRunStatus;
+    use komo_core::domain::cron::{CronJobStatus, CronRunStatus};
 
     fn turso_url(name: &str) -> String {
         let path = std::env::temp_dir().join(name);
@@ -327,23 +392,29 @@ mod tests {
         assert_eq!(workdir.as_deref(), Some("/opt"));
         assert_eq!(*timeout_secs, 600);
         assert_eq!(listed[0].next_run_at, 1234);
-        assert!(listed[0].enabled);
+        assert_eq!(listed[0].status, CronJobStatus::Active);
         assert!(listed[0].last_status.is_none());
+        assert_eq!(listed[0].last_output, "");
+        assert_eq!(listed[0].last_run_session, None);
 
         let mut updated = listed[0].clone();
-        updated.enabled = false;
+        updated.status = CronJobStatus::Paused;
         updated.next_run_at = 9999;
         updated.last_run_at = Some(5000);
         updated.last_status = Some(CronRunStatus::Failed);
         updated.last_error = "exit status: 3".into();
+        updated.last_output = "boom\n".into();
+        updated.last_run_session = Some("cron:weekly:5000".into());
         db.update(&updated).await.unwrap();
 
         let found = db.find_by_name("weekly").await.unwrap().unwrap();
-        assert!(!found.enabled);
+        assert_eq!(found.status, CronJobStatus::Paused);
         assert_eq!(found.next_run_at, 9999);
         assert_eq!(found.last_run_at, Some(5000));
         assert_eq!(found.last_status, Some(CronRunStatus::Failed));
         assert_eq!(found.last_error, "exit status: 3");
+        assert_eq!(found.last_output, "boom\n");
+        assert_eq!(found.last_run_session.as_deref(), Some("cron:weekly:5000"));
 
         assert!(db.delete("weekly").await.unwrap());
         assert!(
@@ -387,6 +458,15 @@ mod tests {
             )
             .await
             .unwrap();
+            // A disabled legacy row must migrate to `paused`, not `active`.
+            conn.execute(
+                "INSERT INTO \"cron_job_records\" VALUES \
+                 ('id-2', 'parked', '0 3 * * *', '/opt/nightly.sh', '[]', '', \
+                 900, 0, 2000, 0, '', '', 100)",
+                (),
+            )
+            .await
+            .unwrap();
         }
         std::fs::write(
             crate::persistence::turso_marker_path(&path),
@@ -394,8 +474,9 @@ mod tests {
         )
         .unwrap();
 
-        // 2. Connect: ensure_columns adds kind/prompt/skills in place, and the
-        //    legacy row reads back as a command job (kind defaults to 'command').
+        // 2. Connect: ensure_columns adds kind/prompt/skills in place, the
+        //    legacy row reads back as a command job (kind defaults to
+        //    'command'), and `enabled` migrates into the stored status.
         let db = CronDb::connect(&format!("turso:{}", path.display()))
             .await
             .unwrap();
@@ -405,10 +486,13 @@ mod tests {
         };
         assert_eq!(command, "/opt/rotate.py");
         assert_eq!(args, &vec!["--push".to_string()]);
+        assert_eq!(found.status, CronJobStatus::Active, "enabled=1 → active");
         assert!(
             found.grants.is_empty(),
             "a row written before the grants column must read as ungranted, not error"
         );
+        let parked = db.find_by_name("parked").await.unwrap().unwrap();
+        assert_eq!(parked.status, CronJobStatus::Paused, "enabled=0 → paused");
 
         // 3. The added columns are usable: an agent job saves and reads back.
         db.save(&CronJob::new(

@@ -13,6 +13,7 @@ use crate::{
     cli::wiring,
     domain::{
         approval::Approver,
+        briefing::BriefingMarkRepository,
         cron::CronJobRepository,
         gateway::{MessageHandler, WeChatLogin},
         home::HomeRepository,
@@ -236,6 +237,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // Reads tasks + memories, composes on the aux LLM, delivers via the same
     // home notifier as reminders.
     if let Some(schedule) = briefing_schedule {
+        let marks: Arc<dyn BriefingMarkRepository> = db.clone();
         let mut briefing_sweep: Arc<dyn Maintenance> = Arc::new(BriefingSweep {
             tasks: kanban.clone(),
             memories: wired.memories.clone(),
@@ -244,6 +246,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             // Tool-capable agent turn (read-only tools + unattended policy
             // gating); the sweep degrades to the plain compose on error.
             runtime: Some(wired.briefing_runtime.clone()),
+            marks: Some(marks.clone()),
         });
         // Opt-in: only fire on Chinese working days (statutory holidays and
         // 调休-adjusted weekends respected). The calendar is built only when
@@ -253,6 +256,29 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             briefing_sweep = Arc::new(WorkdayGated {
                 inner: briefing_sweep,
                 calendar,
+            });
+        }
+        // Startup catch-up: a gateway that was down (restart, upgrade) across
+        // today's slot runs the briefing late, once — the same rule a cron job
+        // gets from its stored `next_run_at`. Goes through the workday-gated
+        // sweep, so a holiday still skips it.
+        if let Some(expr) = briefing_expr.clone() {
+            let sweep = briefing_sweep.clone();
+            let marks = marks.clone();
+            tokio::spawn(async move {
+                let handled = marks.last_handled().await.unwrap_or_default();
+                if komo_agent::daemon::briefing_catchup_due(
+                    &expr,
+                    handled.as_deref(),
+                    chrono::Local::now(),
+                ) {
+                    tracing::info!(
+                        "briefing: today's slot passed while the gateway was down; catching up"
+                    );
+                    if let Err(error) = sweep.run().await {
+                        tracing::warn!(%error, "briefing catch-up failed");
+                    }
+                }
             });
         }
         gateway = gateway.with_maintenance(MaintenanceService {

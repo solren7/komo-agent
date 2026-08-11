@@ -386,13 +386,20 @@ call the same functions, which is what keeps validation from forking.
   ledger steps up per skill (`domain/run.rs`'s `skill_viewed`), so it reaches
   only as far back as the disposable `state.db` does.
 - `komo-agent`'s `daemon` — `Maintenance` sweeps under `supervise` (circuit breaker
-  after 5 failures): `ReviewSweep` (via the shared `ReviewCoordinator`, which
+  after 5 failures). Sweep cron expressions are matched against **local time**
+  via the same `next_occurrence_local` cron jobs use — never `Utc::now()`
+  straight into croner, which silently shifts every schedule by the UTC offset.
+  Sweeps: `ReviewSweep` (via the shared `ReviewCoordinator`, which
   also serves the post-turn trigger — watermark + in-flight guard prevent
   duplicate reviews), `ReminderSweep`, `CronJobSweep` (claim-before-run: a
   crash never re-fires a slot), `TaskSweep`, `BriefingSweep` (opt-in; aux-model
   runtime with read-only tools + deny-all unattended approver; degrades to
-  tool-less `complete` on error), `DreamSweep`. `WorkdayGated` decorator gates
-  a sweep to Chinese working days (`komo-infra`'s `workday`, cached per-year).
+  tool-less `complete` on error; stamps a per-day watermark
+  (`BriefingMarkRepository`, state.db settings) so a gateway restarted across
+  today's slot catches up once at startup — `briefing_catchup_due`, same
+  "asleep over a slot → run late, once" rule as cron jobs), `DreamSweep`.
+  `WorkdayGated` decorator gates a sweep to Chinese working days
+  (`komo-infra`'s `workday`, cached per-year).
 - `komo-agent`'s `gateway` + `interaction` — gateway hosts channels +
   sweeps. `GatewayDispatcher` owns turns (spawned per turn so `/approve` can
   arrive mid-turn; one turn per session). Chat commands: `/new` (rotate
@@ -435,8 +442,14 @@ call the same functions, which is what keeps validation from forking.
   command job from chat is `Risk::Dangerous`. An agent job declares the actions
   it needs as `grants`, approved in that **same** prompt (which is why a
   grant-carrying `add` drops the `cron:add` scope key) — narrower than a global
-  `unattended` rule and revoked when the job is removed. Recurring *work* = cron job,
-  recurring *message* = reminder.
+  `unattended` rule and revoked when the job is removed. A job's lifecycle is a
+  **stored status** (`active`/`paused`/`done` — the sole authority, no enabled
+  flag); a `@at YYYY-MM-DD HH:MM` schedule is a one-shot that completes (`done`)
+  at claim time and keeps its row as the queryable record — `last_output` holds
+  every run's delivered body and `last_run_session` links an agent run to its
+  ledger transcript, so "what did that job do" outlives the notification.
+  `enable`/`run` refuse a `done` job. Recurring *work* = cron job, recurring
+  *message* = reminder, one-shot scheduled work = `@at` job.
 - `apps/` — bun workspace: `apps/app` (shared React renderer) mounted by
   `apps/desktop` (Electron) and `apps/web` (SPA served via `web_dir`). Talks
   to the gateway over HTTP only (`HttpKomoClient`); feature-first layout;

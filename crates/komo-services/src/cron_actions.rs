@@ -7,8 +7,9 @@
 //! surface; it does not reimplement them.
 
 use komo_core::domain::cron::{
-    CronAction, CronJob, CronJobRepository, CronJobSpec, DEFAULT_CRON_JOB_TIMEOUT_SECS,
-    MAX_CRON_JOB_NAME_LEN, next_occurrence_local, valid_cron_job_name,
+    CronAction, CronJob, CronJobRepository, CronJobSpec, CronJobStatus,
+    DEFAULT_CRON_JOB_TIMEOUT_SECS, MAX_CRON_JOB_NAME_LEN, next_occurrence_local,
+    valid_cron_job_name,
 };
 use komo_core::domain::policy::{Matcher, RuleSpec};
 
@@ -138,10 +139,12 @@ pub fn normalize_grants(grants: Vec<RuleSpec>) -> anyhow::Result<Vec<RuleSpec>> 
         .collect()
 }
 
-/// Flip a job's enabled flag; `None` = no such job. Re-enabling recomputes
+/// Pause or resume a job; `None` = no such job. Resuming recomputes
 /// `next_run_at` from now — a stale past slot must not fire the moment the job
-/// comes back (a broken-schedule job that the sweep disabled keeps its stored
-/// expression, so this also surfaces the parse error to the operator).
+/// comes back (a broken-schedule job that the sweep paused keeps its stored
+/// expression, so this also surfaces the parse error to the operator; a
+/// one-shot whose moment has passed is refused the same way). A completed
+/// one-shot is terminal: its row is the record of what ran, never a schedule.
 pub async fn set_cron_enabled(
     jobs: &dyn CronJobRepository,
     name: &str,
@@ -151,17 +154,27 @@ pub async fn set_cron_enabled(
     let Some(mut job) = jobs.find_by_name(name).await? else {
         return Ok(None);
     };
-    if enabled && !job.enabled {
+    if job.status == CronJobStatus::Done {
+        anyhow::bail!(
+            "cron job `{name}` already completed (one-shot) — create a new job to run it again"
+        );
+    }
+    if enabled && job.status == CronJobStatus::Paused {
         job.next_run_at = next_occurrence_local(&job.schedule, now)?;
     }
-    job.enabled = enabled;
+    job.status = if enabled {
+        CronJobStatus::Active
+    } else {
+        CronJobStatus::Paused
+    };
     jobs.update(&job).await?;
     Ok(Some(job))
 }
 
 /// Make a job due immediately (the sweep picks it up on its next tick);
-/// `None` = no such job. The job must be enabled — triggering a disabled job
-/// would silently do nothing until someone re-enabled it.
+/// `None` = no such job. The job must be active — triggering a paused job
+/// would silently do nothing until someone resumed it, and a completed
+/// one-shot is terminal.
 pub async fn trigger_cron_job(
     jobs: &dyn CronJobRepository,
     name: &str,
@@ -170,8 +183,14 @@ pub async fn trigger_cron_job(
     let Some(mut job) = jobs.find_by_name(name).await? else {
         return Ok(None);
     };
-    if !job.enabled {
-        anyhow::bail!("cron job `{name}` is disabled — enable it first (`komo cron enable`)");
+    match job.status {
+        CronJobStatus::Done => anyhow::bail!(
+            "cron job `{name}` already completed (one-shot) — create a new job to run it again"
+        ),
+        CronJobStatus::Paused => {
+            anyhow::bail!("cron job `{name}` is paused — enable it first (`komo cron enable`)")
+        }
+        CronJobStatus::Active => {}
     }
     job.next_run_at = now;
     jobs.update(&job).await?;
@@ -187,6 +206,117 @@ pub fn no_cron_job_message(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakeJobs {
+        jobs: Mutex<Vec<CronJob>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CronJobRepository for FakeJobs {
+        async fn save(&self, job: &CronJob) -> anyhow::Result<()> {
+            self.jobs.lock().unwrap().push(job.clone());
+            Ok(())
+        }
+        async fn list(&self) -> anyhow::Result<Vec<CronJob>> {
+            Ok(self.jobs.lock().unwrap().clone())
+        }
+        async fn find_by_name(&self, name: &str) -> anyhow::Result<Option<CronJob>> {
+            Ok(self
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|j| j.name == name)
+                .cloned())
+        }
+        async fn update(&self, job: &CronJob) -> anyhow::Result<()> {
+            let mut jobs = self.jobs.lock().unwrap();
+            if let Some(slot) = jobs.iter_mut().find(|j| j.id == job.id) {
+                *slot = job.clone();
+            }
+            Ok(())
+        }
+        async fn delete(&self, name: &str) -> anyhow::Result<bool> {
+            let mut jobs = self.jobs.lock().unwrap();
+            let before = jobs.len();
+            jobs.retain(|j| j.name != name);
+            Ok(jobs.len() != before)
+        }
+    }
+
+    fn done_job(name: &str) -> CronJob {
+        let mut job = CronJob::new_command(name, "@at 2020-01-01 08:00", "/bin/true", 0);
+        job.status = CronJobStatus::Done;
+        job.last_run_at = Some(100);
+        job
+    }
+
+    /// A completed one-shot is terminal — its row is the record of what ran.
+    /// Both resume and trigger refuse rather than resurrecting a past moment.
+    #[tokio::test]
+    async fn a_completed_one_shot_refuses_enable_and_trigger() {
+        let jobs = FakeJobs::default();
+        jobs.save(&done_job("once")).await.unwrap();
+
+        let err = set_cron_enabled(&jobs, "once", true, 1000)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already completed"), "{err}");
+        let err = trigger_cron_job(&jobs, "once", 1000).await.unwrap_err();
+        assert!(err.to_string().contains("already completed"), "{err}");
+        assert_eq!(
+            jobs.find_by_name("once").await.unwrap().unwrap().status,
+            CronJobStatus::Done,
+            "refusal must not mutate the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_accepts_a_future_one_shot_and_rejects_a_past_one() {
+        let jobs = FakeJobs::default();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let job = add_cron_job(
+            &jobs,
+            CronJobSpec {
+                name: "reboot-nas".into(),
+                schedule: "@at 2030-01-02 08:30".into(),
+                action: CronAction::Command {
+                    command: "/bin/true".into(),
+                    args: vec![],
+                    workdir: None,
+                    timeout_secs: 0,
+                },
+                grants: vec![],
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(job.is_once());
+        assert!(job.next_run_at > now);
+        assert_eq!(job.status, CronJobStatus::Active);
+
+        let err = add_cron_job(
+            &jobs,
+            CronJobSpec {
+                name: "too-late".into(),
+                schedule: "@at 2020-01-01 08:00".into(),
+                action: CronAction::Command {
+                    command: "/bin/true".into(),
+                    args: vec![],
+                    workdir: None,
+                    timeout_secs: 0,
+                },
+                grants: vec![],
+            },
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already past"), "{err}");
+    }
 
     fn spec(category: &str, matcher: &str, value: &str) -> RuleSpec {
         RuleSpec {

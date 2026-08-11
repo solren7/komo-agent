@@ -24,6 +24,42 @@ use crate::domain::policy::{Rule, RuleSpec};
 /// (15 min), generous enough for a script that clones a repo and pushes an MR.
 pub const DEFAULT_CRON_JOB_TIMEOUT_SECS: u64 = 900;
 
+/// A job's lifecycle state, stored — the single authority on whether it fires.
+///
+/// - `Active` — fires when `next_run_at` arrives.
+/// - `Paused` — the operator's stop switch (also where the sweep parks a job
+///   whose schedule no longer parses, with the reason in `last_error`).
+/// - `Done` — a one-shot job that has fired. Terminal: the row stays as the
+///   queryable record of what ran and what it produced; re-running means
+///   creating a new job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronJobStatus {
+    Active,
+    Paused,
+    Done,
+}
+
+impl CronJobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// Anything unrecognized reads as `Active`: the failure mode of a mangled row
+/// is a job that fires on schedule, not one that silently stops.
+pub fn parse_cron_job_status(s: &str) -> CronJobStatus {
+    match s {
+        "paused" => CronJobStatus::Paused,
+        "done" => CronJobStatus::Done,
+        _ => CronJobStatus::Active,
+    }
+}
+
 /// Outcome of a job's most recent execution.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,20 +138,31 @@ impl CronAction {
 pub struct CronJob {
     pub id: String,
     pub name: String,
-    /// 5-field cron expression (local timezone).
+    /// 5-field cron expression (local timezone), or `@at YYYY-MM-DD HH:MM`
+    /// (local) for a one-shot job that fires once and completes.
     pub schedule: String,
     /// What the job does when it fires (command vs agent turn).
     pub action: CronAction,
-    /// Disabled jobs stay listed/inspectable but never fire.
-    pub enabled: bool,
+    /// Lifecycle state — only `Active` jobs fire. `Paused`/`Done` rows stay
+    /// listed and inspectable.
+    pub status: CronJobStatus,
     /// Next scheduled fire (unix seconds). The sweep runs a job once its
     /// `next_run_at` is due, then advances it — set to "now" to trigger an
-    /// off-schedule run on the next sweep tick.
+    /// off-schedule run on the next sweep tick. For a `Done` one-shot this
+    /// keeps the slot that fired.
     pub next_run_at: i64,
     pub last_run_at: Option<i64>,
     pub last_status: Option<CronRunStatus>,
-    /// Failure detail from the most recent run (empty on success / never ran).
+    /// Schedule/config problem detail (e.g. an expression that stopped
+    /// parsing). Run output — success and failure alike — lives in
+    /// `last_output`.
     pub last_error: String,
+    /// What the most recent run produced (delivered body, capped), success and
+    /// failure alike. Empty = never ran.
+    pub last_output: String,
+    /// Session id of the most recent agent-mode run (`cron:<name>:<unix>`),
+    /// for `komo run inspect`. `None` for command jobs / never ran.
+    pub last_run_session: Option<String>,
     pub created_at: i64,
     /// Actions this job may take unattended, approved by a human when the job
     /// was created. Empty = no side-effecting action is granted, which is what
@@ -139,11 +186,13 @@ impl CronJob {
             name: name.to_string(),
             schedule: schedule.to_string(),
             action,
-            enabled: true,
+            status: CronJobStatus::Active,
             next_run_at,
             last_run_at: None,
             last_status: None,
             last_error: String::new(),
+            last_output: String::new(),
+            last_run_session: None,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             grants: Vec::new(),
         }
@@ -170,9 +219,16 @@ impl CronJob {
         )
     }
 
-    /// Due = enabled and the scheduled fire time has arrived.
+    /// Due = active and the scheduled fire time has arrived.
     pub fn is_due(&self, now: i64) -> bool {
-        self.enabled && self.next_run_at <= now
+        self.status == CronJobStatus::Active && self.next_run_at <= now
+    }
+
+    /// One-shot job: fires once, then completes (`Done`) instead of
+    /// rescheduling. Derived from the schedule's shape, which is the one
+    /// authority on when it fires.
+    pub fn is_once(&self) -> bool {
+        schedule_is_once(&self.schedule)
     }
 
     /// This job's grants as policy rules.
@@ -250,9 +306,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_command_job_is_enabled_with_default_timeout() {
+    fn new_command_job_is_active_with_default_timeout() {
         let job = CronJob::new_command("weekly", "0 14 * * 5", "/opt/rotate.py", 1000);
-        assert!(job.enabled);
+        assert_eq!(job.status, CronJobStatus::Active);
         assert_eq!(job.action.kind(), "command");
         let CronAction::Command { timeout_secs, .. } = &job.action else {
             panic!("command job");
@@ -282,13 +338,37 @@ mod tests {
     }
 
     #[test]
-    fn due_requires_enabled_and_elapsed() {
+    fn due_requires_active_and_elapsed() {
         let mut job = CronJob::new_command("j", "* * * * *", "/bin/true", 100);
         assert!(job.is_due(100));
         assert!(job.is_due(101));
         assert!(!job.is_due(99));
-        job.enabled = false;
-        assert!(!job.is_due(200), "a disabled job is never due");
+        job.status = CronJobStatus::Paused;
+        assert!(!job.is_due(200), "a paused job is never due");
+        job.status = CronJobStatus::Done;
+        assert!(!job.is_due(200), "a completed one-shot is never due");
+    }
+
+    #[test]
+    fn once_is_derived_from_the_schedule_shape() {
+        let once = CronJob::new_command("o", "@at 2030-01-02 08:30", "/bin/true", 100);
+        assert!(once.is_once());
+        let recurring = CronJob::new_command("r", "0 8 * * *", "/bin/true", 100);
+        assert!(!recurring.is_once());
+    }
+
+    #[test]
+    fn job_status_roundtrip() {
+        for status in [
+            CronJobStatus::Active,
+            CronJobStatus::Paused,
+            CronJobStatus::Done,
+        ] {
+            assert_eq!(parse_cron_job_status(status.as_str()), status);
+        }
+        // A mangled row fires on schedule rather than silently stopping.
+        assert_eq!(parse_cron_job_status("garbage"), CronJobStatus::Active);
+        assert_eq!(parse_cron_job_status(""), CronJobStatus::Active);
     }
 
     #[test]
@@ -332,7 +412,18 @@ mod tests {
     }
 }
 
-/// Compute the next occurrence of a cron expression strictly after `after`.
+/// Prefix marking a one-shot schedule: `@at YYYY-MM-DD HH:MM` (local time).
+pub const ONCE_PREFIX: &str = "@at ";
+
+/// A one-shot schedule (`@at …`), as opposed to a recurring cron expression.
+pub fn schedule_is_once(expr: &str) -> bool {
+    expr.trim_start().starts_with(ONCE_PREFIX)
+}
+
+/// Compute the next occurrence of a schedule strictly after `after`: the next
+/// cron slot, or — for a one-shot `@at YYYY-MM-DD HH:MM` — the named moment
+/// itself, which is an **error once it has passed** (that is what makes `add`
+/// reject a past time and `enable` refuse to resurrect an elapsed one-shot).
 /// Timezone-generic so tests can use `FixedOffset` for determinism while
 /// production uses `Local`.
 pub fn next_occurrence_in<Tz>(
@@ -342,6 +433,24 @@ pub fn next_occurrence_in<Tz>(
 where
     Tz: chrono::TimeZone + Clone,
 {
+    if let Some(at) = expr.trim().strip_prefix(ONCE_PREFIX) {
+        let at = at.trim();
+        let naive = chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M").map_err(|e| {
+            anyhow::anyhow!("invalid one-shot time `{at}` (expected `@at YYYY-MM-DD HH:MM`): {e}")
+        })?;
+        let moment = match after.timezone().from_local_datetime(&naive) {
+            chrono::LocalResult::Single(dt) => dt,
+            // DST fold: two readings exist; the earlier one fires, same as cron.
+            chrono::LocalResult::Ambiguous(dt, _) => dt,
+            chrono::LocalResult::None => {
+                anyhow::bail!("one-shot time `{at}` does not exist in this timezone (DST gap)")
+            }
+        };
+        if moment <= after {
+            anyhow::bail!("one-shot time `{at}` is already past");
+        }
+        return Ok(moment);
+    }
     let cron = expr
         .parse::<Cron>()
         .map_err(|e| anyhow::anyhow!("invalid cron expression `{expr}`: {e}"))?;
@@ -386,5 +495,35 @@ mod schedule_tests {
         let next = next_occurrence_in(expr, at_9am).unwrap();
         assert_eq!(next.hour(), 9);
         assert_eq!(next.day(), 2);
+    }
+
+    #[test]
+    fn at_schedule_fires_at_the_named_local_moment() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let now = tz.with_ymd_and_hms(2024, 1, 1, 8, 0, 0).unwrap();
+        let next = next_occurrence_in("@at 2024-01-02 09:30", now).unwrap();
+        assert_eq!((next.day(), next.hour(), next.minute()), (2, 9, 30));
+        assert_eq!(next.offset().local_minus_utc(), 8 * 3600, "local, not UTC");
+    }
+
+    #[test]
+    fn at_schedule_rejects_past_and_present_moments() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let now = tz.with_ymd_and_hms(2024, 1, 2, 9, 30, 0).unwrap();
+        // Exactly now counts as past — "strictly after", same as cron.
+        let err = next_occurrence_in("@at 2024-01-02 09:30", now).unwrap_err();
+        assert!(err.to_string().contains("already past"), "{err}");
+        assert!(next_occurrence_in("@at 2023-12-31 09:30", now).is_err());
+    }
+
+    #[test]
+    fn at_schedule_rejects_malformed_times() {
+        let now = chrono::Utc::now();
+        for bad in ["@at tomorrow", "@at 2024-1-2", "@at 2024-01-02", "@at "] {
+            assert!(
+                next_occurrence_in(bad, now).is_err(),
+                "{bad} must not parse"
+            );
+        }
     }
 }

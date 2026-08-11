@@ -4,7 +4,7 @@
 //! runtime. They are the operator's view into what the gateway will act on.
 
 use crate::{
-    domain::cron::{CronAction, CronJob, CronJobSpec, CronRunStatus},
+    domain::cron::{CronAction, CronJob, CronJobSpec, CronJobStatus},
     domain::task::TaskStatus,
     services::operator_control::{
         OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
@@ -67,10 +67,10 @@ pub async fn cron_list(control: &OperatorControl) -> anyhow::Result<()> {
 
 /// One job line (+ a detail line for its last run, when it has one).
 fn print_cron_job(job: &CronJob) {
-    let state = if !job.enabled {
-        "disabled".to_string()
-    } else {
-        format!("next {}", local_time(job.next_run_at))
+    let state = match job.status {
+        CronJobStatus::Active => format!("next {}", local_time(job.next_run_at)),
+        CronJobStatus::Paused => "paused".to_string(),
+        CronJobStatus::Done => "done".to_string(),
     };
     let target = match &job.action {
         CronAction::Command { command, args, .. } => std::iter::once(command.as_str())
@@ -101,11 +101,17 @@ fn print_cron_job(job: &CronJob) {
     }
     if let (Some(at), Some(status)) = (job.last_run_at, &job.last_status) {
         let mut line = format!("      last run {} {}", local_time(at), status.as_str());
-        if *status == CronRunStatus::Failed && !job.last_error.is_empty() {
-            let first = job.last_error.lines().next().unwrap_or_default();
+        if !job.last_output.is_empty() {
+            let first = job.last_output.lines().next().unwrap_or_default();
             line.push_str(&format!(" — {first}"));
         }
         println!("{line}");
+        if let Some(session) = &job.last_run_session {
+            println!("      transcript: komo run list (session {session})");
+        }
+    }
+    if !job.last_error.is_empty() {
+        println!("      schedule error: {}", job.last_error);
     }
 }
 

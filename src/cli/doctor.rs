@@ -52,7 +52,7 @@ pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyho
 /// Scheduled cron jobs (cron.db): count, disabled ones, and any whose last run
 /// failed — the operator's "is my weekly job actually running" glance.
 async fn cron_health(control: &OperatorControl) {
-    use crate::domain::cron::CronRunStatus;
+    use crate::domain::cron::{CronJobStatus, CronRunStatus};
     println!("\ncron jobs:");
     let fetched = control
         .query(OperatorQuery::CronJobs)
@@ -73,17 +73,17 @@ async fn cron_health(control: &OperatorControl) {
         return;
     }
     for job in &jobs {
-        let mark = if !job.enabled {
+        let mark = if job.status != CronJobStatus::Active {
             OFF
         } else if job.last_status == Some(CronRunStatus::Failed) {
             BAD
         } else {
             OK
         };
-        let state = if job.enabled {
-            format!("next {}", local_time(job.next_run_at))
-        } else {
-            "disabled".to_string()
+        let state = match job.status {
+            CronJobStatus::Active => format!("next {}", local_time(job.next_run_at)),
+            CronJobStatus::Paused => "paused".to_string(),
+            CronJobStatus::Done => "done".to_string(),
         };
         let last = match (&job.last_status, job.last_run_at) {
             (Some(status), Some(at)) => {
