@@ -44,6 +44,7 @@ use komo_tools::todo::TodoTool;
 use komo_tools::web_fetch::WebFetchTool;
 use komo_tools::web_search::WebSearchTool;
 use komo_tools::wiki_index::WikiIndexTool;
+use komo_tools::wiki_read::WikiReadTool;
 use komo_tools::wiki_search::WikiSearchTool;
 use komo_tools::write::WriteTool;
 use std::sync::Arc;
@@ -315,6 +316,17 @@ pub async fn build(
     // valid across turns. A server that appears later cannot be added.
     let mcp_tools = build_mcp_tools(&config.runtime.mcp_servers).await;
 
+    // One memory query service, shared by the `memory` tool's explicit search and
+    // the enricher's automatic recall — that sharing is the point: a model handed
+    // a memory unprompted must be able to find the same memory by asking. Built
+    // before the tool set because the tool holds it.
+    let mut memory_query =
+        komo_services::memory_query::MemoryQueryService::new(memory_repo.clone());
+    if let Some(embedder) = build_embedder(config.runtime.embedding.as_ref()).await {
+        memory_query = memory_query.with_embedder(embedder);
+    }
+    let memory_query = Arc::new(memory_query);
+
     // Keep the always-on preamble small: list a bounded catalog, the rest is
     // discoverable on demand via the `skill` tool.
     //
@@ -353,10 +365,20 @@ pub async fn build(
     // (the catalog is frozen once this returns). Only a `[wiki]` that can never
     // work, which no amount of retrying fixes, drops the tool outright.
     let mut wiki_ops: Option<crate::services::operator_control::actions::WikiOps> = None;
-    // Two tools when a vault is usable: `wiki_search` (read) and `wiki_index`
-    // (maintain). They share the handles, and `wiki_index` shares the runner
-    // with the operator surface so no two runs overlap.
-    let wiki_tools: Vec<Arc<dyn komo_core::domain::tool::Tool>> = match &config.runtime.wiki {
+    // Three tools when a vault is usable: `wiki_search` (find), `wiki_read`
+    // (widen a hit into its section) and `wiki_index` (maintain). They share the
+    // handles, and `wiki_index` shares the runner with the operator surface so no
+    // two runs overlap. `wiki_read` needs none of them — the markdown on disk is
+    // the source of truth, so it reads the vault directly and serves a note
+    // edited since the last index run.
+    let mut wiki_tools: Vec<Arc<dyn komo_core::domain::tool::Tool>> = Vec::new();
+    if let Some(wiki) = &config.runtime.wiki {
+        // Registered before the handles are built, and kept even if they fail: a
+        // broken vector backend costs search, not the ability to read a note whose
+        // path the user or a memory already names.
+        wiki_tools.push(Arc::new(WikiReadTool::new(wiki.vault.clone())));
+    }
+    wiki_tools.extend(match &config.runtime.wiki {
         Some(wiki) => match wiki_handles(wiki) {
             Ok((index, embedder)) => {
                 // Probed once so a wrong url still shows up at boot instead of
@@ -394,10 +416,11 @@ pub async fn build(
                         wiki.data_dir.join(&wiki.collection).display().to_string()
                     },
                 });
-                vec![
+                let tools: Vec<Arc<dyn komo_core::domain::tool::Tool>> = vec![
                     Arc::new(WikiSearchTool::new(index, embedder)),
                     Arc::new(WikiIndexTool::new(runner)),
-                ]
+                ];
+                tools
             }
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "wiki_search unavailable");
@@ -405,7 +428,7 @@ pub async fn build(
             }
         },
         None => Vec::new(),
-    };
+    });
 
     let build_full_tools =
         |approver: Arc<dyn Approver>, delegate: Option<Arc<DelegateTool>>| -> ToolExecutor {
@@ -451,7 +474,10 @@ pub async fn build(
                     ha.token.clone(),
                 )));
             }
-            tools.register(Arc::new(MemoryTool::new(memory_repo.clone())));
+            tools.register(Arc::new(MemoryTool::new(
+                memory_repo.clone(),
+                memory_query.clone(),
+            )));
             // Shared instances, not rebuilt per executor — see `build_mcp_tools`.
             for tool in &mcp_tools {
                 tools.register(tool.clone());
@@ -561,16 +587,26 @@ pub async fn build(
     // Hand the same tool instances to the LLM so the model can call them, plus
     // the memory enricher (main agent only): the memory store for pinned/recall
     // selection and the aux agent for recall screening, behind one interface.
-    let mut enricher = MemoryEnricher::new(memory_repo.clone(), Some(aux_llm.clone()));
-    if let Some(embedder) = build_embedder(config.runtime.embedding.as_ref()).await {
-        enricher = enricher.with_embedder(embedder);
-    }
-    let enricher = Arc::new(enricher);
+    let enricher = Arc::new(MemoryEnricher::new(
+        memory_repo.clone(),
+        Some(aux_llm.clone()),
+        memory_query.clone(),
+    ));
     let llm = build_llm(model_config, Some(&tools), preamble, Some(enricher), None)?;
     let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
+    // The seam every extracted observation goes through. It shares the query
+    // service with recall, so "which existing claims might this be about" is
+    // answered by the same hybrid matching that decides what gets injected.
+    let consolidator = Arc::new(
+        komo_services::memory_consolidation::MemoryConsolidator::new(
+            memory_repo.clone(),
+            aux_llm.clone(),
+            memory_query.clone(),
+        ),
+    );
     let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
         aux_llm.clone(),
-        memory_repo.clone(),
+        consolidator,
         skill_repo,
         kanban.clone(),
     ));

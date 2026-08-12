@@ -80,15 +80,25 @@ pub struct ResumeOutcome {
     pub reply: String,
 }
 
-/// One candidate in the dreaming preview, with the score that drove its verdict.
+/// One candidate in the dreaming preview, carrying the signals behind its
+/// verdict: the truth signals that decide promotion, and the usage signal that
+/// decides retention.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamItem {
     pub id: String,
-    pub recall_count: i64,
-    /// Distinct recall-query fingerprints (the diversity half of the promote
-    /// gate). `default` so a payload from an older gateway still parses.
+    /// Independent occasions of support — what promotion actually reads.
+    /// `default` so a payload from an older gateway still parses.
     #[serde(default)]
-    pub unique_queries: usize,
+    pub support_count: i64,
+    #[serde(default)]
+    pub contradiction_count: i64,
+    /// `current` / `contested` / `superseded`. Anything but `current` blocks
+    /// promotion.
+    #[serde(default)]
+    pub belief: String,
+    /// Retrieval frequency. Retention only — never evidence that a memory is
+    /// true, which is why it no longer appears in the promote gate.
+    pub recall_count: i64,
     pub score: f64,
     pub content: String,
 }

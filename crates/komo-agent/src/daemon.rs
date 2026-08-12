@@ -180,7 +180,12 @@ impl DreamSweep {
                     match self.memories.save(&memory).await {
                         Ok(()) => {
                             summary.memories_promoted += 1;
-                            info!(id = %memory.id, recalls = memory.recall_count, queries = memory.recall_query_hashes.len(), "dream: promoted candidate to active");
+                            info!(
+                                id = %memory.id,
+                                support = memory.support_count,
+                                confirmed = memory.last_confirmed_at.is_some(),
+                                "dream: promoted candidate to active"
+                            );
                         }
                         Err(error) => {
                             warn!(%error, id = %memory.id, "dream: promote failed (skipped)")
@@ -2371,7 +2376,7 @@ mod tests {
     // ── DreamSweep ────────────────────────────────────────────────────────────
 
     use komo_core::domain::memory::{
-        DREAM_FORGET_AGE_DAYS, DREAM_MIN_RECALL_COUNT, MemoryConfidence, MemoryStatus,
+        DREAM_FORGET_AGE_DAYS, DREAM_MIN_SUPPORT, EvidenceRelation, MemoryConfidence, MemoryStatus,
     };
 
     /// A `FakeMemories` whose `save` overwrites by id (the real store is
@@ -2395,25 +2400,31 @@ mod tests {
         }
     }
 
-    fn dream_candidate(id: &str, recall_count: i64, age_days: i64, now: i64) -> Memory {
+    /// A candidate with `support` independent occasions of support behind it —
+    /// the signal promotion actually reads.
+    fn dream_candidate(id: &str, support: i64, age_days: i64, now: i64) -> Memory {
         let mut m = Memory::new(MemoryKind::Fact, "a candidate fact");
         m.id = id.to_string();
         m.status = MemoryStatus::Candidate;
         m.confidence = MemoryConfidence::Extracted;
         m.created_at = now - age_days * 86_400;
-        m.recall_count = recall_count;
-        if recall_count > 0 {
-            m.last_used_at = Some(now - 86_400);
-            // Diverse queries, so the count is the deciding signal under test.
-            m.recall_query_hashes = (0..recall_count).map(|i| format!("hash-{i}")).collect();
+        for i in 0..support {
+            m.record_evidence(
+                &format!("s-{id}-{i}"),
+                EvidenceRelation::Supports,
+                "the user said so",
+                now - 86_400,
+            );
         }
+        // `record_evidence` bumps `updated_at`; the age under test is `created_at`.
+        m.created_at = now - age_days * 86_400;
         m
     }
 
     #[tokio::test]
     async fn dream_sweep_promotes_and_archives() {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let promote = dream_candidate("mem-promote", DREAM_MIN_RECALL_COUNT, 5, now);
+        let promote = dream_candidate("mem-promote", DREAM_MIN_SUPPORT, 5, now);
         let archive = dream_candidate("mem-archive", 0, DREAM_FORGET_AGE_DAYS + 5, now);
         let keep = dream_candidate("mem-keep", 0, 1, now); // young, never recalled
         let (pid, aid, kid) = (promote.id.clone(), archive.id.clone(), keep.id.clone());
@@ -2428,8 +2439,8 @@ mod tests {
 
         let mems = repo.0.lock().unwrap();
         let by_id = |id: &str| mems.iter().find(|m| m.id == id).unwrap();
-        // Promoted → active + inferred (usage-proven, not user-confirmed), so it
-        // recalls but stays ineligible for L1 pinning.
+        // Promoted → active + inferred (evidence-proven, not user-confirmed), so
+        // it recalls but stays ineligible for L1 pinning.
         assert_eq!(by_id(&pid).status, MemoryStatus::Active);
         assert_eq!(by_id(&pid).confidence, MemoryConfidence::Inferred);
         assert_eq!(by_id(&aid).status, MemoryStatus::Archived);

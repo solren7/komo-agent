@@ -79,13 +79,18 @@ fn strip_frontmatter(content: &str) -> &str {
 /// Fences matter beyond formatting: a shell or Python block is full of lines
 /// starting with `#`, and treating those as headings would shatter the block
 /// into dozens of bogus sections. 47% of this vault's notes contain fences.
-fn is_fence(line: &str) -> bool {
+///
+/// Public because `wiki_read` walks the same heading tree to slice out a
+/// section: a second definition of "what is a heading" would let the reader miss
+/// a heading the searcher reported.
+pub fn is_fence(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("```") || t.starts_with("~~~")
 }
 
-/// Heading level (1-6) and text, for a line that is a heading.
-fn parse_heading(line: &str) -> Option<(usize, &str)> {
+/// Heading level (1-6) and text, for a line that is a heading. Public for the
+/// same reason as [`is_fence`].
+pub fn parse_heading(line: &str) -> Option<(usize, &str)> {
     let hashes = line.len() - line.trim_start_matches('#').len();
     if hashes == 0 || hashes > 6 {
         return None;

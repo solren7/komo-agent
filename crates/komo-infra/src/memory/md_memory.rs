@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 
 use komo_core::domain::memory::{
-    Memory, MemoryConfidence, MemoryRepository, MemoryScope, MemoryStatus, parse_memory_confidence,
-    parse_memory_kind, parse_memory_status,
+    BeliefState, Memory, MemoryConfidence, MemoryRepository, MemoryScope, MemoryStatus,
+    parse_belief_state, parse_memory_confidence, parse_memory_kind, parse_memory_status,
 };
 
 pub struct MdMemoryStore {
@@ -88,6 +88,30 @@ fn render_md(memory: &Memory) -> String {
     if memory.recall_count > 0 {
         front.push_str(&format!("recall_count: {}\n", memory.recall_count));
     }
+    // Belief and the truth signals **must** round-trip. Dropping an embedding or a
+    // recall count costs quality; dropping `superseded` resurrects a belief someone
+    // deliberately retired, and dropping a support count re-opens a promotion
+    // decision that was already earned. Only the evidence *detail* is left out — a
+    // JSON blob in frontmatter would be unreadable, and it is provenance, not a
+    // decision input (see `Memory::evidence`).
+    if memory.belief != BeliefState::Current {
+        front.push_str(&format!("belief: {}\n", memory.belief.as_str()));
+    }
+    if !memory.superseded_by.is_empty() {
+        front.push_str(&format!("superseded_by: {}\n", memory.superseded_by));
+    }
+    if memory.support_count > 0 {
+        front.push_str(&format!("support_count: {}\n", memory.support_count));
+    }
+    if memory.contradiction_count > 0 {
+        front.push_str(&format!(
+            "contradiction_count: {}\n",
+            memory.contradiction_count
+        ));
+    }
+    if let Some(last_confirmed_at) = memory.last_confirmed_at {
+        front.push_str(&format!("last_confirmed_at: {last_confirmed_at}\n"));
+    }
     format!("{front}---\n\n{}\n", memory.content)
 }
 
@@ -113,6 +137,11 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
     let mut expires_at: Option<i64> = None;
     let mut last_used_at: Option<i64> = None;
     let mut recall_count: i64 = 0;
+    let mut belief = BeliefState::Current;
+    let mut superseded_by = String::new();
+    let mut support_count: i64 = 0;
+    let mut contradiction_count: i64 = 0;
+    let mut last_confirmed_at: Option<i64> = None;
 
     for line in front.lines() {
         if let Some(v) = line.strip_prefix("kind:") {
@@ -146,6 +175,16 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
             last_used_at = v.trim().parse::<i64>().ok();
         } else if let Some(v) = line.strip_prefix("recall_count:") {
             recall_count = v.trim().parse::<i64>().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("belief:") {
+            belief = parse_belief_state(v.trim());
+        } else if let Some(v) = line.strip_prefix("superseded_by:") {
+            superseded_by = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("support_count:") {
+            support_count = v.trim().parse::<i64>().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("contradiction_count:") {
+            contradiction_count = v.trim().parse::<i64>().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("last_confirmed_at:") {
+            last_confirmed_at = v.trim().parse::<i64>().ok();
         }
     }
 
@@ -174,10 +213,18 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
         updated_at: updated_at.unwrap_or(created_at),
         expires_at,
         last_used_at,
+        belief,
+        support_count,
+        contradiction_count,
+        last_confirmed_at,
+        superseded_by,
+        // The counts round-trip but the per-observation detail does not: a legacy
+        // file predates evidence entirely, and a rendered one deliberately omits
+        // the blob. A memory read back therefore knows *how much* backed it up,
+        // not *which sessions* — enough for every decision, short of the audit
+        // trail the canonical store keeps.
+        evidence: Vec::new(),
         recall_count,
-        // Legacy markdown predates query fingerprints; counts imported without
-        // provenance start diversity from zero (the conservative default).
-        recall_query_hashes: Vec::new(),
         // Markdown carries no vector. Left empty so the backfill embeds it on
         // its own terms rather than importing a stale or foreign one.
         embedding: Vec::new(),
@@ -212,7 +259,7 @@ impl MemoryRepository for MdMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_core::domain::memory::MemoryKind;
+    use komo_core::domain::memory::{EvidenceRelation, MemoryKind};
 
     fn temp_store(name: &str) -> MdMemoryStore {
         let dir = std::env::temp_dir().join(name);
@@ -261,6 +308,44 @@ mod tests {
             }
         );
         assert_eq!(rows[0].source_message_id, "commit-abc");
+    }
+
+    /// Belief and the truth signals have to survive a round-trip. Losing them is
+    /// not a quality regression like a dropped embedding — a `superseded` memory
+    /// that reads back as `current` is a retired belief coming back to life, and
+    /// an earned support count reading back as zero re-opens a settled promotion.
+    #[tokio::test]
+    async fn belief_and_truth_signals_roundtrip() {
+        let store = temp_store("komo_md_memory_belief");
+        let now = 1_700_000_000;
+        let mut memory = Memory::new(MemoryKind::Preference, "prefers Python examples");
+        memory.record_evidence("s-1", EvidenceRelation::Supports, "I use Python", now);
+        memory.record_evidence("s-2", EvidenceRelation::Contradicts, "Rust now", now);
+        memory.last_confirmed_at = Some(now);
+        memory.supersede("mem-rust", now);
+        store.save(&memory).await.unwrap();
+
+        let rows = store.list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].belief, BeliefState::Superseded);
+        assert!(!rows[0].is_injectable(), "a retired belief stays retired");
+        assert_eq!(rows[0].superseded_by, "mem-rust");
+        assert_eq!(rows[0].support_count, 1);
+        assert_eq!(rows[0].contradiction_count, 1);
+        assert_eq!(rows[0].last_confirmed_at, Some(now));
+    }
+
+    /// A believed memory writes no belief line — the common case must not pay for
+    /// the exceptional one, and an absent line reads back as `current`.
+    #[tokio::test]
+    async fn a_current_belief_writes_no_frontmatter_line() {
+        let memory = Memory::new(MemoryKind::Fact, "komo is written in Rust");
+        let rendered = render_md(&memory);
+        assert!(!rendered.contains("belief:"), "{rendered}");
+        assert_eq!(
+            parse_md("mem-1", &rendered).unwrap().belief,
+            BeliefState::Current
+        );
     }
 
     #[tokio::test]

@@ -71,9 +71,22 @@ fn report_bucket(label: &str, items: &[DreamItem]) {
     }
     println!("\n{label}: {}", items.len());
     for m in items.iter().take(20) {
+        // Support and contradictions first: they are what the verdict reads.
+        // Recalls are shown because they explain *archival*, not promotion.
+        let belief = if m.belief.is_empty() || m.belief == "current" {
+            String::new()
+        } else {
+            format!(" {}", m.belief)
+        };
         println!(
-            "  {}  [recalls={} queries={} score={:.2}]  {}",
-            m.id, m.recall_count, m.unique_queries, m.score, m.content
+            "  {}  [support={} against={}{} recalls={} score={:.2}]  {}",
+            m.id,
+            m.support_count,
+            m.contradiction_count,
+            belief,
+            m.recall_count,
+            m.score,
+            m.content
         );
     }
     if items.len() > 20 {

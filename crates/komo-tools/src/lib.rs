@@ -34,5 +34,6 @@ pub mod todo;
 pub mod web_fetch;
 pub mod web_search;
 pub mod wiki_index;
+pub mod wiki_read;
 pub mod wiki_search;
 pub mod write;

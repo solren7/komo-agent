@@ -5,10 +5,7 @@ use serde::Deserialize;
 
 use komo_core::domain::{
     llm::LlmClient,
-    memory::{
-        Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryRepository, MemoryStatus,
-        parse_memory_kind,
-    },
+    memory::{MemoryContext, MemoryKind, parse_memory_kind},
     message::{Message, Role},
     repository::SkillRepository,
     reviewer::{ReviewOutcome, Reviewer, SELF_REVIEW_PROMPT},
@@ -16,10 +13,14 @@ use komo_core::domain::{
     skill::{SOURCE_REVIEWER, Skill},
     task::{Task, TaskRepository, TaskStatus},
 };
+use komo_services::memory_consolidation::{Consolidated, MemoryConsolidator, Observation};
 
 pub struct ReflectiveReviewer {
     llm: Arc<dyn LlmClient>,
-    memories: Arc<dyn MemoryRepository>,
+    /// Where extracted memory observations go. The reviewer holds no memory store
+    /// of its own: deciding what an observation *means* against the existing
+    /// library is one rule, and it lives in one place.
+    consolidator: Arc<MemoryConsolidator>,
     skills: Arc<dyn SkillRepository>,
     tasks: Arc<dyn TaskRepository>,
 }
@@ -27,13 +28,13 @@ pub struct ReflectiveReviewer {
 impl ReflectiveReviewer {
     pub fn new(
         llm: Arc<dyn LlmClient>,
-        memories: Arc<dyn MemoryRepository>,
+        consolidator: Arc<MemoryConsolidator>,
         skills: Arc<dyn SkillRepository>,
         tasks: Arc<dyn TaskRepository>,
     ) -> Self {
         Self {
             llm,
-            memories,
+            consolidator,
             skills,
             tasks,
         }
@@ -110,63 +111,43 @@ impl Reviewer for ReflectiveReviewer {
         let ctx = MemoryContext::from_session(&session.id);
         let mut outcome = ReviewOutcome::default();
 
-        // Load the memory store once and derive both dedup guards from it,
-        // instead of re-scanning per suggestion (the sweep runs the reviewer
-        // over every active session — the per-suggestion scans were O(sessions ×
-        // suggestions) full-table reads).
+        // Extraction produces *observations*; deciding what each one means against
+        // what komo already believes belongs to `MemoryConsolidator`. That is what
+        // turns a reworded restatement into evidence for an existing claim rather
+        // than a near-duplicate memory, and a change of mind into a supersede
+        // rather than two contradictory facts both eligible for injection.
         //
-        //  - `known_keys` (anti-self-cannibalization, roadmap §5): content keys
-        //    of active, in-scope memories — exactly the set eligible to be
-        //    recalled into this session. A re-extraction matching one is the
-        //    assistant echoing its own injected context, not a fresh user
-        //    disclosure. Exact content-key match only; fuzzy/semantic dedup is
-        //    deferred to embedding-based recall (§5-D).
-        //  - `seen_keys` (cross-sweep dedup): the `source_message_id`s this
-        //    session already produced (any status), mirroring
-        //    `find_by_source_message_id(session.id, key)`. Mutable so a duplicate
-        //    within this same review is also caught.
-        let all_memories = self.memories.list().await?;
-        let known_keys: std::collections::HashSet<String> = all_memories
-            .iter()
-            .filter(|m| m.status == MemoryStatus::Active && ctx.allows(&m.scope))
-            .map(|m| memory_key(&m.content))
+        // The dedup guards that used to live here — the exact content-key echo
+        // check and per-session deduplication — moved with it, because they are the
+        // trivial cases of the same question.
+        let observations: Vec<Observation> = suggestions
+            .memories
+            .into_iter()
+            .filter(|s| !should_skip(&s.content))
+            .map(|s| Observation {
+                kind: s
+                    .kind
+                    .as_deref()
+                    .map(parse_memory_kind)
+                    .unwrap_or(MemoryKind::Fact),
+                // The quote is what the user actually said; the claim is komo's
+                // wording of it. Provenance wants the former, and falls back to
+                // the latter when the extractor gave none.
+                excerpt: s
+                    .quote
+                    .filter(|q| !q.trim().is_empty())
+                    .unwrap_or_else(|| s.content.clone()),
+                content: s.content,
+            })
             .collect();
-        let mut seen_keys: std::collections::HashSet<String> = all_memories
-            .iter()
-            .filter(|m| m.source == session.id && !m.source_message_id.is_empty())
-            .map(|m| m.source_message_id.clone())
-            .collect();
-
-        for suggestion in suggestions.memories {
-            if should_skip(&suggestion.content) {
-                continue;
-            }
-            let kind = suggestion
-                .kind
-                .as_deref()
-                .map(parse_memory_kind)
-                .unwrap_or(MemoryKind::Fact);
-            // Content-derived dedup key: skip if this session already produced
-            // the same fact (an earlier sweep or earlier in this review), or if
-            // komo already holds it as an active, in-scope memory.
-            let key = memory_key(&suggestion.content);
-            if seen_keys.contains(&key) || known_keys.contains(&key) {
-                continue;
-            }
-            let mut memory = Memory::new(kind, suggestion.content);
-            // Automated extraction is a low-trust suggestion: it lands as a
-            // Candidate the user confirms or discards (same governance as task
-            // inbox), never a pinned/active memory. Scope it to the origin so a
-            // channel-scoped fact never leaks into another chat.
-            memory.status = MemoryStatus::Candidate;
-            memory.confidence = MemoryConfidence::Extracted;
-            memory.scope = ctx.write_scope();
-            // Tag the origin so a later answer can trace why komo believes this.
-            memory.source = session.id.clone();
-            memory.source_message_id = key.clone();
-            self.memories.save(&memory).await?;
-            seen_keys.insert(key);
-            outcome.memories_written.push(memory.id);
+        if !observations.is_empty() {
+            let results = self
+                .consolidator
+                .consolidate_all(&ctx, &session.id, observations)
+                .await?;
+            outcome
+                .memories_written
+                .extend(results.into_iter().filter_map(written_id));
         }
 
         for suggestion in suggestions.skills {
@@ -272,11 +253,16 @@ fn commitment_key(title: &str) -> String {
     format!("commit-{:016x}", fnv1a(title))
 }
 
-/// Content-derived dedup key for an extracted memory (same FNV-1a-over-
-/// normalized-text scheme as [`commitment_key`]), so a re-extraction of the
-/// same fact maps to the same key.
-fn memory_key(content: &str) -> String {
-    format!("mem-{:016x}", fnv1a(content))
+/// The id a consolidation outcome reports as "written" for the review summary,
+/// which counts library changes. `Skipped` changed nothing.
+fn written_id(result: Consolidated) -> Option<String> {
+    match result {
+        Consolidated::Created { id } | Consolidated::Supported { id } => Some(id),
+        // The new claim is the write worth naming; the retired one is its
+        // consequence.
+        Consolidated::Contested { new, .. } | Consolidated::Superseded { new, .. } => Some(new),
+        Consolidated::Skipped => None,
+    }
 }
 
 /// FNV-1a over whitespace-normalized lowercased text. Deterministic, dependency-
@@ -349,7 +335,8 @@ fn review_prompt(session: &Session, catalog: &str) -> String {
 
     format!(
         "{SELF_REVIEW_PROMPT}\n\n{existing}Return only JSON in this exact shape:\n\
-         {{\"memories\":[{{\"kind\":\"profile|preference|feedback|project|person|fact|decision|reference\",\"content\":\"...\"}}],\
+         {{\"memories\":[{{\"kind\":\"profile|preference|feedback|project|person|fact|decision|reference\",\
+         \"content\":\"...\",\"quote\":\"the user's own words this came from\"}}],\
          \"skills\":[{{\"name\":\"class-level-skill-name\",\"description\":\"...\",\
          \"instructions\":\"full patched skill body\"}}],\
          \"commitments\":[{{\"title\":\"short actionable obligation\",\
@@ -396,6 +383,11 @@ struct MemorySuggestion {
     #[serde(default)]
     kind: Option<String>,
     content: String,
+    /// What the user actually said, kept as evidence provenance so a
+    /// `support_count` can be audited instead of trusted. Optional: absent, the
+    /// claim itself is used, which is weaker but never wrong.
+    #[serde(default)]
+    quote: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,7 +447,13 @@ fn should_skip(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The reviewer itself no longer touches the memory store — the consolidator
+    // does — but these tests still assert what lands in it.
+    use komo_core::domain::memory::{
+        Memory, MemoryConfidence, MemoryRepository, MemoryScope, MemoryStatus,
+    };
     use komo_core::domain::skill::Skill;
+    use komo_services::memory_query::MemoryQueryService;
     use std::sync::Mutex;
 
     // ── fakes ─────────────────────────────────────────────────────────────────
@@ -550,11 +548,26 @@ mod tests {
         }
     }
 
+    /// A consolidator over `memories` whose classifier always answers
+    /// "unrelated", so these tests exercise the *reviewer* — extraction, scoping,
+    /// the dedup guards — and not the classification, which
+    /// `memory_consolidation` tests directly.
+    fn consolidator_over(memories: Arc<dyn MemoryRepository>) -> Arc<MemoryConsolidator> {
+        let query = Arc::new(MemoryQueryService::new(memories.clone()));
+        Arc::new(MemoryConsolidator::new(
+            memories,
+            Arc::new(FixedLlm(
+                r#"{"relation":"unrelated","target":""}"#.to_string(),
+            )),
+            query,
+        ))
+    }
+
     fn reviewer_with(reply: &str) -> (ReflectiveReviewer, Arc<FakeTasks>) {
         let tasks = Arc::new(FakeTasks::default());
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
-            Arc::new(FakeMemories::default()),
+            consolidator_over(Arc::new(FakeMemories::default())),
             Arc::new(FakeSkills::default()),
             tasks.clone(),
         );
@@ -627,7 +640,7 @@ mod tests {
         let skills = Arc::new(FakeSkills(Mutex::new(existing)));
         let reviewer = ReflectiveReviewer::new(
             llm,
-            Arc::new(FakeMemories::default()),
+            consolidator_over(Arc::new(FakeMemories::default())),
             skills.clone(),
             Arc::new(FakeTasks::default()),
         );
@@ -796,7 +809,7 @@ mod tests {
         let memories = Arc::new(FakeMemories::default());
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
-            memories.clone(),
+            consolidator_over(memories.clone()),
             Arc::new(FakeSkills::default()),
             tasks,
         );
@@ -809,7 +822,7 @@ mod tests {
         assert_eq!(rows[0].confidence, MemoryConfidence::Extracted);
         assert_eq!(
             rows[0].scope,
-            komo_core::domain::memory::MemoryScope::Channel {
+            MemoryScope::Channel {
                 platform: "telegram".into(),
                 chat_id: "42".into()
             }
@@ -823,7 +836,7 @@ mod tests {
         let memories = Arc::new(FakeMemories::default());
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
-            memories.clone(),
+            consolidator_over(memories.clone()),
             Arc::new(FakeSkills::default()),
             Arc::new(FakeTasks::default()),
         );
@@ -846,7 +859,7 @@ mod tests {
         let memories = Arc::new(FakeMemories::default());
         let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
-        existing.scope = komo_core::domain::memory::MemoryScope::Channel {
+        existing.scope = MemoryScope::Channel {
             platform: "telegram".into(),
             chat_id: "42".into(),
         };
@@ -855,7 +868,7 @@ mod tests {
 
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
-            memories.clone(),
+            consolidator_over(memories.clone()),
             Arc::new(FakeSkills::default()),
             Arc::new(FakeTasks::default()),
         );
@@ -875,7 +888,7 @@ mod tests {
         let memories = Arc::new(FakeMemories::default());
         let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
-        existing.scope = komo_core::domain::memory::MemoryScope::Channel {
+        existing.scope = MemoryScope::Channel {
             platform: "feishu".into(),
             chat_id: "oc_x".into(),
         };
@@ -883,7 +896,7 @@ mod tests {
 
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
-            memories.clone(),
+            consolidator_over(memories.clone()),
             Arc::new(FakeSkills::default()),
             Arc::new(FakeTasks::default()),
         );

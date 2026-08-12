@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_services::memory_enrichment::pinned_budget_usage;
+use komo_services::memory_query::MemoryQueryService;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use komo_core::domain::{
     context::ToolContext,
     memory::{
-        Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
-        MemoryStatus, RecallQuery, ScoredMemory, parse_memory_kind, parse_memory_status,
-        select_recall,
+        EvidenceRelation, Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryRepository,
+        MemoryStatus, ScoredMemory, parse_memory_kind, parse_memory_status,
     },
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
@@ -46,7 +46,7 @@ struct MemoryArgs {
     /// Optional TTL in days (action=save).
     #[serde(default)]
     expiry_days: Option<i64>,
-    /// Ids of existing memories the new fact replaces (action=save); archived
+    /// Ids of existing memories the new fact replaces (action=save); superseded
     /// in the same call so an outdated fact never coexists with its successor.
     #[serde(default)]
     supersedes: Option<Vec<String>>,
@@ -86,13 +86,18 @@ impl MemoryArgs {
 /// library: `promote` a candidate to active, `reject`/`archive` it, or `update`
 /// fields (including `pinned`, which gates L1 per-turn injection). Storage lives
 /// behind [`MemoryRepository`] — the same store the reviewer writes to.
+///
+/// Searching goes through the same [`MemoryQueryService`] as automatic recall, so
+/// what the model can find by asking is exactly what it can be handed
+/// unprompted — including candidates and cross-language matches.
 pub struct MemoryTool {
     memories: Arc<dyn MemoryRepository>,
+    query: Arc<MemoryQueryService>,
 }
 
 impl MemoryTool {
-    pub fn new(memories: Arc<dyn MemoryRepository>) -> Self {
-        Self { memories }
+    pub fn new(memories: Arc<dyn MemoryRepository>, query: Arc<MemoryQueryService>) -> Self {
+        Self { memories, query }
     }
 
     /// A Hermes-style usage line for the L1 pinned profile — the one memory
@@ -137,7 +142,10 @@ impl Tool for MemoryTool {
         "Persistent long-term memory across sessions, with governance. \
          action=\"save\" stores a fact (optional kind: profile | preference | feedback | \
          project | person | fact | decision | reference); action=\"search\" returns facts \
-         matching a query (scoped to this chat); action=\"list\" returns stored facts; \
+         matching a query (scoped to this chat) — by meaning as well as by wording, so \
+         it matches across languages, and it is worth re-searching with different terms \
+         when the memories you were handed are close but not enough; action=\"list\" \
+         returns stored facts; \
          action=\"update\" changes a memory by id (status / pinned / importance / kind / \
          content); action=\"promote\" marks a candidate active; action=\"reject\" / \
          \"archive\" retire one. Pin a memory (update pinned=true) only when the user \
@@ -147,9 +155,10 @@ impl Tool for MemoryTool {
          future steering. Do not save anything that will be stale within a week — task \
          progress, completed-work logs, PR/issue numbers, or commit SHAs do not belong here. \
          When a new fact replaces or contradicts a stored one (a changed preference, a \
-         corrected fact), pass `supersedes: [ids]` on save so the outdated memory is \
-         archived instead of coexisting with its successor; `save` reports possibly \
-         related existing memories so you can catch the conflict."
+         corrected fact), pass `supersedes: [ids]` on save: the outdated memory is \
+         retired as history that points at its replacement, instead of coexisting with \
+         it. `save` reports possibly related existing memories so you can catch the \
+         conflict while you are still in context."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -176,7 +185,7 @@ impl Tool for MemoryTool {
                 "supersedes": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Ids of stored memories the new fact replaces (action=save); they are archived in the same call."
+                    "description": "Ids of stored memories the new fact replaces (action=save); they are retired as history in the same call, linked to the new memory."
                 }
             },
             "required": ["action"]
@@ -206,13 +215,31 @@ impl Tool for MemoryTool {
                 for id in args.supersedes.as_deref().unwrap_or_default() {
                     superseded.push(self.require(&Some(id.clone())).await?);
                 }
-                // Snapshot the store pre-save: the related-memory scan below
-                // must not report the new memory against itself.
-                let existing = self.memories.list().await?;
+                // Look for possibly-conflicting memories *before* the save, so the
+                // new memory cannot be reported against itself. Through the shared
+                // query service, so this catches a cross-language near-duplicate —
+                // exactly the case a lexical scan misses and the user then has to
+                // correct by hand.
+                let related = self
+                    .query
+                    .lookup(&scope, &text, RELATED_LIMIT + superseded.len())
+                    .await
+                    .map_err(ToolError::Failed)?;
 
                 let mut memory = Memory::new(kind, text);
                 // An explicit user save is the highest trust tier.
                 memory.confidence = MemoryConfidence::UserWritten;
+                // …and it is a confirmation, not merely an origin: the user asked
+                // for this to be remembered. Stamped so the freshness clock starts
+                // now rather than at "never vouched for", and recorded as evidence
+                // so provenance is uniform across every write path.
+                memory.last_confirmed_at = Some(now);
+                memory.record_evidence(
+                    &tool_ctx.session.session_id,
+                    EvidenceRelation::Supports,
+                    &memory.content.clone(),
+                    now,
+                );
                 // Scope to the current chat so a channel fact does not leak elsewhere.
                 memory.scope = scope.write_scope();
                 if let Some(days) = args.expiry_days.filter(|d| *d > 0) {
@@ -224,24 +251,34 @@ impl Tool for MemoryTool {
                 let superseded_ids: Vec<String> = superseded.iter().map(|m| m.id.clone()).collect();
                 if !superseded.is_empty() {
                     for mut old in superseded.drain(..) {
-                        old.status = MemoryStatus::Archived;
-                        old.updated_at = now;
+                        // `supersede`, not `Archived`: the two express different
+                        // things, and conflating them loses both. Archived means
+                        // "retired, nobody needed it"; superseded means "was true,
+                        // this replaced it" — it carries a forward link, stays
+                        // queryable as history ("what did I use to prefer"), and is
+                        // already barred from injection by `is_injectable`. It is
+                        // also what the reviewer-side consolidation seam writes, so
+                        // the explicit and the automated path now say the same
+                        // thing about the same event.
+                        old.supersede(&memory.id, now);
                         self.memories.save(&old).await?;
                     }
-                    out.push_str(&format!(
-                        "\nSuperseded (archived): {}.",
-                        superseded_ids.join(", ")
-                    ));
+                    out.push_str(&format!("\nSuperseded: {}.", superseded_ids.join(", ")));
                 }
 
-                // Surface possibly related existing memories so a contradiction
-                // is caught while the model is still in context — the store has
-                // no automatic conflict detection, the model is it.
-                let related = related_memories(&existing, &scope, &memory, &superseded_ids, now);
+                // Surface possibly related existing memories so a contradiction is
+                // caught while the model is still in context. The consolidation seam
+                // only sees a conversation *after* it ends, so on this path the
+                // model is the conflict detector.
+                let related: Vec<&ScoredMemory> = related
+                    .iter()
+                    .filter(|h| !superseded_ids.contains(&h.memory.id))
+                    .take(RELATED_LIMIT)
+                    .collect();
                 if !related.is_empty() {
                     out.push_str(
-                        "\nPossibly related existing memories — if the new fact contradicts \
-                         or replaces one, archive it (action=archive):",
+                        "\nPossibly related existing memories — if the new fact replaces one, \
+                         save again with `supersedes: [id]`, or archive it (action=archive):",
                     );
                     for hit in &related {
                         out.push('\n');
@@ -283,14 +320,11 @@ impl Tool for MemoryTool {
                 let text = args.query.ok_or_else(|| {
                     ToolError::InvalidInput("`query` is required for action=search".to_string())
                 })?;
-                let query = MemoryQuery {
-                    text,
-                    allowed_scopes: scope.allowed_scopes.clone(),
-                    kinds: Vec::new(),
-                    statuses: vec![MemoryStatus::Active],
-                    limit: SEARCH_LIMIT,
-                };
-                let hits = self.memories.search(query).await?;
+                let hits = self
+                    .query
+                    .lookup(&scope, &text, SEARCH_LIMIT)
+                    .await
+                    .map_err(ToolError::Failed)?;
                 Ok(ToolOutput::text(render_scored(&hits))
                     .with_title(format!("{} matches", hits.len())))
             }
@@ -344,28 +378,6 @@ fn memory_context(session_id: &str) -> MemoryContext {
     MemoryContext::from_session(session_id)
 }
 
-/// Existing memories a fresh save might contradict or duplicate: the in-scope
-/// active/candidate memories that lexically overlap the new content, ranked by
-/// the recall score, top [`RELATED_LIMIT`]. `exclude` drops the ones already
-/// superseded in this call — they are being archived, no point flagging them.
-/// Lexical-only on purpose: the tool holds no embedding backend, and a save is
-/// almost always phrased in the vocabulary of the fact it updates.
-fn related_memories(
-    existing: &[Memory],
-    scope: &MemoryContext,
-    saved: &Memory,
-    exclude: &[String],
-    now: i64,
-) -> Vec<ScoredMemory> {
-    let pool: Vec<Memory> = existing
-        .iter()
-        .filter(|m| m.id != saved.id && !exclude.contains(&m.id))
-        .cloned()
-        .collect();
-    let query = RecallQuery::lexical(&saved.content);
-    select_recall(&pool, scope, &query, RELATED_LIMIT, now)
-}
-
 async fn set_status(
     tool: &MemoryTool,
     id: &Option<String>,
@@ -413,15 +425,27 @@ fn render(memories: &[Memory]) -> String {
 
 fn render_one(m: &Memory) -> String {
     let pin = if m.pinned { " 📌" } else { "" };
+    // Belief is shown only when it is *not* `current`, so the common line stays
+    // short — but a contested or superseded memory can never be read as an
+    // ordinary fact, which is the whole point of it being searchable at all.
+    let belief = if m.is_injectable() {
+        String::new()
+    } else {
+        format!("/{}", m.belief.as_str())
+    };
     let mut line = format!(
-        "[{}/{}/{}{}] {}: {}",
+        "[{}/{}/{}{}{}] {}: {}",
         m.kind.as_str(),
         m.status.as_str(),
         m.scope.type_str(),
+        belief,
         pin,
         m.id,
         m.content
     );
+    if !m.superseded_by.is_empty() {
+        line.push_str(&format!(" (replaced by {})", m.superseded_by));
+    }
     if !m.source.is_empty() {
         line.push_str(&format!(" (from {})", m.source));
     }
@@ -446,7 +470,11 @@ mod tests {
     fn temp_tool(name: &str) -> MemoryTool {
         let dir = std::env::temp_dir().join(name);
         let _ = std::fs::remove_dir_all(&dir);
-        MemoryTool::new(Arc::new(MdMemoryStore::new(dir)))
+        let store: Arc<dyn MemoryRepository> = Arc::new(MdMemoryStore::new(dir));
+        // No embedding backend: the lexical arm alone, which is what a machine
+        // with no Ollama running gets.
+        let query = Arc::new(MemoryQueryService::new(store.clone()));
+        MemoryTool::new(store, query)
     }
 
     /// A CLI-shaped session: global + session scope, no channel scope.
@@ -551,13 +579,24 @@ mod tests {
             .await
             .unwrap()
             .text;
-        assert!(out.contains("Superseded (archived)"));
+        assert!(out.contains("Superseded"));
         assert!(out.contains(&old.id));
         // The superseded line must not double as a "possibly related" hint.
         assert!(!out.contains("Possibly related"));
 
-        let archived = tool.memories.get(&old.id).await.unwrap().unwrap();
-        assert_eq!(archived.status, MemoryStatus::Archived);
+        // Retired as *history*, not archived: no longer injectable, still
+        // queryable, and pointing at what replaced it. Same mechanism the
+        // reviewer-side consolidation seam uses.
+        let retired = tool.memories.get(&old.id).await.unwrap().unwrap();
+        assert_eq!(
+            retired.belief,
+            komo_core::domain::memory::BeliefState::Superseded
+        );
+        assert!(!retired.is_injectable());
+        assert!(
+            !retired.superseded_by.is_empty(),
+            "history has to point at its replacement"
+        );
     }
 
     /// A save that overlaps a stored fact reports it, so the model can catch a

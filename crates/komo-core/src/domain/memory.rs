@@ -21,6 +21,9 @@ pub struct Memory {
     /// Lifecycle state. Automated extraction lands as `Candidate`; only
     /// user-confirmed/written memories become high-confidence `Active`.
     pub status: MemoryStatus,
+    /// Whether komo believes this *right now* — a different axis from `status`.
+    /// See [`BeliefState`].
+    pub belief: BeliefState,
     /// How much the memory can be trusted, by origin.
     pub confidence: MemoryConfidence,
     /// 0–100 ranking weight; ties broken by recency. Default 50.
@@ -47,24 +50,38 @@ pub struct Memory {
     /// treated as stale and hidden from recall. `None` = never expires.
     pub expires_at: Option<i64>,
     /// Last time this memory surfaced in recall, for usage-based
-    /// promotion/archival signals. `None` = never used.
+    /// retention signals. `None` = never used.
     pub last_used_at: Option<i64>,
-    /// How many times this memory has surfaced in L3 recall. The OpenClaw-style
-    /// "dreaming" signal: importance proven by use, not guessed at write time.
-    /// A candidate that earns enough recalls is auto-promoted to active by the
-    /// `DreamSweep`; one that never does is eventually archived. See
-    /// [`dream_verdict`].
-    pub recall_count: i64,
-    /// Distinct fingerprints of the queries that recalled this memory (see
-    /// [`recall_query_hash`]), capped at [`RECALL_QUERY_HASHES_CAP`]. The
-    /// query-diversity half of the dreaming signal (OpenClaw's
-    /// `minUniqueQueries`): a raw `recall_count` can be pumped by one repeated
-    /// question, but promotion also requires being recalled by
-    /// [`DREAM_MIN_UNIQUE_QUERIES`] lexically-distinct queries.
-    /// `#[serde(default)]` so a payload from an older gateway still parses.
-    #[serde(default)]
-    pub recall_query_hashes: Vec<String>,
 
+    // ── truth signals ────────────────────────────────────────────────────────
+    //
+    // Deliberately separate from the usage signals below. `recall_count` proves
+    // a memory keeps being *relevant*; only these prove it is *true*. Promotion
+    // reads these, retention reads those — conflating them is what let a wrong
+    // memory promote itself by being repeatedly retrieved.
+    /// Independent occasions on which the user said something supporting this
+    /// claim. Independence is per session — see [`Memory::record_evidence`].
+    pub support_count: i64,
+    /// Independent occasions on which the user said something conflicting with
+    /// it. Any unresolved contradiction is what `Contested` expresses.
+    pub contradiction_count: i64,
+    /// When the user last explicitly confirmed this (triage promote, or an
+    /// unambiguous restatement). The strongest truth signal there is, and the
+    /// freshness that matters for a memory about to drive an action.
+    pub last_confirmed_at: Option<i64>,
+    /// Id of the memory that replaced this one, when `belief` is `Superseded`.
+    /// Empty otherwise.
+    pub superseded_by: String,
+    /// Capped, summarized provenance: *why* komo believes this. See [`Evidence`].
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+    /// How many times this memory has surfaced in L3 recall — a **utility**
+    /// signal, not a truth signal. It says the retriever keeps finding this
+    /// relevant, which is exactly what retention should be decided on, and is
+    /// exactly what promotion must *not* be decided on: a wrong memory that
+    /// happens to be relevant to a recurring question would otherwise promote
+    /// itself. See [`dream_verdict`].
+    pub recall_count: i64,
     /// L2-normalized semantic vector of [`content`](Self::content), or empty
     /// when none has been computed yet (no embedding backend configured, or the
     /// backfill has not reached this memory). This is what lets a Chinese
@@ -85,6 +102,12 @@ pub struct Memory {
 /// Default ranking weight for a new memory.
 pub const DEFAULT_IMPORTANCE: i32 = 50;
 
+/// How long a memory can go unvouched-for before an injected line flags it.
+///
+/// Six months: long enough that a settled preference is not nagged about every
+/// turn, short enough that a stale one is questioned before it drives an action.
+pub const MEMORY_STALE_AFTER_DAYS: i64 = 180;
+
 impl Memory {
     /// A new memory with conservative defaults: `Active` status, `Inferred`
     /// confidence, global scope, not pinned. Callers (the `memory` tool, the
@@ -96,6 +119,7 @@ impl Memory {
             kind,
             content: content.into(),
             status: MemoryStatus::Active,
+            belief: BeliefState::Current,
             confidence: MemoryConfidence::Inferred,
             importance: DEFAULT_IMPORTANCE,
             pinned: false,
@@ -106,8 +130,15 @@ impl Memory {
             updated_at: now,
             expires_at: None,
             last_used_at: None,
+            // Zero, not one: the count means "recorded evidence", so the
+            // observation that created a memory is registered by whoever creates
+            // it (`record_evidence`), never assumed here.
+            support_count: 0,
+            contradiction_count: 0,
+            last_confirmed_at: None,
+            superseded_by: String::new(),
+            evidence: Vec::new(),
             recall_count: 0,
-            recall_query_hashes: Vec::new(),
             embedding: Vec::new(),
             embedding_model: String::new(),
         }
@@ -131,11 +162,123 @@ impl Memory {
     // surfaces.
 
     /// Promote a candidate to an active, **confirmed** memory (a human vouched
-    /// for it — unlike dreaming's usage-driven promote, which caps at inferred).
+    /// for it — unlike dreaming's evidence-driven promote, which caps at
+    /// inferred).
+    ///
+    /// A human vouching *is* an explicit confirmation, so this also stamps
+    /// `last_confirmed_at` and clears any contest: whatever conflict was
+    /// outstanding, the operator has now ruled on it.
     pub fn promote(&mut self, now: i64) {
         self.status = MemoryStatus::Active;
         self.confidence = MemoryConfidence::Confirmed;
+        self.last_confirmed_at = Some(now);
+        self.belief = BeliefState::Current;
+        self.superseded_by.clear();
         self.updated_at = now;
+    }
+
+    /// Record an observation bearing on this memory. Returns whether it counted.
+    ///
+    /// **Independence is per session.** An observation from a session already
+    /// present in the evidence list is dropped, which is what makes
+    /// `support_count` mean "N separate occasions" instead of "N sentences" — a
+    /// user restating a preference three times in one conversation must not look
+    /// like three independent confirmations.
+    ///
+    /// The evidence *list* is capped at [`EVIDENCE_CAP`] (most recent kept) while
+    /// the counts keep rising, so a long-lived memory cannot grow its row without
+    /// bound. Consequence, deliberately accepted: once the cap is reached, a
+    /// session evicted from the list can be counted again. Every threshold that
+    /// reads these counts sits far below the cap, so this cannot change a verdict.
+    pub fn record_evidence(
+        &mut self,
+        session: &str,
+        relation: EvidenceRelation,
+        excerpt: &str,
+        now: i64,
+    ) -> bool {
+        if self.evidence.iter().any(|e| e.session == session) {
+            return false;
+        }
+        match relation {
+            EvidenceRelation::Supports => self.support_count += 1,
+            EvidenceRelation::Contradicts => self.contradiction_count += 1,
+        }
+        self.evidence.push(Evidence {
+            session: session.to_string(),
+            observed_at: now,
+            relation,
+            excerpt: truncate_excerpt(excerpt),
+        });
+        if self.evidence.len() > EVIDENCE_CAP {
+            let drop = self.evidence.len() - EVIDENCE_CAP;
+            self.evidence.drain(..drop);
+        }
+        self.updated_at = now;
+        true
+    }
+
+    /// Something now conflicts with this memory and nothing has resolved which
+    /// wins. It stops being injected until a confirmation or triage rules on it.
+    pub fn contest(&mut self, now: i64) {
+        self.belief = BeliefState::Contested;
+        self.updated_at = now;
+    }
+
+    /// This memory was true and has been replaced by `by`. Kept as history
+    /// rather than deleted — "what did I use to prefer" is a real question, and
+    /// the replacement's provenance points back here.
+    pub fn supersede(&mut self, by: &str, now: i64) {
+        self.belief = BeliefState::Superseded;
+        self.superseded_by = by.to_string();
+        self.updated_at = now;
+    }
+
+    /// When this memory's content was last *vouched for*: an explicit
+    /// confirmation, else the most recent recorded observation, else the day it
+    /// was created.
+    ///
+    /// Deliberately not `updated_at`, which is an edit clock — it also moves when
+    /// importance is retuned or the belief is contested, neither of which says
+    /// anything about whether the claim still holds. This is the clock that
+    /// answers "how long since anyone actually backed this up", which is what a
+    /// memory about to drive an action should be judged on.
+    pub fn vouched_at(&self) -> i64 {
+        let newest_evidence = self.evidence.iter().map(|e| e.observed_at).max();
+        [self.last_confirmed_at, newest_evidence]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(self.created_at)
+    }
+
+    /// Whether nothing has vouched for this memory in [`MEMORY_STALE_AFTER_DAYS`].
+    /// Injected memories say so, because acting on a long-unconfirmed preference
+    /// is how an assistant gets corrected.
+    pub fn is_stale(&self, now: i64) -> bool {
+        (now - self.vouched_at()).max(0) / 86_400 >= MEMORY_STALE_AFTER_DAYS
+    }
+
+    /// Whether independent occasions corroborate this memory — the same bar
+    /// promotion uses, so what an injected line claims and what dreaming acts on
+    /// cannot drift apart.
+    pub fn is_supported(&self) -> bool {
+        self.last_confirmed_at.is_some() || self.support_count >= DREAM_MIN_SUPPORT
+    }
+
+    /// Whether this memory may enter a prompt **unasked** (L1 pinned or L3
+    /// recall).
+    ///
+    /// Only a `Current` belief qualifies. Injecting a contested memory would hand
+    /// the model both sides of an unresolved conflict and let it pick one, which
+    /// is the specific failure the state exists to prevent; injecting a
+    /// superseded one would assert something known to be out of date.
+    ///
+    /// This gates *injection*, not retrieval. An explicit `memory search` still
+    /// returns these — the model cannot help resolve a conflict it is forbidden
+    /// to see, and the rendered line names the state.
+    pub fn is_injectable(&self) -> bool {
+        self.belief == BeliefState::Current
     }
 
     /// Reject a memory so it never surfaces in recall or injection.
@@ -156,10 +299,15 @@ impl Memory {
     }
 
     /// Whether this memory is eligible for L1 pinned-profile injection in the
-    /// given context: pinned, active, high-confidence, an identity/preference
-    /// kind, in a scope the context allows, and not expired.
+    /// given context: pinned, active, believed, high-confidence, an
+    /// identity/preference kind, in a scope the context allows, and not expired.
+    ///
+    /// The belief check matters most here: a pinned memory is asserted on *every*
+    /// turn, so one the user has just contradicted must stop the moment the
+    /// contradiction lands, without waiting for anyone to unpin it.
     pub fn is_pinnable(&self, ctx: &MemoryContext, now: i64) -> bool {
         self.pinned
+            && self.is_injectable()
             && self.status == MemoryStatus::Active
             && matches!(
                 self.confidence,
@@ -249,6 +397,100 @@ pub fn parse_memory_status(value: &str) -> MemoryStatus {
         "rejected" => MemoryStatus::Rejected,
         _ => MemoryStatus::Active,
     }
+}
+
+// ── belief ────────────────────────────────────────────────────────────────────
+
+/// Whether komo believes a memory right now.
+///
+/// A **separate axis from [`MemoryStatus`]**, on purpose. Status answers "where is
+/// this in the triage pipeline" (candidate → active → archived/rejected) and is
+/// what the CLI, the operator surfaces and recall eligibility are built on. Belief
+/// answers "is this true at the moment", which no consumer of `status` has an
+/// opinion about: an `Active` memory the user just contradicted is still active —
+/// somebody curated it — but must stop being asserted until the conflict resolves.
+///
+/// Folding the two into one column was the tempting shortcut. It would have made
+/// every reader of `status` handle a truth value, and every truth transition
+/// clobber a governance decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BeliefState {
+    /// Believed, and safe to inject.
+    Current,
+    /// A later observation conflicts with it, and nothing has resolved which
+    /// wins. Never injected unasked — see [`Memory::is_injectable`].
+    Contested,
+    /// Was true, has been replaced by a newer fact (`Memory::superseded_by`).
+    Superseded,
+}
+
+impl BeliefState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Contested => "contested",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// Parse a belief state. Unknown → `Current`, which is what every row written
+/// before this column existed means.
+pub fn parse_belief_state(value: &str) -> BeliefState {
+    match value.trim() {
+        "contested" => BeliefState::Contested,
+        "superseded" => BeliefState::Superseded,
+        _ => BeliefState::Current,
+    }
+}
+
+// ── evidence ──────────────────────────────────────────────────────────────────
+
+/// One observation bearing on a memory, kept so governance is auditable rather
+/// than merely asserted.
+///
+/// **Not an episode store.** The conversation this came from already lives in the
+/// run ledger and transcript; this is a capped, summarized pointer at *why* komo
+/// believes something, so a `support_count` of 3 can be inspected instead of
+/// trusted. `state.db` is disposable, so the excerpt is the part that survives
+/// its deletion — which is also why it is bounded rather than verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Evidence {
+    /// Session the observation came from, and the unit of independence: two
+    /// statements within one conversation are one observation.
+    pub session: String,
+    pub observed_at: i64,
+    pub relation: EvidenceRelation,
+    /// Short quote of what was actually said, capped at
+    /// [`EVIDENCE_EXCERPT_MAX`] characters.
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EvidenceRelation {
+    Supports,
+    Contradicts,
+}
+
+/// How many evidence entries one memory retains. Five is well past every
+/// threshold that reads the counts, so the cap bounds the row without ever
+/// bounding a decision.
+pub const EVIDENCE_CAP: usize = 5;
+
+/// Character cap on a stored excerpt. Long enough to recognize what was said,
+/// short enough that five of them are not a transcript.
+pub const EVIDENCE_EXCERPT_MAX: usize = 200;
+
+/// Trim an excerpt to [`EVIDENCE_EXCERPT_MAX`] characters (not bytes — the vault
+/// and these memories are largely CJK).
+fn truncate_excerpt(excerpt: &str) -> String {
+    let excerpt = excerpt.trim();
+    if excerpt.chars().count() <= EVIDENCE_EXCERPT_MAX {
+        return excerpt.to_string();
+    }
+    excerpt.chars().take(EVIDENCE_EXCERPT_MAX).collect()
 }
 
 // ── confidence ──────────────────────────────────────────────────────────────
@@ -407,47 +649,17 @@ impl MemoryContext {
 
 // ── query / scored result ─────────────────────────────────────────────────────
 
-/// A scope-bounded search over the memory library. `allowed_scopes` and
-/// `statuses` must be filled before the store is hit — the repository enforces
-/// them, callers cannot widen them downstream.
-#[derive(Debug, Clone)]
-pub struct MemoryQuery {
-    pub text: String,
-    pub allowed_scopes: Vec<MemoryScope>,
-    pub kinds: Vec<MemoryKind>,
-    pub statuses: Vec<MemoryStatus>,
-    pub limit: usize,
-}
-
-/// A memory plus its rerank score for a given query.
+/// A memory plus its relevance score for a given query.
 #[derive(Debug, Clone)]
 pub struct ScoredMemory {
     pub memory: Memory,
     pub score: f64,
 }
 
-/// Explainable rerank score for a memory against a (already lowercased) query.
-/// Returns `None` when a non-empty query does not lexically match the content
-/// (the memory is excluded); otherwise a positive score combining lexical hit,
-/// importance, confidence, and recency. No embedding — `LIKE`-style substring
-/// match plus weighted signals, per the first-version plan. Scope/status/kind
-/// are filtered before this is called.
-pub fn rerank_score(memory: &Memory, query_lower: &str, now: i64) -> Option<f64> {
-    if !query_lower.is_empty() && !memory.content.to_lowercase().contains(query_lower) {
-        return None;
-    }
-    let mut score = 0.0;
-    if !query_lower.is_empty() {
-        score += 2.0; // lexical match
-    }
-    score += signal_bonus(memory, now);
-    Some(score)
-}
-
-/// The importance + confidence + recency bonus shared by L2 rerank
-/// ([`rerank_score`]) and L3 recall ([`recall_score`]) scoring. Factored out so
-/// the two ranking formulas can't drift apart: importance in `0..~1`, a
-/// confidence step, and a 30-day half-life decay on the last update.
+/// The importance + confidence + recency component of [`recall_score`]:
+/// importance in `0..~1`, a confidence step, and a 30-day half-life decay on the
+/// last update. Separate from the query-match component so the two can be read
+/// (and tuned) independently.
 fn signal_bonus(memory: &Memory, now: i64) -> f64 {
     let mut bonus = memory.importance as f64 / 100.0; // 0..~1
     bonus += match memory.confidence {
@@ -463,14 +675,14 @@ fn signal_bonus(memory: &Memory, now: i64) -> f64 {
 
 // ── recall (L3) ───────────────────────────────────────────────────────────────
 
-/// Extract lexical terms from text for L3 recall matching, language-agnostically:
+/// Extract lexical terms from text for recall matching, language-agnostically:
 /// runs of alphanumeric characters of length ≥ 2 become word terms, and adjacent
 /// CJK characters become bigrams (a cheap stand-in for word segmentation, since
 /// CJK has no whitespace boundaries). Everything lowercased.
 ///
-/// This is distinct from [`rerank_score`]'s whole-query substring match: the L2
-/// tool passes a focused keyword query (substring works), but L3 recall passes a
-/// whole user message, where token overlap is the meaningful signal.
+/// Token overlap rather than substring containment, because the input is as
+/// often a whole user message as a focused keyword query — a substring match
+/// would find nothing in the former case.
 fn recall_terms(text: &str) -> HashSet<String> {
     let mut terms = HashSet::new();
     let mut word = String::new();
@@ -559,32 +771,6 @@ fn is_cjk(ch: char) -> bool {
         ch as u32,
         0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
     )
-}
-
-/// Fingerprint a recall query for the dreaming query-diversity signal: the
-/// message's [`recall_terms`] (already normalized: lowercased, stopwords
-/// dropped) sorted and hashed, first 16 hex chars of the SHA-256. Reordering or
-/// re-punctuating the same question yields the same fingerprint; only a change
-/// in substantive terms counts as a new query. Lexical, not semantic — a full
-/// rephrasing with different words counts as distinct, which slightly
-/// overstates diversity; acceptable until the embedding phase.
-///
-/// Returns an empty string when the text yields no terms (no signal — callers
-/// must not record it).
-pub fn recall_query_hash(text: &str) -> String {
-    let mut terms: Vec<String> = recall_terms(text).into_iter().collect();
-    if terms.is_empty() {
-        return String::new();
-    }
-    terms.sort();
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for term in &terms {
-        hasher.update(term.as_bytes());
-        hasher.update([0x1f]); // separator so ["ab","c"] != ["a","bc"]
-    }
-    let digest = hasher.finalize();
-    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Minimum cosine similarity for a memory to be *admitted* to recall on
@@ -782,40 +968,8 @@ pub trait MemoryRepository: Send + Sync {
         Ok(self.list().await?.into_iter().find(|m| m.id == id))
     }
 
-    /// Scope-bounded L2/L3 search. Filters by `allowed_scopes` / `statuses` /
-    /// `kinds`, scores the rest with [`rerank_score`], and returns the top
-    /// `limit` by score. Default runs over [`list`](MemoryRepository::list); a
-    /// store may override the candidate fetch (e.g. an FTS prefilter) later
-    /// without changing the rerank.
-    async fn search(&self, query: MemoryQuery) -> anyhow::Result<Vec<ScoredMemory>> {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let needle = query.text.to_lowercase();
-        let mut scored: Vec<ScoredMemory> = self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|m| query.allowed_scopes.contains(&m.scope))
-            .filter(|m| query.statuses.is_empty() || query.statuses.contains(&m.status))
-            .filter(|m| query.kinds.is_empty() || query.kinds.contains(&m.kind))
-            .filter_map(|m| {
-                rerank_score(&m, &needle, now).map(|score| ScoredMemory { memory: m, score })
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if query.limit > 0 {
-            scored.truncate(query.limit);
-        }
-        Ok(scored)
-    }
-
     /// L3 active recall: the in-scope memories most relevant to `text` (the
-    /// current user message), ranked by [`recall_score`], top `limit`. Unlike
-    /// [`search`](MemoryRepository::search) — which substring-matches a focused
-    /// query — recall does token-overlap matching against a whole message.
+    /// current user message), ranked by [`recall_score`], top `limit`.
     /// Scope/status are enforced here (design principle 3: never widen in the
     /// render layer). Default runs over [`list`](MemoryRepository::list); a
     /// store may override the candidate fetch later without changing scoring.
@@ -845,26 +999,19 @@ pub trait MemoryRepository: Send + Sync {
         Ok(select_recall(&self.list().await?, ctx, &query, limit, now))
     }
 
-    /// Record that memories surfaced in recall: bump `recall_count`, stamp
-    /// `last_used_at`, and accumulate the query's fingerprint (see
-    /// [`recall_query_hash`]) into `recall_query_hashes` — never touching
-    /// `updated_at` so the recency-decay signal stays tied to real edits.
-    /// Count + distinct-query fingerprints are the dreaming system's usage
-    /// signal (see [`dream_verdict`]). An empty `query_hash` (a query with no
-    /// terms) still counts the recall but records no fingerprint; a fingerprint
-    /// already present, or one past [`RECALL_QUERY_HASHES_CAP`], is dropped.
-    /// Best-effort: ids that no longer resolve are skipped.
-    async fn mark_used(&self, ids: &[String], now: i64, query_hash: &str) -> anyhow::Result<()> {
+    /// Record that memories surfaced in recall: bump `recall_count` and stamp
+    /// `last_used_at`, never touching `updated_at` so the recency-decay signal
+    /// stays tied to real edits.
+    ///
+    /// A **utility** signal only. It says the retriever keeps finding these
+    /// relevant, which is what retention is decided on; what makes a memory *true*
+    /// is recorded by `record_evidence` instead. Best-effort: ids that no longer
+    /// resolve are skipped.
+    async fn mark_used(&self, ids: &[String], now: i64) -> anyhow::Result<()> {
         for id in ids {
             if let Some(mut memory) = self.get(id).await? {
                 memory.recall_count += 1;
                 memory.last_used_at = Some(now);
-                if !query_hash.is_empty()
-                    && memory.recall_query_hashes.len() < RECALL_QUERY_HASHES_CAP
-                    && !memory.recall_query_hashes.iter().any(|h| h == query_hash)
-                {
-                    memory.recall_query_hashes.push(query_hash.to_string());
-                }
                 self.save(&memory).await?;
             }
         }
@@ -872,13 +1019,23 @@ pub trait MemoryRepository: Send + Sync {
     }
 }
 
-// ── dreaming (usage-driven consolidation) ──────────────────────────────────────
+// ── dreaming (evidence-driven consolidation) ─────────────────────────────────
 
-/// What the nightly `DreamSweep` should do with a candidate memory, decided
-/// purely from its accumulated usage. Borrowed from OpenClaw's dreaming system,
-/// adapted to komo's governance ladder: instead of promoting daily-journal
-/// fragments into `MEMORY.md`, we promote reviewer-extracted **candidates** into
-/// the active, recallable set — and archive the ones that never earn their keep.
+/// What the nightly `DreamSweep` should do with a candidate memory.
+///
+/// **Truth and utility are decided by different signals**, and mixing them was
+/// the defect this split fixes. Promotion used to be earned by `recall_count` and
+/// query diversity — which prove only that the retriever keeps finding a memory
+/// relevant. A wrong candidate that happened to be relevant to a question the
+/// user asks often would therefore promote itself: injected, counted, promoted,
+/// on the strength of nothing but its own retrieval. Recall could never be
+/// evidence, because the thing being retrieved is not the thing being tested.
+///
+/// So promotion now reads the evidence signals — an explicit confirmation, or
+/// support from independent occasions, with no unresolved conflict — and
+/// `recall_count` decides only *retention*: whether a candidate nobody ever needed
+/// should be retired. Which is the one question retrieval frequency genuinely
+/// answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DreamVerdict {
     /// Recalled often enough, recently enough → promote to active.
@@ -889,16 +1046,15 @@ pub enum DreamVerdict {
     Keep,
 }
 
-/// Minimum recalls a candidate must have earned to be promoted (OpenClaw's
-/// `minRecallCount`, default 3).
-pub const DREAM_MIN_RECALL_COUNT: i64 = 3;
-/// Minimum distinct query fingerprints a candidate must have been recalled by
-/// to be promoted (OpenClaw's `minUniqueQueries`) — so one repeated question
-/// cannot pump a candidate to active on count alone.
-pub const DREAM_MIN_UNIQUE_QUERIES: usize = 2;
-/// Cap on stored distinct query fingerprints per memory. Diversity is proven
-/// well before this; appending forever would only widen the row.
-pub const RECALL_QUERY_HASHES_CAP: usize = 8;
+/// Independent occasions of support a candidate needs to be promoted without an
+/// explicit confirmation.
+///
+/// Two, not three: independence is already per session (see
+/// [`Memory::record_evidence`]), so two means the user said the same thing in two
+/// separate conversations — a real pattern rather than one talkative session. A
+/// higher bar would leave genuinely established facts sitting in the candidate
+/// pile for weeks.
+pub const DREAM_MIN_SUPPORT: i64 = 2;
 /// A candidate this old (days) that has gone cold — never recalled, or not
 /// recalled within the same window — is archived: the "forget the flotsam" half
 /// of dreaming. Coldness is measured on `last_used_at`, not a lifetime
@@ -906,15 +1062,17 @@ pub const RECALL_QUERY_HASHES_CAP: usize = 8;
 /// is retired too rather than lingering in the pile forever.
 pub const DREAM_FORGET_AGE_DAYS: i64 = 30;
 
-/// Dreaming score for a candidate: dominated by recall frequency, nudged by
-/// recency and importance. Explainable and embedding-free, matching the rest of
-/// komo's ranking. This is a **display/ranking** signal only — it drives the
-/// `komo dream` preview ordering, not the verdict. Promotion is decided purely
-/// by the recall-count and query-diversity gates in [`dream_verdict`]; a score
-/// threshold was removed because, with `recall_count` its dominant term, it
-/// could never reject anything the count gate already accepted.
+/// Dreaming score for a candidate, for **ordering the `komo dream` preview** —
+/// never the verdict, which [`dream_verdict`] decides on its own gates.
+///
+/// Weighted so the preview surfaces what is closest to promotion: support
+/// dominates (it is what promotion reads), with recall and recency as tiebreakers
+/// among equally-supported candidates. A contradiction pushes a candidate down —
+/// it is the furthest thing from ready.
 pub fn dream_score(memory: &Memory, now: i64) -> f64 {
-    let mut score = memory.recall_count as f64; // each recall = 1.0, the core signal
+    let mut score = 10.0 * memory.support_count as f64;
+    score -= 10.0 * memory.contradiction_count as f64;
+    score += memory.recall_count as f64; // utility, as a tiebreaker
     score += memory.importance as f64 / 100.0; // 0..~1
     // Recency of last use: a 30-day half-life decay, 0 when never used.
     if let Some(last) = memory.last_used_at {
@@ -932,11 +1090,14 @@ pub fn dream_verdict(memory: &Memory, now: i64) -> DreamVerdict {
     if memory.status != MemoryStatus::Candidate {
         return DreamVerdict::Keep;
     }
-    // Promotion takes precedence: recalled often enough, by enough distinct
-    // queries. No score gate — see `dream_score`.
-    if memory.recall_count >= DREAM_MIN_RECALL_COUNT
-        && memory.recall_query_hashes.len() >= DREAM_MIN_UNIQUE_QUERIES
-    {
+    // Promotion takes precedence, and reads only truth signals: the user said so
+    // outright, or said it on enough independent occasions — and nothing is
+    // currently in conflict with it. An unresolved conflict blocks promotion
+    // however well-supported the claim is: promoting into a contest would assert
+    // one side of a question nobody has answered.
+    let believed = memory.belief == BeliefState::Current && memory.contradiction_count == 0;
+    let proven = memory.last_confirmed_at.is_some() || memory.support_count >= DREAM_MIN_SUPPORT;
+    if believed && proven {
         return DreamVerdict::Promote;
     }
     // Forget the flotsam: old enough to have had its chance, and now cold. Cold
@@ -1259,37 +1420,97 @@ mod tests {
         m.recall_count = recall_count;
         if recall_count > 0 {
             m.last_used_at = Some(now - 86_400); // used yesterday
-            // Recalled by as many distinct queries as recalls (the diverse,
-            // promotion-friendly shape); diversity-gate tests override this.
-            m.recall_query_hashes = (0..recall_count.min(RECALL_QUERY_HASHES_CAP as i64))
-                .map(|i| format!("hash-{i}"))
-                .collect();
         }
         m
     }
 
+    /// Support from independent occasions is what earns promotion.
     #[test]
-    fn dream_promotes_well_recalled_recent_candidate() {
+    fn dream_promotes_a_candidate_with_independent_support() {
         let now = 10_000 * 86_400;
-        let m = candidate(DREAM_MIN_RECALL_COUNT, 5, now);
+        let mut m = candidate(0, 5, now);
+        m.record_evidence("s-1", EvidenceRelation::Supports, "said it", now);
+        assert_eq!(
+            dream_verdict(&m, now),
+            DreamVerdict::Keep,
+            "one occasion is not a pattern"
+        );
+        m.record_evidence("s-2", EvidenceRelation::Supports, "said it again", now);
         assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
     }
 
+    /// An explicit confirmation is enough on its own — no waiting for a second
+    /// occasion when the user has already said so outright.
     #[test]
-    fn dream_keeps_candidate_pumped_by_one_repeated_query() {
+    fn dream_promotes_an_explicitly_confirmed_candidate() {
         let now = 10_000 * 86_400;
-        // Plenty of recalls, but all from the same question: count alone must
-        // not promote (the minUniqueQueries gate).
-        let mut m = candidate(10, 5, now);
-        m.recall_query_hashes = vec!["same-hash".into()];
-        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
-        // Pre-upgrade rows (counts accumulated before fingerprints existed)
-        // look the same — empty hashes — and stay put until diversity accrues.
-        m.recall_query_hashes.clear();
-        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
-        // A second distinct query unlocks promotion.
-        m.recall_query_hashes = vec!["hash-a".into(), "hash-b".into()];
+        let mut m = candidate(0, 5, now);
+        m.last_confirmed_at = Some(now - 86_400);
         assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
+    }
+
+    /// **The defect this rework exists for.** A candidate retrieved many times by
+    /// many different questions used to promote itself on that alone — but recall
+    /// frequency measures the retriever, not the truth of what it retrieved.
+    #[test]
+    fn recall_frequency_alone_can_never_promote_a_candidate() {
+        let now = 10_000 * 86_400;
+        let m = candidate(50, 5, now);
+        assert_eq!(
+            dream_verdict(&m, now),
+            DreamVerdict::Keep,
+            "heavily recalled, never corroborated — it stays a candidate"
+        );
+        // …and it is not archived either: it is plainly still useful.
+        let mut cold_but_hot = m.clone();
+        cold_but_hot.created_at = now - (DREAM_FORGET_AGE_DAYS + 10) * 86_400;
+        assert_eq!(dream_verdict(&cold_but_hot, now), DreamVerdict::Keep);
+    }
+
+    /// An unresolved conflict blocks promotion however well-supported the claim
+    /// is: promoting into a contest asserts one side of an open question.
+    #[test]
+    fn dream_never_promotes_a_contested_or_contradicted_candidate() {
+        let now = 10_000 * 86_400;
+        let mut m = candidate(0, 5, now);
+        m.record_evidence("s-1", EvidenceRelation::Supports, "a", now);
+        m.record_evidence("s-2", EvidenceRelation::Supports, "b", now);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
+
+        // A contradiction from a third occasion stops it, even before anything
+        // marks the belief contested.
+        let mut contradicted = m.clone();
+        contradicted.record_evidence("s-3", EvidenceRelation::Contradicts, "no", now);
+        assert_eq!(dream_verdict(&contradicted, now), DreamVerdict::Keep);
+
+        let mut contested = m.clone();
+        contested.contest(now);
+        assert_eq!(dream_verdict(&contested, now), DreamVerdict::Keep);
+
+        let mut superseded = m.clone();
+        superseded.supersede("mem-new", now);
+        assert_eq!(dream_verdict(&superseded, now), DreamVerdict::Keep);
+    }
+
+    /// The preview ordering has to put what is closest to promotion on top, or
+    /// `komo dream` stops being a useful triage queue.
+    #[test]
+    fn dream_score_ranks_supported_candidates_above_merely_recalled_ones() {
+        let now = 10_000 * 86_400;
+        let mut supported = candidate(0, 5, now);
+        supported.record_evidence("s-1", EvidenceRelation::Supports, "a", now);
+        let recalled = candidate(5, 5, now);
+        assert!(
+            dream_score(&supported, now) > dream_score(&recalled, now),
+            "one real corroboration outranks five retrievals"
+        );
+
+        let mut contradicted = supported.clone();
+        contradicted.record_evidence("s-2", EvidenceRelation::Contradicts, "no", now);
+        assert!(
+            dream_score(&contradicted, now) < dream_score(&supported, now),
+            "a contradiction pushes a candidate down the queue"
+        );
     }
 
     #[test]
@@ -1319,20 +1540,6 @@ mod tests {
         written.confidence = MemoryConfidence::UserWritten;
         written.pin(now);
         assert_eq!(written.confidence, MemoryConfidence::UserWritten);
-    }
-
-    #[test]
-    fn recall_query_hash_is_order_and_punctuation_invariant() {
-        let a = recall_query_hash("rust project language");
-        let b = recall_query_hash("Language — PROJECT... rust?!");
-        assert_eq!(a.len(), 16);
-        assert_eq!(a, b, "same terms, any order/punctuation → same fingerprint");
-        let c = recall_query_hash("does komo support telegram");
-        assert_ne!(a, c, "different substantive terms → different fingerprint");
-        assert!(
-            recall_query_hash("— …!").is_empty(),
-            "no extractable terms → empty (never recorded)"
-        );
     }
 
     #[test]
@@ -1390,6 +1597,146 @@ mod tests {
         let mut cold = candidate(0, DREAM_FORGET_AGE_DAYS + 100, now);
         cold.status = MemoryStatus::Active;
         assert_eq!(dream_verdict(&cold, now), DreamVerdict::Keep);
+    }
+
+    // ---- belief state and evidence ----
+
+    /// Independence is per session: restating a fact three times in one
+    /// conversation is one observation, not three.
+    #[test]
+    fn evidence_from_the_same_session_counts_once() {
+        let now = 1_000;
+        let mut m = Memory::new(MemoryKind::Preference, "user prefers rebase");
+        assert!(m.record_evidence("s-1", EvidenceRelation::Supports, "I rebase", now));
+        assert!(!m.record_evidence("s-1", EvidenceRelation::Supports, "always rebase", now + 5));
+        assert_eq!(m.support_count, 1);
+        assert_eq!(m.evidence.len(), 1);
+
+        // A different session is a genuinely independent observation.
+        assert!(m.record_evidence("s-2", EvidenceRelation::Supports, "rebase again", now + 10));
+        assert_eq!(m.support_count, 2);
+    }
+
+    #[test]
+    fn contradicting_evidence_counts_separately() {
+        let now = 1_000;
+        let mut m = Memory::new(MemoryKind::Preference, "user prefers rebase");
+        m.record_evidence("s-1", EvidenceRelation::Supports, "I rebase", now);
+        m.record_evidence("s-2", EvidenceRelation::Contradicts, "merge now", now);
+        assert_eq!(m.support_count, 1);
+        assert_eq!(m.contradiction_count, 1);
+    }
+
+    /// The list is bounded while the counts keep rising, so a long-lived memory
+    /// cannot grow its row without limit.
+    #[test]
+    fn the_evidence_list_is_capped_but_the_count_is_not() {
+        let now = 1_000;
+        let mut m = Memory::new(MemoryKind::Fact, "x");
+        for i in 0..(EVIDENCE_CAP + 3) {
+            m.record_evidence(
+                &format!("s-{i}"),
+                EvidenceRelation::Supports,
+                "said so",
+                now + i as i64,
+            );
+        }
+        assert_eq!(m.evidence.len(), EVIDENCE_CAP);
+        assert_eq!(m.support_count, (EVIDENCE_CAP + 3) as i64);
+        // The most recent survive — they are the ones that speak to "still true".
+        assert_eq!(m.evidence.last().unwrap().session, "s-7");
+    }
+
+    #[test]
+    fn an_excerpt_is_truncated_by_characters_not_bytes() {
+        let now = 1_000;
+        let mut m = Memory::new(MemoryKind::Fact, "x");
+        let long = "语".repeat(EVIDENCE_EXCERPT_MAX + 50);
+        m.record_evidence("s-1", EvidenceRelation::Supports, &long, now);
+        assert_eq!(
+            m.evidence[0].excerpt.chars().count(),
+            EVIDENCE_EXCERPT_MAX,
+            "counted in chars, so CJK is not cut to a third"
+        );
+    }
+
+    /// The core of the belief axis: a contested memory stays retrievable but
+    /// stops being assertable.
+    #[test]
+    fn contested_and_superseded_memories_are_not_injectable() {
+        let now = 1_000;
+        let mut m = Memory::new(MemoryKind::Preference, "user writes Python");
+        assert!(m.is_injectable());
+
+        m.contest(now);
+        assert!(!m.is_injectable());
+        assert_eq!(m.belief, BeliefState::Contested);
+        // Governance is untouched — contesting is not a triage decision.
+        assert_eq!(m.status, MemoryStatus::Active);
+
+        let mut m = Memory::new(MemoryKind::Preference, "user writes Python");
+        m.supersede("mem-rust", now);
+        assert!(!m.is_injectable());
+        assert_eq!(m.superseded_by, "mem-rust");
+    }
+
+    /// A pinned memory is asserted every single turn, so a contradiction has to
+    /// silence it immediately — without anyone unpinning it first.
+    #[test]
+    fn a_contested_pinned_memory_leaves_the_l1_profile() {
+        let ctx = MemoryContext::from_session("cli");
+        let now = 1_000;
+        let mut m = pinnable_memory();
+        assert!(m.is_pinnable(&ctx, now));
+        m.contest(now);
+        assert!(!m.is_pinnable(&ctx, now));
+        assert_eq!(select_pinned(&[m], &ctx, now).len(), 0);
+    }
+
+    /// Retrieval is deliberately belief-agnostic: the scoring layer must keep
+    /// returning a contested memory so an explicit search can surface it. The
+    /// injection filter lives with the injector.
+    #[test]
+    fn recall_scoring_still_returns_a_contested_memory() {
+        let ctx = MemoryContext::from_session("cli");
+        let now = 1_000;
+        let mut m = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
+        m.contest(now);
+        let query = RecallQuery::lexical("rust toolchain");
+        assert_eq!(
+            select_recall(&[m], &ctx, &query, 5, now).len(),
+            1,
+            "the query layer finds it; only injection refuses it"
+        );
+    }
+
+    /// An operator promote is an explicit ruling: it confirms the memory and
+    /// clears whatever conflict was outstanding.
+    #[test]
+    fn promote_confirms_and_resolves_a_contest() {
+        let now = 9_000;
+        let mut m = candidate(0, 1, 8_000);
+        m.contest(now - 100);
+        m.superseded_by = "mem-other".into();
+        m.promote(now);
+        assert_eq!(m.belief, BeliefState::Current);
+        assert!(m.superseded_by.is_empty());
+        assert_eq!(m.last_confirmed_at, Some(now));
+        assert!(m.is_injectable());
+    }
+
+    #[test]
+    fn belief_state_round_trips_and_unknown_reads_as_current() {
+        for state in [
+            BeliefState::Current,
+            BeliefState::Contested,
+            BeliefState::Superseded,
+        ] {
+            assert_eq!(parse_belief_state(state.as_str()), state);
+        }
+        // Every row written before the column existed.
+        assert_eq!(parse_belief_state(""), BeliefState::Current);
+        assert_eq!(parse_belief_state("nonsense"), BeliefState::Current);
     }
 
     #[test]

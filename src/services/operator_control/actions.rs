@@ -575,8 +575,10 @@ pub fn dream_classify(memories: &[Memory], now: i64) -> DreamReport {
         }
         let item = DreamItem {
             id: m.id.clone(),
+            support_count: m.support_count,
+            contradiction_count: m.contradiction_count,
+            belief: m.belief.as_str().to_string(),
             recall_count: m.recall_count,
-            unique_queries: m.recall_query_hashes.len(),
             score: dream_score(m, now),
             content: m.content.clone(),
         };

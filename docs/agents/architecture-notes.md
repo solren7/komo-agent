@@ -671,6 +671,14 @@ model's view is one config value, in one place.
 - the turn's session context is established for BOTH paths: the gateway dispatcher sets it (with a real `ReplySink`), and `AgentRuntime::handle_input` sets a *detached* context (no-op sink) when none exists, so the REPL gets `todo` too — see `SessionContext::detached`
 
 `domain/memory.rs` + `tools/memory.rs` + `infra/memory/memory_db.rs` — long-term memory as three surfaces (roadmap §5)
+> **Superseded in part.** The memory sections below describe the pre-consolidation
+> design: promotion by `recall_count` + query-diversity fingerprints, and the
+> reviewer writing memories directly. Promotion is now evidence-driven
+> (`support_count` / `last_confirmed_at`, with `BeliefState` blocking contested
+> claims), query fingerprints are gone, and every extracted observation goes
+> through `MemoryConsolidator`. See `AGENTS.md`'s memory bullet for the current
+> rules; this file is kept for the reasoning that led here.
+
 - `Memory` model is governed and scoped: `kind` (profile/preference/feedback/project/person/fact/decision/reference), `status` (candidate→active, plus archived/rejected), `confidence` (extracted/inferred/confirmed/user_written), `importance`, `pinned`, `scope` (`MemoryScope` global/project/channel/session, serialized as `scope_type`+`scope_key`), `source`/`source_message_id`, timestamps, `expires_at`/`last_used_at`/`recall_count`/`recall_query_hashes` (the dreaming usage signals — see below). `MemoryContext::from_session` derives the turn's `allowed_scopes` from the session id (chat → global+channel+session; CLI → global+session, **never** infers project from chat). Governance transitions live on the model (`Memory::promote/reject/pin`) so the CLI, the api channel, and the `memory` tool share one definition
 - **L1 pinned** (done): `select_pinned` filters `is_pinnable` (pinned + active + confirmed/user_written + identity-kind + in-scope); `services/memory_enrichment.rs` renders an ≤800-char block appended **after** the volatile tier (cache-stable), marked `<!-- komo:memory:pinned -->`, flagged as untrusted data. Main agent only (the enricher is `Some` only there); aux/delegate get none
 - **L2 tool/governance** (done): `memory` tool `save/search/list/update/promote/reject/archive`; `search` is scope-bounded (`MemoryQuery` + `rerank_score`: lexical `LIKE` + importance/confidence/recency, no embedding). Operator CLI `komo memory list/search/promote/reject/pin/triage` (promote/reject take multiple ids; `triage` walks the candidate pile oldest-first with p/r/s/q; all three writes route through a running gateway — see the api-channel note above). `pin` is the manual-only path into L1 — automated extraction never pins

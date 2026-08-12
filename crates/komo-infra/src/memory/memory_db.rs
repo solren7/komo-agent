@@ -25,8 +25,8 @@ use crate::persistence::{
     DEFAULT_POOL_SIZE, prepare_turso_path, sqlite_backup_path, turso_marker_path, with_write_retry,
 };
 use komo_core::domain::memory::{
-    Memory, MemoryRepository, MemoryScope, parse_memory_confidence, parse_memory_kind,
-    parse_memory_status,
+    Evidence, Memory, MemoryRepository, MemoryScope, parse_belief_state, parse_memory_confidence,
+    parse_memory_kind, parse_memory_status,
 };
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
@@ -48,10 +48,19 @@ struct MemoryRecord {
     updated_at: i64,
     expires_at: i64,
     last_used_at: i64,
+    // Truth signals — see `Memory`'s own docs for why they are kept apart from
+    // `recall_count`.
+    belief_state: String,
+    support_count: i64,
+    contradiction_count: i64,
+    last_confirmed_at: i64,
+    superseded_by: String,
+    // JSON array of `Evidence`; empty when none. JSON rather than a child table
+    // because the list is capped at a handful of entries and is always read with
+    // its memory — a join would buy nothing and cost `list()`, which runs every
+    // turn.
+    evidence: String,
     recall_count: i64,
-    // Comma-separated distinct query fingerprints (hex, so commas never occur
-    // inside a value); domain type is `Vec<String>`.
-    recall_query_hashes: String,
     // Base64 of the L2-normalized embedding's little-endian f32 bytes; empty
     // when not embedded. Base64 rather than a JSON array because a 1024-dim
     // vector is ~5.5 KB encoded against ~12 KB as text, and `list()` loads
@@ -94,6 +103,25 @@ fn decode_embedding(encoded: &str) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// Encode an evidence list as JSON. Empty list → empty string, so "no evidence"
+/// needs no sentinel and costs no bytes on the many rows that have none.
+fn encode_evidence(evidence: &[Evidence]) -> String {
+    if evidence.is_empty() {
+        return String::new();
+    }
+    serde_json::to_string(evidence).unwrap_or_default()
+}
+
+/// Decode a stored evidence list. Malformed JSON reads as *no evidence* rather
+/// than failing the load — provenance is an audit aid, and losing it must never
+/// cost access to the memory itself.
+fn decode_evidence(encoded: &str) -> Vec<Evidence> {
+    if encoded.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(encoded).unwrap_or_default()
 }
 
 /// Connection to the memory database. Holds only `MemoryRecord`.
@@ -210,8 +238,13 @@ fn record_from_memory(memory: &Memory) -> MemoryRecord {
         updated_at: memory.updated_at,
         expires_at: memory.expires_at.unwrap_or(0),
         last_used_at: memory.last_used_at.unwrap_or(0),
+        belief_state: memory.belief.as_str().to_string(),
+        support_count: memory.support_count,
+        contradiction_count: memory.contradiction_count,
+        last_confirmed_at: memory.last_confirmed_at.unwrap_or(0),
+        superseded_by: memory.superseded_by.clone(),
+        evidence: encode_evidence(&memory.evidence),
         recall_count: memory.recall_count,
-        recall_query_hashes: memory.recall_query_hashes.join(","),
         embedding: encode_embedding(&memory.embedding),
         embedding_model: memory.embedding_model.clone(),
     }
@@ -234,13 +267,13 @@ fn memory_from_record(record: MemoryRecord) -> Memory {
         updated_at: record.updated_at,
         expires_at: nonzero(record.expires_at),
         last_used_at: nonzero(record.last_used_at),
+        belief: parse_belief_state(&record.belief_state),
+        support_count: record.support_count,
+        contradiction_count: record.contradiction_count,
+        last_confirmed_at: nonzero(record.last_confirmed_at),
+        superseded_by: record.superseded_by,
+        evidence: decode_evidence(&record.evidence),
         recall_count: record.recall_count,
-        recall_query_hashes: record
-            .recall_query_hashes
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect(),
         embedding: decode_embedding(&record.embedding),
         embedding_model: record.embedding_model,
     }
@@ -272,8 +305,13 @@ impl MemoryRepository for MemoryDb {
                     .updated_at(r.updated_at)
                     .expires_at(r.expires_at)
                     .last_used_at(r.last_used_at)
+                    .belief_state(r.belief_state)
+                    .support_count(r.support_count)
+                    .contradiction_count(r.contradiction_count)
+                    .last_confirmed_at(r.last_confirmed_at)
+                    .superseded_by(r.superseded_by)
+                    .evidence(r.evidence)
                     .recall_count(r.recall_count)
-                    .recall_query_hashes(r.recall_query_hashes)
                     .embedding(r.embedding)
                     .embedding_model(r.embedding_model)
                     .exec(&mut conn)
@@ -296,8 +334,13 @@ impl MemoryRepository for MemoryDb {
                 updated_at: r.updated_at,
                 expires_at: r.expires_at,
                 last_used_at: r.last_used_at,
+                belief_state: r.belief_state,
+                support_count: r.support_count,
+                contradiction_count: r.contradiction_count,
+                last_confirmed_at: r.last_confirmed_at,
+                superseded_by: r.superseded_by,
+                evidence: r.evidence,
                 recall_count: r.recall_count,
-                recall_query_hashes: r.recall_query_hashes,
                 embedding: r.embedding,
                 embedding_model: r.embedding_model,
             })
@@ -343,10 +386,29 @@ async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
             "recall_count",
             "\"recall_count\" integer NOT NULL DEFAULT 0",
         ),
+        // Truth signals. `belief_state` defaults to `current`, which is exactly
+        // what every row written before the column existed means.
         (
-            "recall_query_hashes",
-            "\"recall_query_hashes\" text NOT NULL DEFAULT ''",
+            "belief_state",
+            "\"belief_state\" text NOT NULL DEFAULT 'current'",
         ),
+        (
+            "support_count",
+            "\"support_count\" integer NOT NULL DEFAULT 0",
+        ),
+        (
+            "contradiction_count",
+            "\"contradiction_count\" integer NOT NULL DEFAULT 0",
+        ),
+        (
+            "last_confirmed_at",
+            "\"last_confirmed_at\" integer NOT NULL DEFAULT 0",
+        ),
+        (
+            "superseded_by",
+            "\"superseded_by\" text NOT NULL DEFAULT ''",
+        ),
+        ("evidence", "\"evidence\" text NOT NULL DEFAULT ''"),
         ("embedding", "\"embedding\" text NOT NULL DEFAULT ''"),
         (
             "embedding_model",
@@ -420,8 +482,13 @@ mod tests {
                     updated_at: r.updated_at,
                     expires_at: r.expires_at,
                     last_used_at: r.last_used_at,
+                    belief_state: r.belief_state,
+                    support_count: r.support_count,
+                    contradiction_count: r.contradiction_count,
+                    last_confirmed_at: r.last_confirmed_at,
+                    superseded_by: r.superseded_by,
+                    evidence: r.evidence,
                     recall_count: r.recall_count,
-                    recall_query_hashes: r.recall_query_hashes,
                     embedding: r.embedding,
                     embedding_model: r.embedding_model,
                 })
@@ -458,12 +525,12 @@ mod tests {
         assert_eq!(db2.list().await.unwrap().len(), 3, "must not re-migrate");
     }
 
-    /// An existing memory.db created before `recall_count` /
-    /// `recall_query_hashes` existed must gain the columns **in place** on
-    /// connect — additive ALTER, no data loss — rather than force a
-    /// destructive reset.
+    /// An existing memory.db created before `recall_count` and the truth-signal
+    /// columns existed must gain them **in place** on connect — additive ALTER, no
+    /// data loss — rather than force a destructive reset. Memories are durable
+    /// personal data; "delete the file" is not an available migration.
     #[tokio::test]
-    async fn adds_missing_recall_columns_in_place() {
+    async fn adds_missing_columns_in_place() {
         let path = std::env::temp_dir().join("komo_memory_db_addcol.db");
         crate::persistence::reset_test_db(&path);
 
@@ -508,15 +575,43 @@ mod tests {
         assert_eq!(rows.len(), 1, "the pre-migration row survives");
         assert_eq!(rows[0].content, "a pre-migration memory");
         assert_eq!(rows[0].recall_count, 0, "new column defaults to 0");
-        assert!(rows[0].recall_query_hashes.is_empty(), "defaults to empty");
+        // The truth-signal columns are additive too, and their defaults have to
+        // read as "believed, nothing recorded" — a pre-migration memory must not
+        // arrive contested or superseded.
+        assert_eq!(
+            rows[0].belief,
+            komo_core::domain::memory::BeliefState::Current
+        );
+        assert_eq!(rows[0].support_count, 0);
+        assert_eq!(rows[0].contradiction_count, 0);
+        assert_eq!(rows[0].last_confirmed_at, None);
+        assert!(rows[0].superseded_by.is_empty());
+        assert!(rows[0].evidence.is_empty());
 
         // 3. The added columns are fully usable: a recall bump persists.
-        db.mark_used(&[rows[0].id.clone()], 9_000, "q-hash")
-            .await
-            .unwrap();
+        db.mark_used(&[rows[0].id.clone()], 9_000).await.unwrap();
         let after = db.get("mem-old").await.unwrap().unwrap();
         assert_eq!(after.recall_count, 1);
-        assert_eq!(after.recall_query_hashes, vec!["q-hash".to_string()]);
+
+        // …and so are the new ones: evidence and a contest survive a write.
+        let mut memory = after;
+        memory.record_evidence(
+            "s-1",
+            komo_core::domain::memory::EvidenceRelation::Contradicts,
+            "actually no",
+            9_100,
+        );
+        memory.contest(9_100);
+        db.save(&memory).await.unwrap();
+        let reloaded = db.get("mem-old").await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.belief,
+            komo_core::domain::memory::BeliefState::Contested
+        );
+        assert_eq!(reloaded.contradiction_count, 1);
+        assert_eq!(reloaded.evidence.len(), 1);
+        assert_eq!(reloaded.evidence[0].session, "s-1");
+        assert_eq!(reloaded.evidence[0].excerpt, "actually no");
     }
 
     #[tokio::test]
@@ -660,26 +755,14 @@ mod tests {
         m.updated_at = 500;
         db.save(&m).await.unwrap();
 
-        db.mark_used(&[m.id.clone()], 9_000, "hash-a")
-            .await
-            .unwrap();
-        db.mark_used(&[m.id.clone()], 9_100, "hash-a")
-            .await
-            .unwrap();
-        db.mark_used(&[m.id.clone()], 9_200, "hash-b")
-            .await
-            .unwrap();
-        db.mark_used(&[m.id.clone()], 9_300, "").await.unwrap();
+        for at in [9_000, 9_100, 9_200, 9_300] {
+            db.mark_used(&[m.id.clone()], at).await.unwrap();
+        }
 
         let after = db.get(&m.id).await.unwrap().unwrap();
         assert_eq!(after.last_used_at, Some(9_300));
         assert_eq!(after.recall_count, 4, "each recall bumps the count");
         assert_eq!(after.updated_at, 500, "recall must not bump updated_at");
-        assert_eq!(
-            after.recall_query_hashes,
-            vec!["hash-a".to_string(), "hash-b".to_string()],
-            "fingerprints dedup; an empty hash is never recorded"
-        );
     }
 
     #[tokio::test]

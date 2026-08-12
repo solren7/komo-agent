@@ -25,7 +25,7 @@ komo health                        # liveness probe (exit 0 = healthy; Docker HE
 
 komo memory list|search|promote|reject|pin|triage|report|repair-scopes
 komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; index is incremental)
-komo dream [--apply]               # usage-driven candidate consolidation (preview by default)
+komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|resume|prune # run ledger (⟲ = recoverable)
 komo skills list|install|inspect|promote|reject|protect|unprotect|enable|disable
@@ -120,7 +120,7 @@ fork — add new operator actions there, not in the CLI or api handlers.
 (default nightly `0 3 * * *`, `"off"` disables), `[channels.*]`, `[policy]`,
 `[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
 cross-language recall; no model = lexical-only —
-`[wiki]` — `vault` (the note directory; absent = no `wiki_search`/`wiki_index`),
+`[wiki]` — `vault` (the note directory; absent = no `wiki_search`/`wiki_read`/`wiki_index`),
 `backend` (`edge` default / `server`), `url` + `collection` for the server
 backend, and its own `embedding_model`/`embedding_url` (falling back to
 `[memory]`'s when unset); `QDRANT_API_KEY` lives in `.env` —
@@ -199,7 +199,8 @@ komo-wiki      note-vault vector index: edge (qdrant-edge, in-process) /
                server (Qdrant over gRPC) / lazy                        (→ core)
 komo-infra     persistence · memory · skills · logs · workday ·
                permissions_store · codex · embedding         (→ core, config, provider)
-komo-services  tool_execution · tool_output_store · memory_enrichment · clarify ·
+komo-services  tool_execution · tool_output_store · memory_query ·
+               memory_consolidation · memory_enrichment · clarify ·
                skill_registry · cron_actions · wiki_indexing ·
                diff/patch/search/file_mutation                (→ core, config)
 komo-tools     every tool                      (→ core, infra, mcp, services)
@@ -265,8 +266,12 @@ call the same functions, which is what keeps validation from forking.
   hardline), `task`, `todo` (session-scoped, dies on `/new`), `memory`,
   `skill`, `cron`, `ask_user` (clarify), `logs` (tail of komo's own
   tracing log — file lookup shared with `komo logs` via `komo-infra`'s `logs`, same
-  deny-only file-read gate as `read`).
-- `komo-agent`'s `reviewer` — the post-turn extraction pass. It sees the
+  deny-only file-read gate as `read`), `wiki_read` (vault-confined by
+  canonicalized prefix, `Risk::Safe` deny-only; reads the markdown, not the
+  index, so a note edited since the last index run is served current).
+- `komo-agent`'s `reviewer` — the post-turn extraction pass. Memory extractions
+  leave here as `Observation`s and are applied by `MemoryConsolidator`, never
+  written directly — the reviewer holds no memory store. It sees the
   transcript only: `runtime` persists user and assistant messages, never tool
   results, so the reviewer has **not** read any skill it proposes to change.
   A proposal naming an existing active skill therefore goes through a second
@@ -309,14 +314,36 @@ call the same functions, which is what keeps validation from forking.
   comes back with `isError` is returned as *content*, not a `ToolError`: the
   message is remote-controlled and the retry classifier falls back to substring
   matching, so an echoed "connection refused" must not re-fire a mutation.
-- `domain/memory.rs` + `services/memory_enrichment.rs` — three surfaces:
+- `domain/memory.rs` + `services/memory_query.rs` + `services/memory_consolidation.rs`
+  + `services/memory_enrichment.rs` — three surfaces:
   L1 pinned block (manual `pin` only), L2 `memory` tool + operator CLI,
-  L3 recall (fetch 15, inject ≤5, aux-screened above 5;
-  injected hits get `recall_count`/`last_used_at`/query-hash stamped —
-  dreaming's signals). Nightly `DreamSweep` promotes candidates recalled ≥3
-  times by ≥2 distinct queries, archives 30-day-cold ones; only candidates are
-  touched. Reviewer extractions are always `candidate`, never pinned/active.
-  L3 matching is **lexical ∪ semantic** (`RecallQuery`): shared terms, or
+  L3 recall (fetch 15, inject ≤5, aux-screened above 5).
+  **Truth and utility are different axes, on purpose.** `support_count` /
+  `contradiction_count` / `last_confirmed_at` / `evidence` say whether a memory is
+  *true*; `recall_count` / `last_used_at` say whether it keeps being *useful*.
+  Promotion reads only the first set (`dream_verdict`: an explicit confirmation, or
+  `DREAM_MIN_SUPPORT` independent occasions, and no unresolved conflict) and
+  retention only the second (30-day-cold candidates archive). Deciding promotion on
+  recall — as it once did — lets a wrong memory confirm itself by being retrieved:
+  the thing retrieved is not the thing tested.
+  **`BeliefState` is a separate column from `status`**, not a new status value.
+  Status is the triage pipeline every operator surface is built on; belief is
+  `current` / `contested` / `superseded`, and only `current` may be injected
+  (`is_injectable`, checked by `enrich` and `is_pinnable`). Retrieval stays
+  belief-agnostic — an explicit `memory search` must surface a contested memory or
+  the model cannot help settle it.
+  **Every extracted observation goes through one seam** (`MemoryConsolidator`):
+  find related claims, classify via aux as same/supports/contradicts/supersedes/
+  unrelated, then record evidence, contest, supersede, or write a candidate. Every
+  failure path lands a plain candidate — the pre-seam behavior. Evidence
+  independence is **per session** (`record_evidence` drops a session it already
+  counted), which is what stops one talkative conversation from corroborating
+  itself; the list is capped at `EVIDENCE_CAP` while the counts keep rising.
+  Reviewer extractions are always `candidate`, never pinned/active.
+  **Both read paths share `MemoryQueryService`** — automatic recall and the
+  model's own `memory search` build the same hybrid query, so a memory the model
+  was handed is a memory it can find again (candidates included). Matching is
+  **lexical ∪ semantic** (`RecallQuery`): shared terms, or
   cosine ≥ `RECALL_SEMANTIC_FLOOR` against the memory's embedding. The semantic
   arm is not optional polish — CJK bigrams and ASCII words can never be equal,
   so lexical-only recall structurally cannot match a Chinese question to an
@@ -324,15 +351,19 @@ call the same functions, which is what keeps validation from forking.
   `komo-infra`'s `embedding` (Ollama; a *multilingual* model, or the gap
   returns), are stored per memory with the model that produced them
   (`embedding_for` rejects a foreign vector), and are backfilled in the
-  background by `enrich` — so every write path is covered by one implementation.
-  Every embedding failure degrades to lexical, never to worse.
+  background from the read path — so every write path is covered by one
+  implementation. Every embedding failure degrades to lexical, never to worse.
+  Injected lines carry `/supported` and `/stale:Nd` markers off
+  `vouched_at()` (last confirmation, else newest evidence, else creation — *not*
+  `updated_at`, which is an edit clock), and the block header tells the model to
+  confirm a stale memory before letting it drive an action.
   **Scope**: `write_scope()` only channel-scopes a *durable* channel
   (`is_durable_channel`). The `api` platform's chat id is per-conversation
   (TUI/desktop/web all ride it), so channel-scoping there makes a memory
   unrecallable from the next turn — those writes go `Global`. Memories written
   before this are repaired by `komo memory repair-scopes`.
 - `domain/wiki.rs` + `komo-wiki` + `komo-services`' `wiki_indexing` +
-  `komo-tools`' `wiki_search` / `wiki_index` — semantic search over the note vault
+  `komo-tools`' `wiki_search` / `wiki_read` / `wiki_index` — semantic search over the note vault
   (`[wiki] vault`), **pulled on demand, never auto-injected** like memory recall:
   a vault dwarfs the memory store, so a turn that does not search pays nothing.
   Two interchangeable backends behind `WikiIndex`, chosen by `[wiki] backend`:
@@ -341,7 +372,13 @@ call the same functions, which is what keeps validation from forking.
   so an index built by one is readable by the other — but **nothing migrates**,
   and a switch leaves the new backend empty until `komo wiki index` refills it.
   Retrieval is hybrid (BM25 fused with dense), capped per note so one long file
-  cannot crowd out a result set. `LazyWikiIndex` opens the backend on first use
+  cannot crowd out a result set. **`wiki_search` finds, `wiki_read` widens**: a
+  search hit is an isolated chunk, and a turn that needs the whole section asks
+  for it by `path` + `heading` rather than making every query pay the context
+  cost of the few that do. `wiki_read` shares the chunker's heading parser
+  (`is_fence` / `parse_heading`), so it can never miss a heading search reported,
+  and needs no index handle at all — which is why it survives a vector backend
+  that failed to open. `LazyWikiIndex` opens the backend on first use
   and retries per call: wiring is one-shot, so an eager open that failed would
   cost `wiki_search` for the life of the process — and the usual causes (a NAS
   still booting, a local-network permission the launchd job lacks) get fixed

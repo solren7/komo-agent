@@ -339,7 +339,9 @@ impl ProviderLlm {
         // (memory is background context — it must never fail a reply).
         let mut prompt = prompt;
         if let Some(enricher) = &self.enricher
-            && let Some(injection) = enricher.enrich(&session.id, &prompt).await
+            && let Some(injection) = enricher
+                .enrich(&session.id, &prompt, &session.messages[..last_user_idx])
+                .await
         {
             if let Some(pinned) = injection.pinned {
                 preamble.push_str("\n\n");

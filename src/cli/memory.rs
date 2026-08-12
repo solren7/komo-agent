@@ -310,21 +310,31 @@ fn report_bucket(label: &str, items: &[&Memory]) {
 
 fn line(m: &Memory) -> String {
     let pin = if m.pinned { " 📌" } else { "" };
+    // Belief is shown only when it is not `current`: an operator scanning the
+    // library needs to see a contested or superseded memory at a glance.
+    let belief = if m.is_injectable() {
+        String::new()
+    } else {
+        format!("/{}", m.belief.as_str())
+    };
     let mut s = format!(
-        "{}  [{}/{}/{}{}]  {}",
+        "{}  [{}/{}/{}{}{}]  {}",
         m.id,
         m.status.as_str(),
         m.kind.as_str(),
         m.scope.type_str(),
+        belief,
         pin,
         m.content
     );
-    if m.recall_count > 0 {
+    if m.support_count > 0 || m.contradiction_count > 0 {
         s.push_str(&format!(
-            "  (recalls={} queries={})",
-            m.recall_count,
-            m.recall_query_hashes.len()
+            "  (support={} against={})",
+            m.support_count, m.contradiction_count
         ));
+    }
+    if m.recall_count > 0 {
+        s.push_str(&format!("  (recalls={})", m.recall_count));
     }
     if !m.source.is_empty() {
         s.push_str(&format!("  (from {})", m.source));
