@@ -9,13 +9,18 @@ use komo_core::domain::{
     context::ToolContext,
     memory::{
         Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryQuery, MemoryRepository,
-        MemoryStatus, ScoredMemory, parse_memory_kind, parse_memory_status,
+        MemoryStatus, RecallQuery, ScoredMemory, parse_memory_kind, parse_memory_status,
+        select_recall,
     },
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
 /// Default cap on search results.
 const SEARCH_LIMIT: usize = 10;
+
+/// How many possibly-related existing memories a `save` reports back. Enough to
+/// surface a contradiction, small enough not to bloat the tool result.
+const RELATED_LIMIT: usize = 3;
 
 #[derive(Deserialize)]
 struct MemoryArgs {
@@ -41,6 +46,10 @@ struct MemoryArgs {
     /// Optional TTL in days (action=save).
     #[serde(default)]
     expiry_days: Option<i64>,
+    /// Ids of existing memories the new fact replaces (action=save); archived
+    /// in the same call so an outdated fact never coexists with its successor.
+    #[serde(default)]
+    supersedes: Option<Vec<String>>,
 }
 
 impl MemoryArgs {
@@ -59,6 +68,13 @@ impl MemoryArgs {
         ] {
             if field.as_deref().is_some_and(|s| s.trim().is_empty()) {
                 *field = None;
+            }
+        }
+        // Same placeholder problem in list form: `"supersedes": []` or `[""]`.
+        if let Some(ids) = &mut self.supersedes {
+            ids.retain(|id| !id.trim().is_empty());
+            if ids.is_empty() {
+                self.supersedes = None;
             }
         }
         self
@@ -129,7 +145,11 @@ impl Tool for MemoryTool {
          Write each memory as a declarative fact, not an instruction (\"User prefers \
          concise replies\" ✓, \"Always reply concisely\" ✗), and prioritize what reduces \
          future steering. Do not save anything that will be stale within a week — task \
-         progress, completed-work logs, PR/issue numbers, or commit SHAs do not belong here."
+         progress, completed-work logs, PR/issue numbers, or commit SHAs do not belong here. \
+         When a new fact replaces or contradicts a stored one (a changed preference, a \
+         corrected fact), pass `supersedes: [ids]` on save so the outdated memory is \
+         archived instead of coexisting with its successor; `save` reports possibly \
+         related existing memories so you can catch the conflict."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -152,7 +172,12 @@ impl Tool for MemoryTool {
                 "status": { "type": "string", "enum": ["candidate", "active", "archived", "rejected"], "description": "New status (action=update)." },
                 "pinned": { "type": "boolean", "description": "Pin/unpin for L1 injection (action=update). Only pin user-confirmed durable facts." },
                 "importance": { "type": "integer", "description": "Ranking weight 0–100 (action=update)." },
-                "expiry_days": { "type": "integer", "description": "Optional TTL in days (action=save); omit for permanent." }
+                "expiry_days": { "type": "integer", "description": "Optional TTL in days (action=save); omit for permanent." },
+                "supersedes": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Ids of stored memories the new fact replaces (action=save); they are archived in the same call."
+                }
             },
             "required": ["action"]
         })
@@ -175,6 +200,16 @@ impl Tool for MemoryTool {
                     .as_deref()
                     .map(parse_memory_kind)
                     .unwrap_or(MemoryKind::Profile);
+                // Validate every superseded id *before* any write, so a typo'd
+                // id can never leave the save half-applied.
+                let mut superseded: Vec<Memory> = Vec::new();
+                for id in args.supersedes.as_deref().unwrap_or_default() {
+                    superseded.push(self.require(&Some(id.clone())).await?);
+                }
+                // Snapshot the store pre-save: the related-memory scan below
+                // must not report the new memory against itself.
+                let existing = self.memories.list().await?;
+
                 let mut memory = Memory::new(kind, text);
                 // An explicit user save is the highest trust tier.
                 memory.confidence = MemoryConfidence::UserWritten;
@@ -185,6 +220,35 @@ impl Tool for MemoryTool {
                 }
                 self.memories.save(&memory).await?;
                 let mut out = format!("Saved memory {}.", memory.id);
+
+                let superseded_ids: Vec<String> = superseded.iter().map(|m| m.id.clone()).collect();
+                if !superseded.is_empty() {
+                    for mut old in superseded.drain(..) {
+                        old.status = MemoryStatus::Archived;
+                        old.updated_at = now;
+                        self.memories.save(&old).await?;
+                    }
+                    out.push_str(&format!(
+                        "\nSuperseded (archived): {}.",
+                        superseded_ids.join(", ")
+                    ));
+                }
+
+                // Surface possibly related existing memories so a contradiction
+                // is caught while the model is still in context — the store has
+                // no automatic conflict detection, the model is it.
+                let related = related_memories(&existing, &scope, &memory, &superseded_ids, now);
+                if !related.is_empty() {
+                    out.push_str(
+                        "\nPossibly related existing memories — if the new fact contradicts \
+                         or replaces one, archive it (action=archive):",
+                    );
+                    for hit in &related {
+                        out.push('\n');
+                        out.push_str(&render_one(&hit.memory));
+                    }
+                }
+
                 if let Some(usage) = self.pinned_usage_line(&scope).await {
                     out.push('\n');
                     out.push_str(&usage);
@@ -278,6 +342,28 @@ impl Tool for MemoryTool {
 /// CLI one does not). An empty id yields the global-only context.
 fn memory_context(session_id: &str) -> MemoryContext {
     MemoryContext::from_session(session_id)
+}
+
+/// Existing memories a fresh save might contradict or duplicate: the in-scope
+/// active/candidate memories that lexically overlap the new content, ranked by
+/// the recall score, top [`RELATED_LIMIT`]. `exclude` drops the ones already
+/// superseded in this call — they are being archived, no point flagging them.
+/// Lexical-only on purpose: the tool holds no embedding backend, and a save is
+/// almost always phrased in the vocabulary of the fact it updates.
+fn related_memories(
+    existing: &[Memory],
+    scope: &MemoryContext,
+    saved: &Memory,
+    exclude: &[String],
+    now: i64,
+) -> Vec<ScoredMemory> {
+    let pool: Vec<Memory> = existing
+        .iter()
+        .filter(|m| m.id != saved.id && !exclude.contains(&m.id))
+        .cloned()
+        .collect();
+    let query = RecallQuery::lexical(&saved.content);
+    select_recall(&pool, scope, &query, RELATED_LIMIT, now)
 }
 
 async fn set_status(
@@ -441,6 +527,118 @@ mod tests {
             .unwrap()
             .text;
         assert!(out.contains("protoc"));
+    }
+
+    /// The preference-evolution case: the new fact archives the outdated one in
+    /// the same call, so the two never coexist in recall.
+    #[tokio::test]
+    async fn save_with_supersedes_archives_the_outdated_memory() {
+        let tool = temp_tool("komo_mem_tool_supersede");
+        let mut old = Memory::new(MemoryKind::Preference, "User prefers Python for scripting");
+        old.status = MemoryStatus::Active;
+        tool.memories.save(&old).await.unwrap();
+
+        let out = tool
+            .call(
+                json!({
+                    "action": "save",
+                    "text": "User mainly uses Rust for scripting now",
+                    "kind": "preference",
+                    "supersedes": [old.id]
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("Superseded (archived)"));
+        assert!(out.contains(&old.id));
+        // The superseded line must not double as a "possibly related" hint.
+        assert!(!out.contains("Possibly related"));
+
+        let archived = tool.memories.get(&old.id).await.unwrap().unwrap();
+        assert_eq!(archived.status, MemoryStatus::Archived);
+    }
+
+    /// A save that overlaps a stored fact reports it, so the model can catch a
+    /// contradiction while still in context.
+    #[tokio::test]
+    async fn save_reports_possibly_related_existing_memories() {
+        let tool = temp_tool("komo_mem_tool_related");
+        let mut old = Memory::new(MemoryKind::Preference, "User prefers Python for scripting");
+        old.status = MemoryStatus::Active;
+        tool.memories.save(&old).await.unwrap();
+
+        let out = tool
+            .call(
+                json!({ "action": "save", "text": "User mainly uses Rust for scripting now" }),
+                &ctx(),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("Possibly related existing memories"));
+        assert!(out.contains(&old.id));
+        assert!(out.contains("Python"));
+        // Nothing was archived — surfacing is a hint, not an action.
+        assert_eq!(
+            tool.memories.get(&old.id).await.unwrap().unwrap().status,
+            MemoryStatus::Active
+        );
+    }
+
+    /// An unrelated save stays quiet — the hint must not fire on every write.
+    #[tokio::test]
+    async fn save_with_no_overlap_reports_nothing_related() {
+        let tool = temp_tool("komo_mem_tool_unrelated");
+        let mut old = Memory::new(MemoryKind::Preference, "User prefers Python for scripting");
+        old.status = MemoryStatus::Active;
+        tool.memories.save(&old).await.unwrap();
+
+        let out = tool
+            .call(
+                json!({ "action": "save", "text": "团队周会安排在星期二" }),
+                &ctx(),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(!out.contains("Possibly related"));
+    }
+
+    /// A typo'd supersede id fails the whole call before any write — the new
+    /// memory is not saved, nothing is archived.
+    #[tokio::test]
+    async fn save_with_unknown_supersede_id_writes_nothing() {
+        let tool = temp_tool("komo_mem_tool_supersede_unknown");
+        let err = tool
+            .call(
+                json!({
+                    "action": "save",
+                    "text": "User mainly uses Rust now",
+                    "supersedes": ["mem-nope"]
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no memory with id"));
+        assert!(tool.memories.list().await.unwrap().is_empty());
+    }
+
+    /// Placeholder shapes (`[]`, `[""]`) mean "no supersede", not an error.
+    #[tokio::test]
+    async fn empty_supersedes_placeholders_are_ignored() {
+        let tool = temp_tool("komo_mem_tool_supersede_empty");
+        let out = tool
+            .call(
+                json!({ "action": "save", "text": "用户喜欢蓝色", "supersedes": [""] }),
+                &ctx(),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("Saved memory"));
     }
 
     #[tokio::test]

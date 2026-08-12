@@ -64,7 +64,8 @@ impl Tool for WikiSearchTool {
          the user refers to something they wrote down, asks what they concluded \
          or decided previously, or when their own notes would answer better than \
          general knowledge. Matches across languages — a Chinese question finds \
-         an English note.\n\
+         an English note. If one search comes back thin, retry with different \
+         wording or an adjacent angle before concluding the note does not exist.\n\
          This answers \"what did I write about X\", never \"what is in the \
          vault\". An inventory question has no passage that matches it: the \
          vault's own index, dashboard and README-style files outrank every real \
