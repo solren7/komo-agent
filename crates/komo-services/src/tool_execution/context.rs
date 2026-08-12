@@ -171,7 +171,7 @@ impl TurnResultBudget {
 
 tokio::task_local! {
     pub(super) static SESSION: SessionContext;
-    static JOB_GRANTS: Arc<Vec<Rule>>;
+    pub(super) static JOB_GRANTS: Arc<Vec<Rule>>;
 }
 
 /// Run `future` with `grants` as the ambient job-grant list — the actions a

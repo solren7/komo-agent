@@ -48,7 +48,7 @@ use komo_core::domain::tool::{Tool, ToolError};
 /// loopback SSE — a couple of KB per call costs nothing worth that.
 const EVENT_SUMMARY_CAP: usize = STEP_FIELD_CAP;
 
-use context::SESSION;
+use context::{JOB_GRANTS, SESSION};
 use result::cap_tool_result;
 use retry::{TOOL_RETRY_BACKOFF_MS, TOOL_RETRY_MAX_ATTEMPTS, should_retry};
 
@@ -441,20 +441,25 @@ impl ToolExecutionCore {
                 let tool_attempt = tool.clone();
                 let value_attempt = value.clone();
                 // Build the explicit per-call context, and also install the
-                // turn's session as the ambient scope for the spawned task —
-                // the approvers still read it (they don't take a context
-                // parameter), and a fresh task doesn't inherit task-locals.
+                // turn's session and job grants as the ambient scope for the
+                // spawned task — the approvers still read them (they don't
+                // take a context parameter), and a fresh task doesn't inherit
+                // task-locals.
                 let ctx = ToolContext::new(
                     context.session.clone(),
                     context.run.clone(),
                     self.approver.clone(),
                 );
                 let scope = context.session.clone();
+                let grants = current_job_grants();
                 let join = tokio::spawn(
                     SESSION
-                        .scope(scope, async move {
-                            tool_attempt.call(value_attempt, &ctx).await
-                        })
+                        .scope(
+                            scope,
+                            JOB_GRANTS.scope(grants, async move {
+                                tool_attempt.call(value_attempt, &ctx).await
+                            }),
+                        )
                         .instrument(span),
                 );
                 // Wall-clock timeout backstop: a tool that hangs forever (a
@@ -1536,6 +1541,52 @@ mod tests {
         let executor = executor(vec![Arc::new(EchoTool)], ToolExecutionConfig::default());
         let out = one(&executor, call("echo", "x"), &unledgered()).await;
         assert_eq!(out.content, "echoed: x");
+    }
+
+    /// Reports the ambient job-grant count from *inside* a tool call — the
+    /// vantage point of an approver consulted mid-tool.
+    struct GrantProbe;
+    #[async_trait]
+    impl Tool for GrantProbe {
+        fn name(&self) -> &'static str {
+            "grant_probe"
+        }
+        fn description(&self) -> &'static str {
+            "reports the ambient job grants"
+        }
+        async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text(current_job_grants().len().to_string()))
+        }
+    }
+
+    /// The cron-job regression: each tool call runs on a spawned task, and a
+    /// task-local does not cross `tokio::spawn` — so unless the executor
+    /// re-installs the turn's job grants (like it does the session), a grant
+    /// approved at job creation never reaches the approver at run time.
+    #[tokio::test]
+    async fn job_grants_reach_a_tool_across_its_spawn() {
+        use komo_core::domain::policy::{Category, Effect, Matcher, Rule};
+        let executor = executor(vec![Arc::new(GrantProbe)], ToolExecutionConfig::default());
+        let grant = Rule {
+            channels: None,
+            category: Category::HomeAssistant,
+            matcher: Matcher::Exact,
+            value: "climate.set_temperature".to_string(),
+            access: None,
+            effect: Effect::Allow,
+            include_dangerous: false,
+            unattended: true,
+        };
+        let out = with_job_grants(
+            vec![grant],
+            one(&executor, call("grant_probe", "{}"), &unledgered()),
+        )
+        .await;
+        assert_eq!(out.content, "1", "the job's grant must be visible in-tool");
+
+        // …and outside the scope the same tool sees none.
+        let out = one(&executor, call("grant_probe", "{}"), &unledgered()).await;
+        assert_eq!(out.content, "0");
     }
 
     /// A tool that never returns on its own — stands in for a hung shell command
