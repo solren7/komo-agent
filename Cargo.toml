@@ -25,10 +25,10 @@ komo-agent = { path = "crates/komo-agent" }
 # Note-vault vector search. Its own crate so its ~130 vector dependencies stay
 # off every other crate's compile path — only this wiring layer sees them.
 komo-wiki = { path = "crates/komo-wiki" }
-clap = { version = "4.6.4", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
-toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
-toasty-driver-turso = "0.9.0"
+toasty = { version = "0.10.0", features = ["sqlite", "turso"] }
+toasty-driver-turso = "0.10.0"
 # Direct handle to the same Turso engine toasty uses, for the one thing toasty's
 # typed API can't do: run a raw `ALTER TABLE ADD COLUMN` to migrate an existing
 # memory.db in place (additive, no data loss). See `memory_db::ensure_columns`.
@@ -65,7 +65,7 @@ uuid = { workspace = true }
 sha2 = { workspace = true }
 # Decode the Codex OAuth access-token JWT to read its `exp` / account-id claims
 # (no signature verification — we only inspect the payload). See `infra/codex.rs`.
-base64 = "0.23.0"
+base64 = "0.23.1"
 # `http` for the Codex OAuth refresh request's header constants; `bytes` for the
 # provider layer's SSE chunk stream.
 http = "1.5.0"
@@ -97,7 +97,7 @@ syntect = { version = "5.3", default-features = false, features = [
     "regex-fancy",
     "dump-load",
 ] }
-two-face = { version = "0.4", default-features = false, features = [
+two-face = { version = "0.5.2+bat-0.26.1", default-features = false, features = [
     "syntect-fancy",
 ] }
 tracing-appender = "0.2.5"
@@ -107,12 +107,12 @@ libc = "0.2.189"
 # one exists on the host (or in a container). `ignore` is the .gitignore-aware
 # parallel walker, `globset` the glob matcher, `grep-searcher`/`grep-regex` the
 # line searcher — all BurntSushi's, all what ripgrep itself is assembled from.
-ignore = "0.4.31"
-globset = "0.4.19"
+ignore = "0.4.33"
+globset = "0.4.20"
 grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
 # Unified diffs + line-level add/remove counts for `edit` / `apply_patch`.
-similar = "3.1.1"
+similar = "3.1.2"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,
@@ -155,16 +155,16 @@ debug = "none"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 anyhow = "1.0.104"
-thiserror = "2.0.19"
-async-trait = "0.1.91"
+thiserror = "2.0.20"
+async-trait = "0.1.92"
 dirs = "6"
 sha2 = "0.11"
 tracing = "0.1"
-time = { version = "0.3.54", features = ["formatting", "macros"] }
+time = { version = "0.3.55", features = ["formatting", "macros"] }
 uuid = { version = "1.24.0", features = ["v4", "v7"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes = "1"
-futures-util = "0.3.33"
+futures-util = "0.3.34"
 toml = "1.1.4"
 envy = "0.4"
 reqwest = { version = "0.13", default-features = false, features = [
