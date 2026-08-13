@@ -117,7 +117,11 @@ fork — add new operator actions there, not in the CLI or api handlers.
 
 `~/.komo/config.toml` = runtime settings (provider/model/`models`/aux_model,
 `schedule`, `briefing_schedule` + `briefing_workdays_only`, `dream_schedule`
-(default nightly `0 3 * * *`, `"off"` disables), `[channels.*]`, `[policy]`,
+(default nightly `0 3 * * *`, `"off"` disables), the two sweep kill switches
+`briefing_schedule_enabled` / `dream_schedule_enabled` (default true; `false`
+disables the sweep while leaving its cron in place, so
+`KOMO_BRIEFING_SCHEDULE_ENABLED=false` / `KOMO_DREAM_SCHEDULE_ENABLED=false`
+silence a deployment without rewriting config.toml), `[channels.*]`, `[policy]`,
 `[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
 cross-language recall; no model = lexical-only —
 `[wiki]` — `vault` (the note directory; absent = no `wiki_search`/`wiki_read`/`wiki_index`),

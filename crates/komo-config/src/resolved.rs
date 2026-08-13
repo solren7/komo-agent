@@ -736,6 +736,14 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
     // `[memory]` backend when it declares no model of its own.
     let embedding = resolve_embedding(file.memory);
     let wiki = resolve_wiki(file.wiki, embedding.as_ref(), &home, &mut issues);
+    let briefing_enabled = env
+        .briefing_schedule_enabled
+        .or(file.briefing_schedule_enabled)
+        .unwrap_or(true);
+    let dream_enabled = env
+        .dream_schedule_enabled
+        .or(file.dream_schedule_enabled)
+        .unwrap_or(true);
 
     let runtime = RuntimeConfig {
         db_url: db_url("state.db"),
@@ -752,12 +760,18 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
             .schedule
             .or(file.schedule)
             .unwrap_or_else(|| DEFAULT_MAINTENANCE_SCHEDULE.to_string()),
-        briefing_schedule: env.briefing_schedule.or(file.briefing_schedule),
+        briefing_schedule: enabled_then(
+            briefing_enabled,
+            env.briefing_schedule.or(file.briefing_schedule),
+        ),
         briefing_workdays_only: env
             .briefing_workdays_only
             .or(file.briefing_workdays_only)
             .unwrap_or(false),
-        dream_schedule: resolve_dream_schedule(env.dream_schedule.or(file.dream_schedule)),
+        dream_schedule: enabled_then(
+            dream_enabled,
+            resolve_dream_schedule(env.dream_schedule.or(file.dream_schedule)),
+        ),
         embedding,
         wiki,
         policy,
@@ -1054,6 +1068,13 @@ fn require_secret(value: &Option<String>, channel: &str, var: &str) -> Result<St
         .ok_or_else(|| {
             format!("[channels.{channel}] is enabled but {var} is not set (put it in ~/.komo/.env)")
         })
+}
+
+/// A `*_schedule_enabled = false` wins over whatever cron is configured: the
+/// switch exists so a deployment can silence a sweep without erasing the
+/// schedule it should come back to.
+fn enabled_then(enabled: bool, schedule: Option<String>) -> Option<String> {
+    enabled.then_some(schedule).flatten()
 }
 
 /// Pure resolution of the dreaming schedule from its configured value: unset →
@@ -1467,6 +1488,35 @@ mod tests {
                 "`{off}` should disable dreaming"
             );
         }
+    }
+
+    #[test]
+    fn enabled_switches_override_a_configured_schedule() {
+        let mut s = with_deepseek_key(sources());
+        s.file.briefing_schedule = Some("30 8 * * *".into());
+        s.file.dream_schedule = Some("0 3 * * *".into());
+        s.env.briefing_schedule_enabled = Some(false);
+        s.env.dream_schedule_enabled = Some(false);
+
+        let rt = ConfigSnapshot::from_sources(s).runtime;
+        assert_eq!(rt.briefing_schedule, None);
+        assert_eq!(rt.dream_schedule, None);
+    }
+
+    #[test]
+    fn enabled_switches_default_on_and_env_beats_file() {
+        let mut s = with_deepseek_key(sources());
+        s.file.briefing_schedule = Some("30 8 * * *".into());
+        s.file.briefing_schedule_enabled = Some(false);
+        s.file.dream_schedule_enabled = Some(false);
+        s.env.briefing_schedule_enabled = Some(true);
+
+        let rt = ConfigSnapshot::from_sources(s).runtime;
+        assert_eq!(rt.briefing_schedule.as_deref(), Some("30 8 * * *"));
+        assert_eq!(
+            rt.dream_schedule, None,
+            "file switch still disables dreaming"
+        );
     }
 
     #[test]

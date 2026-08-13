@@ -28,9 +28,11 @@ provider = "deepseek"
 # Daily briefing — opt-in, no default. Uncomment to enable.
 # briefing_schedule = "30 8 * * *"
 # briefing_workdays_only = true  # skip Chinese non-working days (incl. 调休)
+# briefing_schedule_enabled = false  # kill switch, keeps the cron above
 
 # Usage-driven memory consolidation ("dreaming"). On by default, nightly.
 # dream_schedule = "0 3 * * *"   # set to "off" to disable
+# dream_schedule_enabled = false     # kill switch, keeps the cron above
 
 # --- ingress channels (each needs its credential in .env) -------------------
 

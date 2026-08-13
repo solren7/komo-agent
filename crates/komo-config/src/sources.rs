@@ -62,8 +62,13 @@ pub struct KomoEnv {
     pub aux_model: Option<String>,
     pub schedule: Option<String>,
     pub briefing_schedule: Option<String>,
+    /// `KOMO_BRIEFING_SCHEDULE_ENABLED=false` kills the briefing without
+    /// touching whatever cron `config.toml` declares.
+    pub briefing_schedule_enabled: Option<bool>,
     pub briefing_workdays_only: Option<bool>,
     pub dream_schedule: Option<String>,
+    /// `KOMO_DREAM_SCHEDULE_ENABLED=false` — same kill switch for dreaming.
+    pub dream_schedule_enabled: Option<bool>,
     pub max_turns: Option<usize>,
     pub max_tool_result_bytes: Option<usize>,
     pub max_turn_result_bytes: Option<usize>,
@@ -140,8 +145,10 @@ impl KomoEnv {
             aux_model,
             schedule,
             briefing_schedule,
+            briefing_schedule_enabled,
             briefing_workdays_only,
             dream_schedule,
+            dream_schedule_enabled,
             max_turns,
             max_tool_result_bytes,
             max_turn_result_bytes,
@@ -240,6 +247,11 @@ pub struct FileConfig {
     /// 5-field Unix cron expression for the daily briefing. Unset = disabled
     /// (the briefing is opt-in; e.g. `0 8 * * *` for 8am daily).
     pub briefing_schedule: Option<String>,
+    /// Master switch for the briefing, independent of its cron. `false` disables
+    /// it while `briefing_schedule` keeps its value — which is what lets a
+    /// deployment turn the sweep off (`KOMO_BRIEFING_SCHEDULE_ENABLED=false`)
+    /// without rewriting the schedule it should return to. Default true.
+    pub briefing_schedule_enabled: Option<bool>,
     /// Gate the daily briefing to Chinese working days only (statutory holidays
     /// and 调休-adjusted weekends respected). Default false.
     pub briefing_workdays_only: Option<bool>,
@@ -247,6 +259,9 @@ pub struct FileConfig {
     /// Unset = on by default (nightly `0 3 * * *`); set to `"off"` (or empty) to
     /// disable.
     pub dream_schedule: Option<String>,
+    /// Master switch for dreaming, independent of its cron. Same role as
+    /// `briefing_schedule_enabled`. Default true.
+    pub dream_schedule_enabled: Option<bool>,
     /// Maximum tool-calling round-trips per user turn (default: 30).
     pub max_turns: Option<usize>,
     /// Byte cap on a tool result handed back to the LLM, a global backstop
