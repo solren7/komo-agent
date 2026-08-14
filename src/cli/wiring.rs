@@ -313,6 +313,10 @@ pub async fn build(
         if let Some(delegate) = delegate {
             tools.register(delegate);
         }
+        // Tools built from the executor itself, now that the rest are in.
+        for tool in registry.build_for(scope, &tools) {
+            tools.register(tool);
+        }
         // A tool the policy denies outright never gets advertised: it would
         // otherwise cost a schema, a prompt entry, and a whole round-trip per
         // attempt, all to be refused. Runs before the catalog is read, so the
@@ -322,6 +326,17 @@ pub async fn build(
             tracing::info!(tools = %dropped.join(", "), "tools withheld by a policy deny rule");
         }
         tools
+    };
+    // The `run_code` API listing, when that runtime loaded the tool. Rendered
+    // from the same catalog the schemas come from, so the two can never
+    // disagree about what a program may call.
+    let code_note_for = |tools: &ToolExecutor| -> Option<String> {
+        let snapshot = tools.snapshot();
+        snapshot
+            .get("run_code")
+            .is_some()
+            .then(|| komo_tools::run_code::sdk_note(&snapshot))
+            .flatten()
     };
     let tool_names_of = |tools: &ToolExecutor| -> Vec<String> {
         tools
@@ -351,6 +366,7 @@ pub async fn build(
         SystemPromptBuilder::new(model_config)
             .tools(subagent_tool_names)
             .skills_note(subagent_note)
+            .code_note(code_note_for(&subagent_tools))
             .workspace_root(Some(root.clone())),
     );
     let subagent_preamble: PreambleFn = Arc::new(move || subagent_builder.build());
@@ -395,6 +411,7 @@ pub async fn build(
         SystemPromptBuilder::new(model_config)
             .tools(tool_names)
             .skills_note(main_note)
+            .code_note(code_note_for(&tools))
             .workspace_root(Some(root.clone()))
             // The main agent fields "how do I configure Komo" questions, so it
             // gets the built-in platform manual (wechat login, pairing, …).
@@ -494,6 +511,7 @@ pub async fn build(
         SystemPromptBuilder::new(model_config)
             .tools(cron_tool_names)
             .skills_note(cron_note)
+            .code_note(code_note_for(&cron_tools))
             .workspace_root(Some(root.clone())),
     );
     let cron_preamble: PreambleFn = Arc::new(move || cron_builder.build());

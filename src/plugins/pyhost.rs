@@ -19,8 +19,9 @@ use async_trait::async_trait;
 use komo_core::domain::catalog::{Registration, ToolCatalog};
 use komo_core::domain::policy::{Category, Policy};
 use komo_core::domain::tool::Tool;
-use komo_pyhost::{HostEvent, PluginToolDef, PyHost};
+use komo_pyhost::{HostEvent, PluginToolDef, PyHost, SharedHost};
 use komo_tools::plugin::PyTool;
+use komo_tools::run_code::RunCodeTool;
 
 use super::{Plugin, Scope, ToolCx, ToolRegistry};
 
@@ -56,7 +57,7 @@ impl Plugin for PyHostPlugin {
         "pyhost"
     }
 
-    async fn setup_tools(&self, _reg: &mut ToolRegistry, cx: &ToolCx<'_>) -> anyhow::Result<()> {
+    async fn setup_tools(&self, reg: &mut ToolRegistry, cx: &ToolCx<'_>) -> anyhow::Result<()> {
         let plugins_dir = cx.config.runtime.home.join("plugins");
         if !plugins_dir.is_dir() {
             // No directory means no plugins can exist. Creating one the user
@@ -81,11 +82,28 @@ impl Plugin for PyHostPlugin {
             return Ok(());
         }
 
+        // The slot the supervisor keeps current across restarts. `run_code`
+        // holds it rather than a host handle, so a restarted host is picked up
+        // without re-registering the tool.
+        let host = SharedHost::default();
+
+        // Code mode: one tool that runs a program, in place of the model
+        // calling three tools in three rounds. Built per executor because a
+        // program's calls go back through that executor — see `run_code`.
+        let shared = host.clone();
+        reg.tool_from_executor(
+            PLUGIN_SCOPE,
+            Box::new(move |executor| {
+                Arc::new(RunCodeTool::new(shared.clone(), executor.downgrade())) as Arc<dyn Tool>
+            }),
+        );
+
         let catalogs = cx.catalogs.covered_by(PLUGIN_SCOPE);
         let supervisor = Supervisor {
             home: cx.config.runtime.home.clone(),
             plugins_dir,
             catalogs,
+            host,
         };
         // Supervised in the background: a plugin host that will not start must
         // cost the plugins, never the boot. Its first attempt is made here
@@ -106,6 +124,8 @@ struct Supervisor {
     home: PathBuf,
     plugins_dir: PathBuf,
     catalogs: Vec<Arc<ToolCatalog>>,
+    /// Published so `run_code` can reach whichever host is current.
+    host: SharedHost,
 }
 
 impl Supervisor {
@@ -143,6 +163,10 @@ impl Supervisor {
     async fn serve_one_host(&self) -> anyhow::Result<String> {
         let (host, mut events) = PyHost::spawn(PYTHON, &self.home, &self.plugins_dir).await?;
         let tools = host.manifest().await?;
+        // Published only once the host answered: a handle to a process that
+        // cannot speak the protocol is worse than none, because `run_code`
+        // would hand programs to it and wait.
+        self.host.set(Some(host.clone()));
 
         // Held across the loop: dropping these unmounts, which is exactly what
         // should happen when this function returns for any reason.
@@ -158,10 +182,17 @@ impl Supervisor {
                     drop(std::mem::take(&mut mounted));
                     mounted = self.mount(&host, tools);
                 }
-                HostEvent::Exited { status } => return Ok(status),
+                HostEvent::Exited { status } => return Ok(self.retire(status)),
             }
         }
-        Ok("event stream closed".to_string())
+        Ok(self.retire("event stream closed".to_string()))
+    }
+
+    /// Stop advertising a host that is gone, so `run_code` says "not running"
+    /// instead of handing a program to a dead process.
+    fn retire(&self, status: String) -> String {
+        self.host.set(None);
+        status
     }
 
     /// Mount `tools` into every catalog this supervisor covers.

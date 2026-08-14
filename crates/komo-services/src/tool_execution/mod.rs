@@ -249,6 +249,19 @@ impl ToolExecutor {
         self.core.snapshot()
     }
 
+    /// A non-owning handle, for a tool that needs to dispatch *other* tools.
+    ///
+    /// Weak on purpose: such a tool lives in the very catalog this executor
+    /// reads, so an owning handle would be a cycle that never drops. Nothing is
+    /// lost by it — an executor gone while one of its own tools is running
+    /// cannot happen, and if it somehow did, [`WeakToolExecutor::upgrade`]
+    /// saying so beats a leak.
+    pub fn downgrade(&self) -> WeakToolExecutor {
+        WeakToolExecutor {
+            core: Arc::downgrade(&self.core),
+        }
+    }
+
     /// Install the approver handed to every tool via its [`ToolContext`]. Called
     /// during wiring before the executor is shared (like [`register`]).
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
@@ -422,6 +435,20 @@ impl ToolExecutor {
             },
         );
         futures_util::future::join_all(futures).await
+    }
+}
+
+/// A [`ToolExecutor`] handle that does not keep it alive. See
+/// [`ToolExecutor::downgrade`].
+#[derive(Clone)]
+pub struct WeakToolExecutor {
+    core: std::sync::Weak<ToolExecutionCore>,
+}
+
+impl WeakToolExecutor {
+    /// The executor, if it still exists.
+    pub fn upgrade(&self) -> Option<ToolExecutor> {
+        self.core.upgrade().map(|core| ToolExecutor { core })
     }
 }
 

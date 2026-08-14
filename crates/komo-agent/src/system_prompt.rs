@@ -235,6 +235,8 @@ fn default_agents_dir() -> PathBuf {
 pub struct SystemPromptBuilder {
     tool_names: Vec<String>,
     skills_note: Option<String>,
+    /// The `run_code` API listing, when that tool is loaded.
+    code_note: Option<String>,
     workspace_root: Option<PathBuf>,
     /// Include the Komo self-configuration manual (main agent only — aux
     /// sub-agents and sweeps never field "how do I configure Komo" questions).
@@ -271,6 +273,7 @@ impl SystemPromptBuilder {
         Self {
             tool_names: Vec::new(),
             skills_note: None,
+            code_note: None,
             workspace_root: None,
             operations_manual: false,
             include_user_profile: false,
@@ -293,6 +296,16 @@ impl SystemPromptBuilder {
     /// The skills catalog note (appended to the stable tier), if any.
     pub fn skills_note(mut self, note: Option<String>) -> Self {
         self.skills_note = note;
+        self
+    }
+
+    /// The `run_code` API note (appended to the stable tier), if any.
+    ///
+    /// Rendered from the tool catalog, so it changes only when the tool set
+    /// does — the same condition under which the schema block changes anyway.
+    /// A runtime with no `run_code` passes `None` and pays nothing.
+    pub fn code_note(mut self, note: Option<String>) -> Self {
+        self.code_note = note;
         self
     }
 
@@ -422,6 +435,9 @@ impl SystemPromptBuilder {
         }
 
         if let Some(note) = &self.skills_note {
+            parts.push(note.clone());
+        }
+        if let Some(note) = &self.code_note {
             parts.push(note.clone());
         }
 

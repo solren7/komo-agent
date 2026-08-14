@@ -14,8 +14,11 @@
 //! plugins and nothing else, and the supervisor starts a new one.
 //!
 //! The protocol is newline-delimited JSON over stdin/stdout — one object per
-//! line. komo sends requests carrying an `id` and gets a response with the same
-//! `id`; the host also pushes `manifest/changed` unasked when a plugin file is
+//! line. Requests travel both ways: komo asks for the manifest, a plugin call,
+//! or a program run ([`PyHost::run_code`]); the host asks komo to run one of
+//! *its* tools on behalf of a running program. The two id spaces cannot collide
+//! because komo's requests carry positive ids and the host's carry negative
+//! ones. The host also pushes `manifest/changed` unasked when a plugin file is
 //! edited, which is what makes "write a `.py` file and the tool appears" work
 //! without a restart.
 
@@ -39,7 +42,7 @@ const HOST_SOURCE: &str = include_str!("../python/host.py");
 
 /// Bumped when the wire contract changes. The host reports the version it
 /// speaks in its manifest; a mismatch is refused rather than half-understood.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Ceiling on one request to the host. A plugin doing real work can be slow, so
 /// this is generous — it exists to catch a host that stopped answering, not to
@@ -86,6 +89,27 @@ struct Manifest {
     tools: Vec<PluginToolDef>,
 }
 
+/// What one `run_code` program produced.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CodeResult {
+    /// Everything the program printed, in order. Its own output channel: a
+    /// program reports intermediate work by printing rather than by stuffing it
+    /// all into the return value.
+    #[serde(default)]
+    pub logs: String,
+    /// What the program returned, or `None` when it returned nothing.
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+}
+
+/// One komo tool call a running program made.
+struct ToolRequest {
+    /// The host's own (negative) request id, echoed back with the answer.
+    id: i64,
+    name: String,
+    args: serde_json::Value,
+}
+
 /// A message from the host that komo did not ask for.
 #[derive(Debug, Clone)]
 pub enum HostEvent {
@@ -105,11 +129,44 @@ pub struct PyHost {
 struct Inner {
     /// Request id → where its response goes. The reader task drains this.
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<serde_json::Value, PyHostError>>>>,
+    /// `run_code` request id → where that program's tool calls go. A program
+    /// tags every call with the run it belongs to, which is what lets two turns
+    /// run code over one host without their calls crossing.
+    code_runs: Mutex<HashMap<i64, mpsc::UnboundedSender<ToolRequest>>>,
     next_id: AtomicI64,
     outbound: mpsc::UnboundedSender<String>,
     /// The child, kept so dropping the host kills it rather than orphaning a
     /// Python process for the rest of the session.
     child: Mutex<Option<Child>>,
+}
+
+/// The current plugin host, shared with whoever needs to reach it later.
+///
+/// A [`PyHost`] handle is one child process: when the supervisor restarts a
+/// dead host, the old handle is not the new one. Anything long-lived that calls
+/// into the host — a tool registered at wiring, for instance — therefore holds
+/// this slot rather than a handle, and reads whichever host is current at call
+/// time. Empty means no host is running, which is a real answer: the caller
+/// says so rather than failing obscurely.
+#[derive(Clone, Default)]
+pub struct SharedHost(Arc<std::sync::RwLock<Option<PyHost>>>);
+
+impl SharedHost {
+    /// The host that is running right now, if any.
+    pub fn get(&self) -> Option<PyHost> {
+        match self.0.read() {
+            Ok(host) => host.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Publish a newly started host, or `None` when one has gone away.
+    pub fn set(&self, host: Option<PyHost>) {
+        match self.0.write() {
+            Ok(mut slot) => *slot = host,
+            Err(poisoned) => *poisoned.into_inner() = host,
+        }
+    }
 }
 
 /// Where the plugin host's own files live, written fresh on every spawn.
@@ -163,6 +220,7 @@ impl PyHost {
         let (events, events_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
             pending: Mutex::new(HashMap::new()),
+            code_runs: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
             outbound,
             child: Mutex::new(Some(child)),
@@ -199,6 +257,75 @@ impl PyHost {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string())
+    }
+
+    /// Run one program on the host, servicing the komo tool calls it makes.
+    ///
+    /// `dispatch` is how a call gets back into komo's own executor — the
+    /// program's `tools.read(path=...)` becomes one invocation of it, so a
+    /// sub-call pays the same approval, ledger and cap the model's own call
+    /// would. Sub-calls are serviced while the program runs; the future
+    /// resolves when the program returns.
+    pub async fn run_code<F, Fut>(
+        &self,
+        source: &str,
+        dispatch: F,
+    ) -> Result<CodeResult, PyHostError>
+    where
+        F: Fn(String, serde_json::Value) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, response_rx) = oneshot::channel();
+        let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
+        self.inner.pending.lock().await.insert(id, response_tx);
+        self.inner.code_runs.lock().await.insert(id, calls_tx);
+
+        let cleanup = || async {
+            self.inner.pending.lock().await.remove(&id);
+            self.inner.code_runs.lock().await.remove(&id);
+        };
+
+        if let Err(error) = self.send(serde_json::json!({
+            "id": id,
+            "method": "run_code",
+            "params": { "source": source },
+        })) {
+            cleanup().await;
+            return Err(error);
+        }
+
+        // Service the program's calls until it answers. One at a time, which is
+        // what the host does anyway — a synchronous program blocks on each call
+        // — and what keeps a program's side effects in the order it wrote them.
+        tokio::pin!(response_rx);
+        let outcome = loop {
+            tokio::select! {
+                answer = &mut response_rx => break match answer {
+                    Ok(result) => result,
+                    Err(_) => Err(PyHostError::Unavailable(
+                        "the plugin host exited before the program finished".into(),
+                    )),
+                },
+                Some(request) = calls_rx.recv() => {
+                    let (content, is_error) = match dispatch(request.name, request.args).await {
+                        Ok(content) => (content, false),
+                        Err(message) => (message, true),
+                    };
+                    // Answer even if the send fails: a host that went away is
+                    // about to fail the program's response too.
+                    let _ = self.send(serde_json::json!({
+                        "id": request.id,
+                        "result": { "content": content, "is_error": is_error },
+                    }));
+                }
+            }
+        };
+        cleanup().await;
+
+        let value = outcome?;
+        serde_json::from_value(value)
+            .map_err(|error| PyHostError::Plugin(format!("malformed program result: {error}")))
     }
 
     /// Ask the host to exit, then wait briefly for it. Dropping the handle also
@@ -312,7 +439,19 @@ async fn read_loop(
             continue;
         };
 
-        // A response carries the id komo sent; anything else is a notification.
+        // A *negative* id is the host asking komo for something — the only
+        // request it originates is a running program's tool call.
+        if let Some(id) = message
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|id| *id < 0)
+        {
+            route_tool_call(&inner, id, &message).await;
+            continue;
+        }
+
+        // A positive id is the response to something komo sent; anything else
+        // is a notification.
         if let Some(id) = message.get("id").and_then(serde_json::Value::as_i64) {
             let Some(waiter) = inner.pending.lock().await.remove(&id) else {
                 debug!(id, "response for an unknown request id");
@@ -367,6 +506,7 @@ async fn read_loop(
 
     // The host is gone. Fail everyone still waiting — a request that will never
     // be answered should say so now, not in two minutes.
+    inner.code_runs.lock().await.clear();
     let waiting: Vec<_> = inner.pending.lock().await.drain().collect();
     for (_, waiter) in waiting {
         let _ = waiter.send(Err(PyHostError::Unavailable(
@@ -381,6 +521,47 @@ async fn read_loop(
         None => "shut down".to_string(),
     };
     let _ = events.send(HostEvent::Exited { status });
+}
+
+/// Hand a program's tool call to the `run_code` invocation that owns it.
+///
+/// A call whose run is unknown is answered rather than dropped: the program is
+/// blocked on it, and a program hung forever is worse than one told its call
+/// went nowhere.
+async fn route_tool_call(inner: &Arc<Inner>, id: i64, message: &serde_json::Value) {
+    let params = message.get("params");
+    let run = params
+        .and_then(|p| p.get("run"))
+        .and_then(serde_json::Value::as_i64);
+    let name = params
+        .and_then(|p| p.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let args = params
+        .and_then(|p| p.get("args"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let sender = match run {
+        Some(run) => inner.code_runs.lock().await.get(&run).cloned(),
+        None => None,
+    };
+    match sender {
+        Some(sender) => {
+            let _ = sender.send(ToolRequest { id, name, args });
+        }
+        None => {
+            warn!(id, ?run, tool = %name, "tool call from an unknown program run");
+            let _ = inner.outbound.send(
+                serde_json::json!({
+                    "id": id,
+                    "error": { "message": "this program run is no longer active" },
+                })
+                .to_string(),
+            );
+        }
+    }
 }
 
 fn truncate(line: &str) -> String {
@@ -616,6 +797,170 @@ def chatty() -> str:
         );
         // Still healthy after all that noise.
         assert_eq!(host.manifest().await.unwrap().len(), 1);
+        host.shutdown().await;
+    }
+
+    // ── Code mode ────────────────────────────────────────────────────────────
+
+    /// Dispatch that answers every call by echoing what it was asked for, and
+    /// records the calls in order.
+    fn recording_dispatch() -> (
+        impl Fn(String, serde_json::Value) -> std::future::Ready<Result<String, String>>,
+        Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let dispatch = move |name: String, args: serde_json::Value| {
+            recorder.lock().unwrap().push((name.clone(), args.clone()));
+            std::future::ready(Ok(format!("{name} says hi")))
+        };
+        (dispatch, seen)
+    }
+
+    /// A program runs, prints, calls back into komo, and returns — the whole
+    /// point of code mode in one exchange.
+    #[tokio::test]
+    async fn a_program_calls_komo_tools_and_returns_a_value() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("codemode");
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+
+        let (dispatch, seen) = recording_dispatch();
+        let result = host
+            .run_code(
+                r#"
+print("starting")
+first = tools.read(path="a.txt")
+second = tools.shell(command="ls")
+return {"first": first, "second": second}
+"#,
+                dispatch,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.logs.trim(), "starting");
+        let value = result.result.expect("the program returned a value");
+        assert_eq!(value["first"], "read says hi");
+        assert_eq!(value["second"], "shell says hi");
+
+        // The calls reached komo as the program wrote them, in order, with
+        // their arguments intact.
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "read");
+        assert_eq!(calls[0].1["path"], "a.txt");
+        assert_eq!(calls[1].0, "shell");
+
+        host.shutdown().await;
+    }
+
+    /// A tool that failed raises inside the program, so it can catch and
+    /// recover — the same choice komo makes for the model, one level down.
+    #[tokio::test]
+    async fn a_failing_tool_raises_inside_the_program_and_can_be_caught() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("codemode-error");
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+
+        let result = host
+            .run_code(
+                r#"
+try:
+    tools.read(path="missing")
+    return "no error"
+except ToolError as error:
+    return f"caught: {error.message}"
+"#,
+                |_name, _args| std::future::ready(Err("no such file".to_string())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.result.unwrap(), "caught: no such file");
+
+        host.shutdown().await;
+    }
+
+    /// A program that raises answers with its traceback rather than killing the
+    /// host: the traceback is what the model rewrites from.
+    #[tokio::test]
+    async fn a_raising_program_returns_its_traceback_and_the_host_survives() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("codemode-raise");
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+
+        let error = host
+            .run_code("return 1 / 0", |_n, _a| {
+                std::future::ready(Ok(String::new()))
+            })
+            .await
+            .expect_err("a raising program is an error");
+        let rendered = format!("{error}");
+        assert!(rendered.contains("ZeroDivisionError"), "{rendered}");
+        assert!(!error.retryable(), "the program already failed");
+
+        // Still usable afterwards.
+        let ok = host
+            .run_code("return 2 + 2", |_n, _a| {
+                std::future::ready(Ok(String::new()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok.result.unwrap(), 4);
+
+        host.shutdown().await;
+    }
+
+    /// Two programs over one host must not have their tool calls crossed — the
+    /// run id each call carries is what keeps them apart.
+    #[tokio::test]
+    async fn concurrent_programs_keep_their_tool_calls_apart() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("codemode-concurrent");
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+
+        // Each program's dispatch answers with its own marker, so a crossed
+        // call would come back with the other program's answer.
+        let one = host.run_code("return tools.whoami()", |_n, _a| {
+            std::future::ready(Ok("first".to_string()))
+        });
+        let two = host.run_code("return tools.whoami()", |_n, _a| {
+            std::future::ready(Ok("second".to_string()))
+        });
+        let (one, two) = tokio::join!(one, two);
+        assert_eq!(one.unwrap().result.unwrap(), "first");
+        assert_eq!(two.unwrap().result.unwrap(), "second");
+
+        host.shutdown().await;
+    }
+
+    /// A program that returns nothing says so, rather than the word `None` —
+    /// which the model would read as a value.
+    #[tokio::test]
+    async fn a_program_that_returns_nothing_reports_no_value() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("codemode-void");
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+
+        let result = host
+            .run_code("print('side effect only')", |_n, _a| {
+                std::future::ready(Ok(String::new()))
+            })
+            .await
+            .unwrap();
+        assert!(result.result.is_none());
+        assert_eq!(result.logs.trim(), "side effect only");
+
         host.shutdown().await;
     }
 

@@ -9,7 +9,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { version = "1.53.1", features = ["rt", "process", "io-util", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "process", "io-util", "sync", "time", "macros"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

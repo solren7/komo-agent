@@ -26,6 +26,7 @@ pub mod memory;
 pub mod plugin;
 pub mod read;
 pub mod reminder;
+pub mod run_code;
 pub mod session;
 pub mod shell;
 pub mod skill;

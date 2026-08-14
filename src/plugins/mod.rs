@@ -50,6 +50,7 @@ use komo_infra::skills::FsSkillStore;
 use komo_services::clarify::ClarifyState;
 use komo_services::memory_query::MemoryQueryService;
 use komo_services::skill_registry::SkillRegistry;
+use komo_services::tool_execution::ToolExecutor;
 
 use crate::domain::{
     cron::CronJobRepository, gateway::WeChatLogin, llm::LlmClient, memory::MemoryRepository,
@@ -334,11 +335,18 @@ pub struct ToolCx<'a> {
     pub skill_store: Arc<FsSkillStore>,
 }
 
+/// Builds a tool that needs the executor it will be registered in.
+pub type ToolFactory = Box<dyn Fn(&ToolExecutor) -> Arc<dyn Tool> + Send + Sync>;
+
 /// Phase-1 registry: tools and hooks, each tagged with the runtimes that see
 /// it. Wiring materializes one `ToolExecutor` per runtime from this.
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<(Arc<dyn Tool>, Scope)>,
+    /// Tools that can only be built once their executor exists — one that
+    /// dispatches *other* tools needs a handle to the thing dispatching it.
+    /// Wiring runs these after the static registrations, per runtime.
+    factories: Vec<(ToolFactory, Scope)>,
     tool_hooks: Vec<(Arc<dyn ToolHook>, Scope)>,
     turn_hooks: Vec<(Arc<dyn TurnHook>, Scope)>,
     /// Note-vault operator handles, produced by the wiki plugin and consumed
@@ -349,6 +357,15 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn tool(&mut self, scope: Scope, tool: Arc<dyn Tool>) {
         self.tools.push((tool, scope));
+    }
+
+    /// Contribute a tool built from the executor it will live in.
+    ///
+    /// For the one shape a plain registration cannot express: a tool that
+    /// dispatches other tools (`run_code`) needs a handle to its own executor,
+    /// which does not exist until the static tools are in.
+    pub fn tool_from_executor(&mut self, scope: Scope, build: ToolFactory) {
+        self.factories.push((build, scope));
     }
 
     /// Contribute a tool hook. No built-in plugin registers one yet — the
@@ -373,6 +390,15 @@ impl ToolRegistry {
             .iter()
             .filter(move |(_, scope)| scope.contains(runtime))
             .map(|(tool, _)| tool)
+    }
+
+    /// The executor-dependent tools for `runtime`, built against `executor`.
+    pub fn build_for(&self, runtime: Scope, executor: &ToolExecutor) -> Vec<Arc<dyn Tool>> {
+        self.factories
+            .iter()
+            .filter(|(_, scope)| scope.contains(runtime))
+            .map(|(build, _)| build(executor))
+            .collect()
     }
 
     pub fn tool_hooks_for(&self, runtime: Scope) -> impl Iterator<Item = &Arc<dyn ToolHook>> {
