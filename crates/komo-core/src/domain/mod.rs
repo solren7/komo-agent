@@ -7,6 +7,7 @@ pub mod embedding;
 pub mod events;
 pub mod gateway;
 pub mod home;
+pub mod hooks;
 pub mod llm;
 pub mod memory;
 pub mod message;

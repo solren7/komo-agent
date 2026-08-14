@@ -67,6 +67,7 @@ const BREAKER_ALERT_TIMEOUT: Duration = Duration::from_secs(10);
 /// job's mean the identical local-time moment. (Matching against `Utc::now()`
 /// here is the bug that made a briefing configured for 8:30 fire at 16:30 on
 /// a UTC+8 machine.)
+#[derive(Clone)]
 pub struct Schedule {
     expr: String,
 }

@@ -1,38 +1,20 @@
-use komo_agent::daemon::{
-    BriefingSweep, CronJobSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep,
-    ReviewSweep, Schedule, TaskSweep, WorkdayGated,
-};
-use komo_agent::gateway::{Gateway, MaintenanceService};
+use komo_agent::daemon::Schedule;
+use komo_agent::gateway::Gateway;
 use komo_agent::interaction::{ApprovalState, ChatApprover, GatewayDispatcher};
 use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
-use komo_infra::workday::HolidayCalendar;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
     cli::wiring,
     domain::{
-        approval::Approver,
-        briefing::BriefingMarkRepository,
-        cron::CronJobRepository,
-        gateway::{MessageHandler, WeChatLogin},
-        home::HomeRepository,
-        notify::Notifier,
-        pairing::PairingRepository,
-        reminder::ReminderRepository,
-        repository::SessionRepository,
-        run::RunRepository,
-        task::TaskRepository,
-        todo::SessionTodoRepository,
+        approval::Approver, cron::CronJobRepository, gateway::MessageHandler, home::HomeRepository,
+        notify::Notifier, pairing::PairingRepository, repository::SessionRepository,
+        run::RunRepository, todo::SessionTodoRepository,
     },
     infra::messaging::{
-        api::ApiChannel,
-        feishu::{FeishuChannel, FeishuSender},
-        home_notifier::{HomeNotifier, TextSender},
-        macos_notifier::MacosNotifier,
-        telegram::{TelegramChannel, TelegramSender},
-        wechat::{WeChatChannel, WeChatQrLogin, WeChatSender, build_bot},
+        api::ApiChannel, home_notifier::HomeNotifier, macos_notifier::MacosNotifier,
     },
+    plugins::{self, ChannelCx, ChannelRegistry, SweepCx, SweepRegistry},
     services::operator_control::actions::OperatorActions,
 };
 use komo_config::{ConfigSnapshot, IssueSeverity};
@@ -40,6 +22,11 @@ use komo_config::{ConfigSnapshot, IssueSeverity};
 /// Run the always-on gateway: a persistent process hosting the maintenance
 /// scheduler and the config-declared ingress channels. Runs until Ctrl-C.
 /// Everything is read from the caller's one resolved `config` snapshot.
+///
+/// Channels and sweeps come from the plugin roster (`crate::plugins`, phases
+/// 2 and 3); the host keeps what plugins depend on or what must never be
+/// disableable — storage, the dispatcher, the home notifier, and the api
+/// channel (the CLI's only path to a running gateway).
 pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // The gateway hosts every surface, so any fatal config issue (unusable
     // model, enabled-but-credential-less channel) stops startup here, before
@@ -55,9 +42,9 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // A cron typo must not crash-loop the always-on gateway (same principle as
     // the missing-credential warnings above): the maintenance schedule degrades
     // to the built-in default cadence, an opt-in sweep (briefing/dream) is
-    // disabled — each with a warning naming the bad expression.
+    // disabled — each with a warning naming the bad expression. Parsed here,
+    // once, so the startup banner and the sweeps can never disagree.
     let (review_schedule, schedule_expr) = schedule_or_default(&rt.maintenance_schedule);
-    let reminder_schedule = Schedule::parse("* * * * *")?;
     let (briefing_schedule, briefing_expr) =
         optional_schedule(rt.briefing_schedule.as_deref(), "briefing_schedule");
     let (dream_schedule, dream_expr) =
@@ -101,96 +88,33 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         n => tracing::info!(removed = n, "expired stored tool outputs"),
     }
 
-    let review_sweep: Arc<dyn Maintenance> = Arc::new(ReviewSweep {
-        review: wired.review.clone(),
-    });
+    let roster = plugins::builtin();
+    let gate = plugins::PluginGate::new(config, &roster);
 
-    // Ingress channels, from the snapshot (validate_gateway above already
-    // refused any enabled-but-misconfigured one). Resolved before the reminder
-    // sweep because a channel `home_chat` takes over reminder delivery from
-    // the local macOS notifier (feishu wins if both set one).
-    let feishu = rt.feishu.ready();
-    let feishu_sender = feishu.map(|cfg| {
-        Arc::new(FeishuSender::new(
-            cfg.app_id.clone(),
-            cfg.app_secret.clone(),
-        ))
-    });
-    let telegram = rt.telegram.ready();
-    let telegram_sender = telegram.map(|cfg| Arc::new(TelegramSender::new(cfg.bot_token.clone())));
-    // WeChat shares one bot instance between its sender and channel so the
-    // channel's poll loop populates the context-token map the sender reads.
-    let wechat = rt.wechat.ready();
-    let wechat_cred_path = komo_config::wechat_cred_path();
-    // HTTP API channel (OpenAI-compatible + dashboard); always on.
-    let api = rt
-        .api
-        .ready()
-        .ok_or_else(|| anyhow::anyhow!("api channel misconfigured"))?;
-    let wechat_bot = wechat.map(|_| build_bot(&wechat_cred_path));
-    let wechat_sender = wechat_bot
-        .as_ref()
-        .map(|bot| Arc::new(WeChatSender::new(bot.clone())));
-    // Shared between the login coordinator (`/wechat login`) and the channel:
-    // a successful login pulses this so the channel starts polling without a
-    // restart.
-    let wechat_ready = Arc::new(tokio::sync::Notify::new());
-    let wechat_provisioning = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let wechat_login: Option<Arc<dyn WeChatLogin>> = wechat_bot.as_ref().map(|bot| {
-        Arc::new(WeChatQrLogin::new(
-            wechat_cred_path.clone(),
-            wechat_ready.clone(),
-            bot.clone(),
-            wechat_provisioning.clone(),
-        )) as Arc<dyn WeChatLogin>
-    });
+    // ── Plugin phase 2: ingress channels ─────────────────────────────────────
+    // Senders outside `allow_from` go through the pairing handshake; the
+    // pairing store is shared with the `komo pair` CLI via the same db.
+    let pairings: Arc<dyn PairingRepository> = db.clone();
+    let mut channel_reg = ChannelRegistry::default();
+    let channel_cx = ChannelCx {
+        config,
+        pairings: pairings.clone(),
+    };
+    plugins::run_channel_phase(&roster, &gate, &mut channel_reg, &channel_cx).await?;
 
     // A single home notifier delivers all proactive output (reminders, task
     // due notices, the shutdown notice). It resolves the home chat at
     // notify-time — a `/sethome` override (db) wins over the config `home_chat`
-    // (feishu first, preserving the prior priority) — and degrades to the local
-    // macOS notifier when no chat home resolves.
-    let mut senders: HashMap<String, Arc<dyn TextSender>> = HashMap::new();
-    if let Some(sender) = &feishu_sender {
-        senders.insert("feishu".to_string(), sender.clone());
-    }
-    if let Some(sender) = &telegram_sender {
-        senders.insert("telegram".to_string(), sender.clone());
-    }
-    if let Some(sender) = &wechat_sender {
-        senders.insert("wechat".to_string(), sender.clone());
-    }
-    let config_home = feishu
-        .and_then(|cfg| cfg.home_chat.clone())
-        .map(|chat| format!("feishu:{chat}"))
-        .or_else(|| {
-            telegram
-                .and_then(|cfg| cfg.home_chat.clone())
-                .map(|chat| format!("telegram:{chat}"))
-        })
-        .or_else(|| {
-            wechat
-                .and_then(|cfg| cfg.home_chat.clone())
-                .map(|chat| format!("wechat:{chat}"))
-        });
+    // (plugin order preserves the feishu-first priority) — and degrades to the
+    // local macOS notifier when no chat home resolves.
+    let config_home = channel_reg.config_home();
     let home_repo: Arc<dyn HomeRepository> = db.clone();
     let notifier: Arc<dyn Notifier> = Arc::new(HomeNotifier::new(
-        senders,
+        channel_reg.senders(),
         home_repo.clone(),
         config_home.clone(),
         Arc::new(MacosNotifier),
     ));
-
-    let reminder_repo: Arc<dyn ReminderRepository> = db.clone();
-    let reminder_sweep: Arc<dyn Maintenance> = Arc::new(ReminderSweep {
-        reminders: reminder_repo,
-        notifier: notifier.clone(),
-    });
-    let task_repo: Arc<dyn TaskRepository> = kanban.clone();
-    let task_sweep: Arc<dyn Maintenance> = Arc::new(TaskSweep {
-        tasks: task_repo,
-        notifier: notifier.clone(),
-    });
 
     let handler: Arc<dyn MessageHandler> = Arc::new(wired.runtime);
     let sessions: Arc<dyn SessionRepository> = db.clone();
@@ -202,171 +126,61 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         sessions,
         home_repo,
         todos,
-        wechat_login,
+        channel_reg.wechat_login.clone(),
         db.clone(),
     ));
-    let mut gateway = Gateway::new(dispatcher)
-        .with_maintenance(MaintenanceService {
-            name: "review".to_string(),
-            schedule: review_schedule,
-            maintenance: review_sweep,
-            alert: Some(notifier.clone()),
-        })
-        .with_maintenance(MaintenanceService {
-            name: "reminders".to_string(),
-            schedule: reminder_schedule,
-            maintenance: reminder_sweep,
-            alert: Some(notifier.clone()),
-        })
-        .with_maintenance(MaintenanceService {
-            name: "tasks".to_string(),
-            schedule: Schedule::parse("* * * * *")?,
-            maintenance: task_sweep,
-            alert: Some(notifier.clone()),
-        })
-        // Always-on RSS observability (hermes' memory_monitor analog). Reads only
-        // the process's own resident set, so it's infallible — no breaker alert.
-        .with_maintenance(MaintenanceService {
-            name: "memory-monitor".to_string(),
-            schedule: Schedule::parse("*/5 * * * *")?,
-            maintenance: Arc::new(MemoryMonitorSweep::new()),
-            alert: None,
-        });
 
-    // Daily briefing — only when the user opted in with `briefing_schedule`.
-    // Reads tasks + memories, composes on the aux LLM, delivers via the same
-    // home notifier as reminders.
-    if let Some(schedule) = briefing_schedule {
-        let marks: Arc<dyn BriefingMarkRepository> = db.clone();
-        let mut briefing_sweep: Arc<dyn Maintenance> = Arc::new(BriefingSweep {
-            tasks: kanban.clone(),
-            memories: wired.memories.clone(),
-            llm: wired.aux_llm.clone(),
-            notifier: notifier.clone(),
-            // Tool-capable agent turn (read-only tools + unattended policy
-            // gating); the sweep degrades to the plain compose on error.
-            runtime: Some(wired.briefing_runtime.clone()),
-            marks: Some(marks.clone()),
-        });
-        // Opt-in: only fire on Chinese working days (statutory holidays and
-        // 调休-adjusted weekends respected). The calendar is built only when
-        // gating is on, so the holiday API is never touched otherwise.
-        if rt.briefing_workdays_only {
-            let calendar = Arc::new(HolidayCalendar::new(komo_config::workday_cache_dir()));
-            briefing_sweep = Arc::new(WorkdayGated {
-                inner: briefing_sweep,
-                calendar,
-            });
-        }
-        // Startup catch-up: a gateway that was down (restart, upgrade) across
-        // today's slot runs the briefing late, once — the same rule a cron job
-        // gets from its stored `next_run_at`. Goes through the workday-gated
-        // sweep, so a holiday still skips it.
-        if let Some(expr) = briefing_expr.clone() {
-            let sweep = briefing_sweep.clone();
-            let marks = marks.clone();
-            tokio::spawn(async move {
-                let handled = marks.last_handled().await.unwrap_or_default();
-                if komo_agent::daemon::briefing_catchup_due(
-                    &expr,
-                    handled.as_deref(),
-                    chrono::Local::now(),
-                ) {
-                    tracing::info!(
-                        "briefing: today's slot passed while the gateway was down; catching up"
-                    );
-                    if let Err(error) = sweep.run().await {
-                        tracing::warn!(%error, "briefing catch-up failed");
-                    }
-                }
-            });
-        }
-        gateway = gateway.with_maintenance(MaintenanceService {
-            name: "briefing".to_string(),
-            schedule,
-            maintenance: briefing_sweep,
-            alert: Some(notifier.clone()),
-        });
+    // ── Plugin phase 3: scheduled sweeps ─────────────────────────────────────
+    let mut sweep_reg = SweepRegistry::default();
+    let sweep_cx = SweepCx {
+        config,
+        db: db.clone(),
+        kanban: kanban.clone(),
+        cron_jobs: cron_jobs.clone(),
+        notifier: notifier.clone(),
+        review: wired.review.clone(),
+        memories: wired.memories.clone(),
+        aux_llm: wired.aux_llm.clone(),
+        briefing_runtime: wired.briefing_runtime.clone(),
+        cron_runtime: wired.cron_runtime.clone(),
+        maintenance_schedule: review_schedule,
+        briefing_schedule,
+        briefing_expr: briefing_expr.clone(),
+        dream_schedule,
+    };
+    plugins::run_sweep_phase(&roster, &gate, &mut sweep_reg, &sweep_cx).await?;
+
+    let mut gateway = Gateway::new(dispatcher);
+    for service in sweep_reg.into_sweeps() {
+        gateway = gateway.with_maintenance(service);
     }
 
-    // Cron jobs (`komo cron add`, stored in cron.db): one every-minute sweep
-    // reads the store and executes due jobs, so jobs added/removed/toggled
-    // while the gateway runs take effect on the next tick — no restart.
-    let cron_job_count = cron_jobs.list().await.map(|j| j.len()).unwrap_or(0);
-    gateway = gateway.with_maintenance(MaintenanceService {
-        name: "cron-jobs".to_string(),
-        schedule: Schedule::parse("* * * * *")?,
-        maintenance: Arc::new(CronJobSweep {
-            jobs: cron_jobs.clone(),
-            notifier: notifier.clone(),
-            // Agent-mode jobs run on the unattended full-tool cron runtime.
-            runtime: Some(wired.cron_runtime.clone()),
-        }),
-        alert: Some(notifier.clone()),
-    });
-
-    // Dreaming — only when the user opted in with `dream_schedule`. Reads the
-    // whole memory library, promotes well-recalled candidates to active, and
-    // archives ones that never earned a recall. Never auto-pins.
-    if let Some(schedule) = dream_schedule {
-        let dream_sweep: Arc<dyn Maintenance> = Arc::new(DreamSweep {
-            memories: wired.memories.clone(),
-        });
-        gateway = gateway.with_maintenance(MaintenanceService {
-            name: "dreaming".to_string(),
-            schedule,
-            maintenance: dream_sweep,
-            alert: Some(notifier.clone()),
-        });
-    }
-
-    // Senders outside `allow_from` go through the pairing handshake; the
-    // pairing store is shared with the `komo pair` CLI via the same db.
-    let pairings: Arc<dyn PairingRepository> = db.clone();
-    let mut channels = Vec::new();
-    if let (Some(cfg), Some(sender)) = (feishu, &feishu_sender) {
-        gateway = gateway.add_channel(Box::new(FeishuChannel::new(
-            sender.clone(),
-            cfg,
-            pairings.clone(),
-        )));
-        channels.push("feishu");
-    }
-    if let (Some(cfg), Some(sender)) = (telegram, &telegram_sender) {
-        gateway = gateway.add_channel(Box::new(TelegramChannel::new(
-            sender.clone(),
-            cfg,
-            pairings.clone(),
-        )));
-        channels.push("telegram");
-    }
-    if let (Some(cfg), Some(bot)) = (wechat, &wechat_bot) {
-        gateway = gateway.add_channel(Box::new(WeChatChannel::new(
-            bot.clone(),
-            cfg,
-            wechat_cred_path.clone(),
-            wechat_ready.clone(),
-            wechat_provisioning.clone(),
-            pairings.clone(),
-        )));
-        channels.push("wechat");
-    }
     // Whether an interactive chat channel exists — gates the shutdown notice.
-    // Only chat channels are pushed above; the api channel below is not one.
-    let has_chat_channel = !channels.is_empty();
+    // Only chat channels register in phase 2; the api channel below is not one.
+    let mut channels = channel_reg.names();
+    let has_chat_channel = !channel_reg.is_empty();
+    for channel in channel_reg.into_channels() {
+        gateway = gateway.add_channel(channel);
+    }
+
+    // For the startup banner.
+    let cron_job_count = cron_jobs.list().await.map(|j| j.len()).unwrap_or(0);
 
     // HTTP API channel: serves the local dashboard UI and any OpenAI-compatible
     // client. It calls the handler directly (synchronous request/response), so
-    // it needs the repositories rather than just the dispatcher. Added last so
-    // `/api/status` can report every other channel that came up.
-    // The api channel is **always on** (see `config::api_config`): it is how the
-    // local `komo` CLI reaches this gateway while we hold the exclusive Turso db
-    // lock. By default it is loopback-only on an ephemeral port (published in the
+    // it needs the repositories rather than just the dispatcher. Host-mounted,
+    // never a plugin: it is how the local `komo` CLI reaches this gateway while
+    // we hold the exclusive Turso db lock, so no `[plugins]` toggle may remove
+    // it. By default it is loopback-only on an ephemeral port (published in the
     // rendezvous file); `[channels.api] enabled = true` widens it to an external
     // bind/port for Open WebUI / the dashboard.
+    let api = rt
+        .api
+        .ready()
+        .ok_or_else(|| anyhow::anyhow!("api channel misconfigured"))?;
     {
         let enabled = {
-            let mut names: Vec<String> = channels.iter().map(|s| s.to_string()).collect();
+            let mut names = channels.clone();
             names.push("api".to_string());
             names
         };
@@ -398,7 +212,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             rt.home.join("workspaces"),
             std::env::current_dir().unwrap_or_else(|_| rt.home.clone()),
         )));
-        channels.push("api");
+        channels.push("api".to_string());
     }
 
     // Send the offline notice on shutdown only when a chat channel exists; with

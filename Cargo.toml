@@ -126,6 +126,8 @@ komo-infra = { path = "crates/komo-infra", features = ["test-support"] }
 komo-services = { path = "crates/komo-services", features = ["test-support"] }
 # Shared tool-test fixtures for the delegate tool's tests.
 komo-tools = { path = "crates/komo-tools", features = ["test-support"] }
+# A defaults-only `ConfigSnapshot` for the plugin-phase tests.
+komo-config = { path = "crates/komo-config", features = ["test-support"] }
 
 [workspace]
 members = [

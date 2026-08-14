@@ -3,6 +3,11 @@ name = "komo-config"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Test-only constructors dependent crates' tests need. Enabled as a
+# dev-dependency only, so they never ship.
+test-support = []
+
 [dependencies]
 komo-core = { path = "../komo-core" }
 serde = { workspace = true }

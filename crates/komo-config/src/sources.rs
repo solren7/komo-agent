@@ -29,6 +29,19 @@ pub struct ConfigSources {
 }
 
 impl ConfigSources {
+    /// Every source empty, for a dependent crate's tests: no file, no env, no
+    /// secrets. See [`super::ConfigSnapshot::defaults_for_test`].
+    #[cfg(feature = "test-support")]
+    pub fn defaults_for_test(home: PathBuf) -> Self {
+        Self {
+            home,
+            file: FileConfig::default(),
+            env: KomoEnv::default(),
+            secrets: Secrets::default(),
+            env_error: None,
+        }
+    }
+
     /// Read all three sources once. Never fails: a malformed `KOMO_*` value is
     /// captured in `env_error` (and later reported) instead of aborting, so
     /// diagnostic consumers like `doctor` always get a full snapshot.
@@ -307,6 +320,20 @@ pub struct FileConfig {
     pub mcp: Option<McpFileConfig>,
     /// Note-vault search (`[wiki]`).
     pub wiki: Option<WikiFileConfig>,
+    /// Uniform per-plugin kill switches (`[plugins.<name>] enabled = false`).
+    /// A plugin's own feature config (channel tables, schedules, `[wiki]`, …)
+    /// stays where it is; this is the one overlay that can silence any plugin
+    /// with the same spelling regardless of what it contributes.
+    pub plugins: Option<std::collections::BTreeMap<String, PluginFileConfig>>,
+}
+
+/// One `[plugins.<name>]` table.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PluginFileConfig {
+    /// `false` disables the plugin everywhere (tools, channel, sweeps).
+    /// Default true.
+    pub enabled: Option<bool>,
 }
 
 /// `[mcp]` namespace: external Model Context Protocol servers.

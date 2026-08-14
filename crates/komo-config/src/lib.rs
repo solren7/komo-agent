@@ -173,6 +173,18 @@ impl ConfigSnapshot {
         Self { runtime, report }
     }
 
+    /// A snapshot resolved from nothing but defaults, for a dependent crate's
+    /// tests: no `config.toml`, no env, no `.env`, and no filesystem touched.
+    ///
+    /// [`from_sources`](Self::from_sources) is the seam this crate's own tests
+    /// use, but [`ConfigSources`]' fields are internal types — a caller
+    /// outside this crate cannot build one, and exposing them just to be
+    /// constructible in a test would leak the whole resolution input.
+    #[cfg(feature = "test-support")]
+    pub fn defaults_for_test(home: std::path::PathBuf) -> Self {
+        Self::from_sources(ConfigSources::defaults_for_test(home))
+    }
+
     /// Fail on the issues that make an agent turn impossible: a malformed
     /// `KOMO_*` env or an unusable model selection. Channel problems don't
     /// block a chat turn — the gateway checks those via [`Self::validate_gateway`].

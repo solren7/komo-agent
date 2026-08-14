@@ -159,6 +159,16 @@ pub struct RuntimeConfig {
     /// through it), so this is never `Disabled` — only `Ready` (loopback or
     /// external) or `Misconfigured` (external without a key).
     pub api: ChannelState<ApiConfig>,
+    /// Explicit `[plugins.<name>] enabled` toggles. Absence = enabled; the
+    /// wiring layer (which knows the plugin roster) warns about unknown names.
+    pub plugin_toggles: std::collections::BTreeMap<String, bool>,
+}
+
+impl RuntimeConfig {
+    /// Whether the uniform `[plugins]` overlay leaves `name` enabled.
+    pub fn plugin_enabled(&self, name: &str) -> bool {
+        self.plugin_toggles.get(name).copied().unwrap_or(true)
+    }
 }
 
 /// One resolved MCP server: reachable-looking config with its token already
@@ -783,6 +793,12 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         telegram,
         wechat,
         api,
+        plugin_toggles: file
+            .plugins
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(name, cfg)| cfg.enabled.map(|enabled| (name, enabled)))
+            .collect(),
     };
     let report = ConfigReport {
         issues,
@@ -1238,6 +1254,51 @@ mod tests {
     fn with_deepseek_key(mut s: ConfigSources) -> ConfigSources {
         s.secrets.deepseek_api_key = Some("sk-test".into());
         s
+    }
+
+    /// `[plugins.<name>] enabled` is the one uniform kill switch: absent means
+    /// enabled, so a plugin roster needs no entry per plugin to run.
+    #[test]
+    fn plugin_toggles_default_to_enabled_and_honor_an_explicit_false() {
+        use crate::sources::PluginFileConfig;
+
+        let mut s = with_deepseek_key(sources());
+        s.file.plugins = Some(
+            [
+                (
+                    "wiki".to_string(),
+                    PluginFileConfig {
+                        enabled: Some(false),
+                    },
+                ),
+                (
+                    "mcp".to_string(),
+                    PluginFileConfig {
+                        enabled: Some(true),
+                    },
+                ),
+                // An entry with no `enabled` says nothing — it must not be
+                // mistaken for a disable.
+                ("web".to_string(), PluginFileConfig { enabled: None }),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let rt = ConfigSnapshot::from_sources(s).runtime;
+
+        assert!(!rt.plugin_enabled("wiki"), "explicit false disables");
+        assert!(rt.plugin_enabled("mcp"), "explicit true enables");
+        assert!(
+            rt.plugin_enabled("web"),
+            "an entry without `enabled` is a no-op"
+        );
+        assert!(
+            rt.plugin_enabled("core-tools"),
+            "an absent plugin is enabled"
+        );
+        // Only the explicit toggles are recorded, so the wiring layer's
+        // unknown-name warning fires on what the operator actually wrote.
+        assert_eq!(rt.plugin_toggles.len(), 2);
     }
 
     #[test]

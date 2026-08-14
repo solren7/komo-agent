@@ -1,6 +1,7 @@
 mod cli;
 mod domain;
 mod infra;
+mod plugins;
 mod services;
 mod tui;
 

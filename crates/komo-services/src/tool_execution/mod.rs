@@ -36,6 +36,7 @@ pub use context::{
 use crate::tool_output_store::{Bounded, ToolOutputStore};
 use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
 use komo_core::domain::events::TurnEvent;
+use komo_core::domain::hooks::{HookDecision, ToolHook};
 use komo_core::domain::llm::{ToolCallReq, ToolOutcome};
 use komo_core::domain::policy::{Access, Category, Policy};
 use komo_core::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
@@ -181,6 +182,9 @@ pub struct ToolExecutionCore {
     /// Where an over-limit result is kept in full. `None` ⇒ over-limit results
     /// are truncated, with the tail lost — the behavior before roadmap item 10.
     output_store: Option<Arc<ToolOutputStore>>,
+    /// Tool hooks, run around every call in registration order (first `Deny`
+    /// wins). Registered during wiring like the catalog, frozen with it.
+    hooks: Vec<Arc<dyn ToolHook>>,
 }
 
 impl ToolExecutor {
@@ -191,6 +195,7 @@ impl ToolExecutor {
                 config,
                 approver: Arc::new(DenyAllApprover),
                 output_store: None,
+                hooks: Vec::new(),
             }),
         }
     }
@@ -213,6 +218,15 @@ impl ToolExecutor {
             .expect("set the output store during wiring, before the executor is shared");
         core.output_store = Some(store);
         self
+    }
+
+    /// Register a tool hook, run around every call in registration order.
+    /// Wiring-time only, like [`register`](Self::register) — frozen once the
+    /// executor is shared.
+    pub fn add_hook(&mut self, hook: Arc<dyn ToolHook>) {
+        let core = Arc::get_mut(&mut self.core)
+            .expect("register hooks during wiring, before the executor is shared");
+        core.hooks.push(hook);
     }
 
     /// Add a tool to the catalog. Registration happens during wiring, before
@@ -330,6 +344,11 @@ impl ToolExecutor {
                          response was truncated. Re-issue the call with its arguments.",
                         call.name
                     )
+                } else if let Some(denial) = self.core.pre_hooks(call).await {
+                    // A hook refused the call. The message rides back as the
+                    // outcome content — append-only, so the model can adjust
+                    // without the prompt prefix ever changing.
+                    denial
                 } else {
                     match self.core.tools.get(&call.name) {
                         Some(tool) => match self
@@ -343,11 +362,17 @@ impl ToolExecutor {
                         None => format!("error: unknown tool `{}`", call.name),
                     }
                 };
-                ToolOutcome {
+                let outcome = ToolOutcome {
                     id: call.id.clone(),
                     call_id: call.call_id.clone(),
                     content,
+                };
+                // Post hooks observe what the model will see — including
+                // refusals and error content — for every call in the round.
+                for hook in &self.core.hooks {
+                    hook.post_execute(call, &outcome).await;
                 }
+                outcome
             },
         );
         futures_util::future::join_all(futures).await
@@ -355,6 +380,19 @@ impl ToolExecutor {
 }
 
 impl ToolExecutionCore {
+    /// Consult the tool hooks before a call runs. Registration order; the
+    /// first `Deny` short-circuits (waterfall semantics) and its message is
+    /// returned as the call's outcome content.
+    async fn pre_hooks(&self, call: &ToolCallReq) -> Option<String> {
+        for hook in &self.hooks {
+            if let HookDecision::Deny(reason) = hook.pre_execute(call).await {
+                warn!(tool = %call.name, hook = hook.name(), "tool call denied by hook");
+                return Some(reason);
+            }
+        }
+        None
+    }
+
     /// Run one tool call through the full pipeline. The invariant order:
     ///
     /// 1. claim a ledger seq (budget counts logical calls, not attempts)
@@ -1755,5 +1793,144 @@ mod tests {
             let out = one(&executor, call("big", &format!("{{\"i\":{i}}}")), &ctx).await;
             assert_eq!(out.content.len(), 10_000);
         }
+    }
+
+    // ── Tool hooks (domain::hooks) ───────────────────────────────────────────
+
+    /// Records what it saw, and optionally refuses every call.
+    struct RecordingHook {
+        label: &'static str,
+        deny: Option<&'static str>,
+        seen_pre: Arc<Mutex<Vec<String>>>,
+        seen_post: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl RecordingHook {
+        fn new(label: &'static str, deny: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                label,
+                deny,
+                seen_pre: Arc::new(Mutex::new(Vec::new())),
+                seen_post: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ToolHook for RecordingHook {
+        fn name(&self) -> &'static str {
+            self.label
+        }
+        async fn pre_execute(&self, call: &ToolCallReq) -> HookDecision {
+            self.seen_pre.lock().unwrap().push(call.name.clone());
+            match self.deny {
+                Some(reason) => HookDecision::Deny(reason.to_string()),
+                None => HookDecision::Continue,
+            }
+        }
+        async fn post_execute(&self, call: &ToolCallReq, outcome: &ToolOutcome) {
+            self.seen_post
+                .lock()
+                .unwrap()
+                .push((call.name.clone(), outcome.content.clone()));
+        }
+    }
+
+    fn hooked(tools: Vec<Arc<dyn Tool>>, hooks: Vec<Arc<dyn ToolHook>>) -> ToolExecutor {
+        let mut executor = executor(tools, ToolExecutionConfig::default());
+        for hook in hooks {
+            executor.add_hook(hook);
+        }
+        executor
+    }
+
+    /// A hook that allows sees the call and its outcome; the tool still runs.
+    #[tokio::test]
+    async fn an_observing_hook_sees_the_call_and_its_outcome() {
+        let hook = RecordingHook::new("observer", None);
+        let executor = hooked(vec![Arc::new(EchoTool)], vec![hook.clone()]);
+
+        let out = one(&executor, call("echo", "hi"), &unledgered()).await;
+        assert_eq!(
+            out.content, "echoed: hi",
+            "an allowing hook changes nothing"
+        );
+        assert_eq!(hook.seen_pre.lock().unwrap().clone(), vec!["echo"]);
+        assert_eq!(
+            hook.seen_post.lock().unwrap().clone(),
+            vec![("echo".to_string(), "echoed: hi".to_string())]
+        );
+    }
+
+    /// A veto never reaches the tool, and its reason rides back as the call's
+    /// outcome content — append-only, so the prompt prefix is untouched and the
+    /// model can adjust, exactly like a policy denial.
+    #[tokio::test]
+    async fn a_denying_hook_short_circuits_and_the_reason_reaches_the_model() {
+        let (tool, calls) = flaky(0, "unused", false);
+        let hook = RecordingHook::new("gate", Some("not allowed right now"));
+        let executor = hooked(vec![tool], vec![hook.clone()]);
+
+        let out = one(&executor, call("flaky", "{}"), &unledgered()).await;
+        assert_eq!(out.content, "not allowed right now");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "a vetoed call must not reach the tool"
+        );
+        // The veto is still an outcome, so post hooks observe what the model saw.
+        assert_eq!(
+            hook.seen_post.lock().unwrap().clone(),
+            vec![("flaky".to_string(), "not allowed right now".to_string())]
+        );
+    }
+
+    /// Registration order, first `Deny` wins: the hook after the refusing one
+    /// is never consulted (waterfall short-circuit).
+    #[tokio::test]
+    async fn the_first_denying_hook_wins_and_later_hooks_are_not_consulted() {
+        let first = RecordingHook::new("first", None);
+        let denier = RecordingHook::new("denier", Some("refused"));
+        let after = RecordingHook::new("after", None);
+        let executor = hooked(
+            vec![Arc::new(EchoTool)],
+            vec![first.clone(), denier.clone(), after.clone()],
+        );
+
+        let out = one(&executor, call("echo", "hi"), &unledgered()).await;
+        assert_eq!(out.content, "refused");
+        assert_eq!(first.seen_pre.lock().unwrap().len(), 1);
+        assert_eq!(denier.seen_pre.lock().unwrap().len(), 1);
+        assert!(
+            after.seen_pre.lock().unwrap().is_empty(),
+            "a hook after the refusal must not run"
+        );
+        // Every hook still observes the outcome the model was handed.
+        assert_eq!(after.seen_post.lock().unwrap().len(), 1);
+    }
+
+    /// A ledgered veto leaves no run step: nothing executed, so there is no
+    /// tool call to audit — the refusal lives in the transcript instead.
+    #[tokio::test]
+    async fn a_vetoed_call_records_no_ledger_step() {
+        let repo = RecordingRuns::new();
+        let hook = RecordingHook::new("gate", Some("refused"));
+        let executor = hooked(vec![Arc::new(EchoTool)], vec![hook]);
+
+        one(&executor, call("echo", "hi"), &ledgered(repo.clone())).await;
+        assert!(repo.steps.lock().unwrap().is_empty());
+    }
+
+    /// An unknown tool still reaches the hooks: a hook that maps a name onto
+    /// something else has to see the call the model actually made.
+    #[tokio::test]
+    async fn hooks_see_a_call_for_an_unknown_tool_too() {
+        let hook = RecordingHook::new("observer", None);
+        let executor = hooked(vec![], vec![hook.clone()]);
+
+        let out = one(&executor, call("nope", "{}"), &unledgered()).await;
+        assert_eq!(out.content, "error: unknown tool `nope`");
+        assert_eq!(hook.seen_pre.lock().unwrap().clone(), vec!["nope"]);
+        assert_eq!(hook.seen_post.lock().unwrap().len(), 1);
     }
 }

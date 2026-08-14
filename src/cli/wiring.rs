@@ -4,6 +4,12 @@
 //! the same agent: identical tools, skills, LLM, and reviewer. The only thing
 //! that differs is the `Approver` — interactive at a TTY vs. auto-deny in the
 //! unattended gateway — so it is passed in.
+//!
+//! Tools and hooks come from the plugin roster (`crate::plugins`): the host
+//! builds the shared services (storage, workspace, memory, skills), phase 1
+//! of the plugin layer contributes every tool tagged with the runtimes that
+//! see it, and this module materializes the four executors from that one
+//! registry — so a runtime's tool set can never drift from the roster.
 
 use komo_agent::delegate::DelegateTool;
 use komo_agent::llm::{PreambleFn, build_llm};
@@ -23,36 +29,13 @@ use komo_services::memory_enrichment::MemoryEnricher;
 use komo_services::skill_registry::SkillRegistry;
 use komo_services::tool_execution::{ToolExecutionConfig, ToolExecutor};
 use komo_services::tool_output_store::ToolOutputStore;
-use komo_tools::apply_patch::ApplyPatchTool;
-use komo_tools::ask_user::AskUserTool;
-use komo_tools::cron::CronTool;
-use komo_tools::edit::EditTool;
-use komo_tools::glob::GlobTool;
-use komo_tools::grep::GrepTool;
-use komo_tools::homeassistant::HomeAssistantTool;
-use komo_tools::logs::LogsTool;
-use komo_tools::mcp::McpTool;
-use komo_tools::memory::MemoryTool;
-use komo_tools::read::ReadTool;
-use komo_tools::reminder::ReminderTool;
-use komo_tools::session::SessionTool;
-use komo_tools::shell::ShellTool;
-use komo_tools::skill::SkillTool;
-use komo_tools::task::TaskTool;
-use komo_tools::time::TimeTool;
-use komo_tools::todo::TodoTool;
-use komo_tools::web_fetch::WebFetchTool;
-use komo_tools::web_search::WebSearchTool;
-use komo_tools::wiki_index::WikiIndexTool;
-use komo_tools::wiki_read::WikiReadTool;
-use komo_tools::wiki_search::WikiSearchTool;
-use komo_tools::write::WriteTool;
 use std::sync::Arc;
 
 use crate::domain::{
     approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
-    repository::SkillRepository, reviewer::Reviewer, tool::Tool, workspace::Workspace,
+    repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
 };
+use crate::plugins::{self, Scope, ToolCx, ToolRegistry};
 use komo_config::ConfigSnapshot;
 
 /// A wired agent plus the handles background work needs (sessions for sweeping,
@@ -120,75 +103,6 @@ async fn build_embedder(
     }
     tracing::info!(model = %config.model, "memory embedding backend ready");
     Some(Arc::new(embedder))
-}
-
-/// Connect the configured MCP servers and turn their allowlisted tools into
-/// komo tools, built **once** and shared (`Arc`) by every executor — each
-/// [`McpTool`] leaks its name and description to satisfy `Tool`'s `&'static
-/// str`, so constructing them per executor would leak the same strings again.
-///
-/// A server that is unreachable, or that no longer offers a tool the operator
-/// listed, is a warning: an optional external integration must not stop komo
-/// from booting (the same call komo makes for a missing model key or a
-/// token-less HA channel).
-async fn build_mcp_tools(servers: &[komo_config::McpServerConfig]) -> Vec<Arc<dyn Tool>> {
-    if servers.is_empty() {
-        return Vec::new();
-    }
-    let allowlists: std::collections::BTreeMap<String, Vec<String>> = servers
-        .iter()
-        .map(|s| (s.name.clone(), s.tools.clone()))
-        .collect();
-    let clients = komo_mcp::connect_all(
-        servers
-            .iter()
-            .map(|s| (s.name.clone(), s.url.clone(), s.token.clone()))
-            .collect(),
-    )
-    .await;
-
-    let mut mounted: Vec<Arc<dyn Tool>> = Vec::new();
-    for client in clients {
-        let server = client.server().to_string();
-        let offered = match client.list_tools().await {
-            Ok(tools) => tools,
-            Err(error) => {
-                tracing::warn!(server = %server, %error, "mcp tools/list failed — no tools mounted");
-                continue;
-            }
-        };
-        // Empty allowlist = `all_tools = true`; config resolution rejects the
-        // empty-and-not-all case, so this is never an accidental wildcard.
-        let allow = allowlists.get(&server).cloned().unwrap_or_default();
-        let wanted = |name: &str| allow.is_empty() || allow.iter().any(|t| t == name);
-
-        let offered_names: Vec<String> = offered.iter().map(|t| t.name.clone()).collect();
-        // A listed tool the server doesn't have is almost always a typo, and it
-        // would otherwise be invisible — the model just never sees the tool.
-        for missing in allow.iter().filter(|t| !offered_names.contains(t)) {
-            tracing::warn!(
-                server = %server,
-                tool = %missing,
-                available = %offered_names.join(", "),
-                "mcp tool listed in config is not offered by the server"
-            );
-        }
-
-        let mut names = Vec::new();
-        for def in offered.into_iter().filter(|d| wanted(&d.name)) {
-            let tool = Arc::new(McpTool::new(client.clone(), def));
-            names.push(tool.name().to_string());
-            mounted.push(tool);
-        }
-        tracing::info!(
-            server = %server,
-            mounted = names.len(),
-            offered = offered_names.len(),
-            tools = %names.join(", "),
-            "mcp tools mounted"
-        );
-    }
-    mounted
 }
 
 /// Build the agent against `db` (sessions/messages/etc.), `kanban` (durable
@@ -310,12 +224,6 @@ pub async fn build(
     );
     let skills = Arc::new(SkillRegistry::load_from_dirs(&skill_dirs));
 
-    // External MCP servers. Connected here, once, because the catalog is
-    // immutable after wiring: `ToolExecutor::register` takes `Arc::get_mut`,
-    // and its byte-stable ordering is what keeps the provider's prompt cache
-    // valid across turns. A server that appears later cannot be added.
-    let mcp_tools = build_mcp_tools(&config.runtime.mcp_servers).await;
-
     // One memory query service, shared by the `memory` tool's explicit search and
     // the enricher's automatic recall — that sharing is the point: a model handed
     // a memory unprompted must be able to find the same memory by asking. Built
@@ -326,6 +234,27 @@ pub async fn build(
         memory_query = memory_query.with_embedder(embedder);
     }
     let memory_query = Arc::new(memory_query);
+
+    // ── Plugin phase 1: every tool and hook, tagged per runtime ──────────────
+    // The roster is `plugins::builtin()`; `[plugins.<name>] enabled = false`
+    // silences a plugin uniformly. MCP/wiki failures degrade (warn, boot on).
+    let roster = plugins::builtin();
+    let gate = plugins::PluginGate::new(config, &roster);
+    let tool_cx = ToolCx {
+        config,
+        db: db.clone(),
+        kanban: kanban.clone(),
+        cron_jobs: cron_jobs.clone(),
+        workspace: workspace.clone(),
+        clarify: clarify.clone(),
+        memory_repo: memory_repo.clone(),
+        memory_query: memory_query.clone(),
+        skills: skills.clone(),
+        skill_store: skill_store.clone(),
+    };
+    let mut registry = ToolRegistry::default();
+    plugins::run_tool_phase(&roster, &gate, &mut registry, &tool_cx).await?;
+    let wiki_ops = registry.wiki_ops.take();
 
     // Keep the always-on preamble small: list a bounded catalog, the rest is
     // discoverable on demand via the `skill` tool.
@@ -351,154 +280,49 @@ pub async fn build(
         })
     };
 
-    // The full tool set, parameterized only by its approver — so the main agent
-    // and the unattended cron agent share one definition and can never drift.
-    // The executor owns execution policy (result cap, per-turn call budget) as
-    // instance config — no process globals.
-    // `delegate` is passed in rather than built here because the sub-agent it
-    // runs needs a tool set of its own — built by this same closure with
+    // Materialize one executor per runtime from the registry: the plugin
+    // roster is the single definition, scope filtering replaces the four
+    // hand-written registration lists (briefing's included). `delegate` is
+    // passed in rather than registered by a plugin because the sub-agent it
+    // runs needs an executor of its own — built by this same closure with
     // `delegate: None`, which is the structural guard against recursion.
-    // Note-vault search, only when `[wiki]` names a vault. The index opens
-    // lazily, so a backend that is down *right now* — a NAS still booting, a
-    // local-network permission macOS has not granted the launchd job — costs a
-    // retry on the next call rather than this tool for the life of the process
-    // (the catalog is frozen once this returns). Only a `[wiki]` that can never
-    // work, which no amount of retrying fixes, drops the tool outright.
-    let mut wiki_ops: Option<crate::services::operator_control::actions::WikiOps> = None;
-    // Three tools when a vault is usable: `wiki_search` (find), `wiki_read`
-    // (widen a hit into its section) and `wiki_index` (maintain). They share the
-    // handles, and `wiki_index` shares the runner with the operator surface so no
-    // two runs overlap. `wiki_read` needs none of them — the markdown on disk is
-    // the source of truth, so it reads the vault directly and serves a note
-    // edited since the last index run.
-    let mut wiki_tools: Vec<Arc<dyn komo_core::domain::tool::Tool>> = Vec::new();
-    if let Some(wiki) = &config.runtime.wiki {
-        // Registered before the handles are built, and kept even if they fail: a
-        // broken vector backend costs search, not the ability to read a note whose
-        // path the user or a memory already names.
-        wiki_tools.push(Arc::new(WikiReadTool::new(wiki.vault.clone())));
-    }
-    wiki_tools.extend(match &config.runtime.wiki {
-        Some(wiki) => match wiki_handles(wiki) {
-            Ok((index, embedder)) => {
-                // Probed once so a wrong url still shows up at boot instead of
-                // on the first search. The outcome is a diagnostic, never a
-                // decision. `{:#}` prints the whole chain: the outermost context
-                // alone says "not reachable", which hides whether the cause was
-                // the network, auth, or a permission the daemon was never given.
-                match index.get().await {
-                    Ok(_) => tracing::info!(vault = %wiki.vault.display(), "wiki_search ready"),
-                    Err(error) => tracing::warn!(
-                        error = format!("{error:#}"),
-                        "wiki index not open — wiki_search retries on each call"
-                    ),
-                }
-                // The same index backs `komo wiki` over the operator channel —
-                // the gateway holds the only handle, so the CLI has to borrow it
-                // rather than open its own.
-                // One runner shared by every indexing caller: this process's
-                // `wiki_index` tool, `komo wiki index` over the operator
-                // channel, and any cron job. Two concurrent runs over one store
-                // is not merely wasteful — a rebuild resets it.
-                let runner = Arc::new(komo_services::wiki_indexing::WikiIndexRunner::new(
-                    index.clone(),
-                    embedder.clone(),
-                    wiki.vault.clone(),
-                    wiki.embedding.model.clone(),
-                ));
-                wiki_ops = Some(crate::services::operator_control::actions::WikiOps {
-                    runner: runner.clone(),
-                    backend: wiki.backend.clone(),
-                    collection: wiki.collection.clone(),
-                    location: if wiki.backend == "server" {
-                        wiki.url.clone()
-                    } else {
-                        wiki.data_dir.join(&wiki.collection).display().to_string()
-                    },
-                });
-                let tools: Vec<Arc<dyn komo_core::domain::tool::Tool>> = vec![
-                    Arc::new(WikiSearchTool::new(index, embedder)),
-                    Arc::new(WikiIndexTool::new(runner)),
-                ];
-                tools
-            }
-            Err(error) => {
-                tracing::warn!(error = format!("{error:#}"), "wiki_search unavailable");
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    });
-
-    let build_full_tools =
-        |approver: Arc<dyn Approver>, delegate: Option<Arc<DelegateTool>>| -> ToolExecutor {
-            let mut tools = ToolExecutor::new(
-                ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
-                    .with_turn_budget(model_config.max_turn_result_bytes)
-                    .with_call_timeout_secs(model_config.tool_timeout_secs),
-            )
-            .with_approver(approver.clone())
-            .with_output_store(output_store.clone());
-            tools.register(Arc::new(TimeTool));
-            tools.register(Arc::new(ReadTool::new(workspace.clone())));
-            tools.register(Arc::new(WriteTool::new(workspace.clone())));
-            tools.register(Arc::new(EditTool::new(workspace.clone())));
-            tools.register(Arc::new(ApplyPatchTool::new(workspace.clone())));
-            tools.register(Arc::new(GrepTool::new(workspace.clone())));
-            tools.register(Arc::new(GlobTool::new(workspace.clone())));
-            tools.register(Arc::new(ShellTool::new(workspace.clone())));
-            tools.register(Arc::new(WebFetchTool::new()));
-            tools.register(Arc::new(WebSearchTool::new()));
-            // Note-vault search and index maintenance, present only when
-            // `[wiki]` named a usable vault (opened once above — this closure is
-            // synchronous).
-            for tool in wiki_tools.iter().cloned() {
-                tools.register(tool);
-            }
-            // komo's own tracing log, so a failed tool call can be diagnosed
-            // from the `tool` span in the same conversation that hit it.
-            tools.register(Arc::new(LogsTool));
-            tools.register(Arc::new(SessionTool::new(db.clone(), db.clone())));
-            tools.register(Arc::new(ReminderTool::new(db.clone())));
-            // Scheduled jobs from inside a conversation. Every mutation is gated
-            // through this tool set's approver — a chat-authored job is
-            // model-authored, unlike one added with `komo cron add`.
-            tools.register(Arc::new(CronTool::new(cron_jobs.clone())));
-            tools.register(Arc::new(TaskTool::new(kanban.clone())));
-            tools.register(Arc::new(TodoTool::new(db.clone())));
-            tools.register(Arc::new(AskUserTool::new(clarify.clone())));
-            // Home Assistant tool, only when configured (HASS_TOKEN set).
-            if let Some(ha) = &config.runtime.homeassistant_tool {
-                tools.register(Arc::new(HomeAssistantTool::new(
-                    ha.base_url.clone(),
-                    ha.token.clone(),
-                )));
-            }
-            tools.register(Arc::new(MemoryTool::new(
-                memory_repo.clone(),
-                memory_query.clone(),
-            )));
-            // Shared instances, not rebuilt per executor — see `build_mcp_tools`.
-            for tool in &mcp_tools {
-                tools.register(tool.clone());
-            }
-            if let Some(delegate) = delegate {
-                tools.register(delegate);
-            }
-            tools.register(Arc::new(SkillTool::new(
-                skills.clone(),
-                skill_store.clone(),
-            )));
-            // A tool the policy denies outright never gets advertised: it would
-            // otherwise cost a schema, a prompt entry, and a whole round-trip per
-            // attempt, all to be refused. Runs before the catalog is read, so the
-            // prompt's tool list and the model's schemas agree by construction.
-            let dropped = tools.drop_policy_denied(&config.runtime.policy.policy);
-            if !dropped.is_empty() {
-                tracing::info!(tools = %dropped.join(", "), "tools withheld by a policy deny rule");
-            }
-            tools
-        };
+    let executor_for = |scope: Scope,
+                        approver: Arc<dyn Approver>,
+                        delegate: Option<Arc<DelegateTool>>|
+     -> ToolExecutor {
+        let mut tools = ToolExecutor::new(
+            ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
+                .with_turn_budget(model_config.max_turn_result_bytes)
+                .with_call_timeout_secs(model_config.tool_timeout_secs),
+        )
+        .with_approver(approver)
+        .with_output_store(output_store.clone());
+        for tool in registry.tools_for(scope) {
+            tools.register(tool.clone());
+        }
+        for hook in registry.tool_hooks_for(scope) {
+            tools.add_hook(hook.clone());
+        }
+        if let Some(delegate) = delegate {
+            tools.register(delegate);
+        }
+        // A tool the policy denies outright never gets advertised: it would
+        // otherwise cost a schema, a prompt entry, and a whole round-trip per
+        // attempt, all to be refused. Runs before the catalog is read, so the
+        // prompt's tool list and the model's schemas agree by construction.
+        let dropped = tools.drop_policy_denied(&config.runtime.policy.policy);
+        if !dropped.is_empty() {
+            tracing::info!(tools = %dropped.join(", "), "tools withheld by a policy deny rule");
+        }
+        tools
+    };
+    let tool_names_of = |tools: &ToolExecutor| -> Vec<String> {
+        tools
+            .definitions()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    };
 
     // ── Sub-agent runtime (the `delegate` tool's worker) ─────────────────────
     // A real agent turn, not a bare completion: the full tool set, so a delegated
@@ -513,12 +337,8 @@ pub async fn build(
     //     and still resolves against the parent's workspace root;
     //   - it shares the run ledger, so each delegation is auditable on its own.
     // No memory enricher: a sub-agent is a worker, not the user's assistant.
-    let subagent_tools = build_full_tools(approver.clone(), None);
-    let subagent_tool_names: Vec<String> = subagent_tools
-        .definitions()
-        .iter()
-        .map(|t| t.name().to_string())
-        .collect();
+    let subagent_tools = executor_for(Scope::SUBAGENT, approver.clone(), None);
+    let subagent_tool_names = tool_names_of(&subagent_tools);
     let subagent_note = skills_note_for(&subagent_tool_names);
     let subagent_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
@@ -546,6 +366,7 @@ pub async fn build(
         // from — the reviewer only ever sees the real one.
         review: None,
         journal: None,
+        turn_hooks: registry.turn_hooks_for(Scope::SUBAGENT),
     });
     let delegate = Arc::new(DelegateTool::new(
         subagent_runtime,
@@ -554,18 +375,14 @@ pub async fn build(
         model_config.model.clone(),
     ));
 
-    let tools = build_full_tools(approver.clone(), Some(delegate));
+    let tools = executor_for(Scope::MAIN, approver.clone(), Some(delegate));
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance
     // (gated on the tools actually loaded) + skills catalog, then the workspace
     // project-instruction file, then the day-precision volatile footer. Wrapped
     // in a factory so `complete` rebuilds it per turn (per session) rather than
     // freezing the date at process start — important for the long-lived gateway.
-    let tool_names: Vec<String> = tools
-        .definitions()
-        .iter()
-        .map(|t| t.name().to_string())
-        .collect();
+    let tool_names = tool_names_of(&tools);
     let main_note = skills_note_for(&tool_names);
     let prompt_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
@@ -637,6 +454,7 @@ pub async fn build(
         // The one runtime whose turns are worth resuming: conversations. The
         // aux runtimes below journal nothing — their turns re-dispatch whole.
         journal: Some(db.clone()),
+        turn_hooks: registry.turn_hooks_for(Scope::MAIN),
     };
 
     // ── Cron agent runtime (general cron, agent mode) ────────────────────────
@@ -660,12 +478,8 @@ pub async fn build(
     // ambient session, so the sub-agent's Risk::Normal actions would be auto-denied
     // anyway, just less legibly. A cron job that needs a sub-agent should say so
     // explicitly (its own runtime with the unattended approver), not inherit one.
-    let cron_tools = build_full_tools(cron_approver, None);
-    let cron_tool_names: Vec<String> = cron_tools
-        .definitions()
-        .iter()
-        .map(|t| t.name().to_string())
-        .collect();
+    let cron_tools = executor_for(Scope::CRON, cron_approver, None);
+    let cron_tool_names = tool_names_of(&cron_tools);
     // No operations_manual / user_profile: the cron agent is a background task
     // executor, not the user-facing assistant.
     let cron_note = skills_note_for(&cron_tool_names);
@@ -693,14 +507,16 @@ pub async fn build(
         history_window: model_config.max_history_messages,
         review: None,
         journal: None,
+        turn_hooks: registry.turn_hooks_for(Scope::CRON),
     });
 
     // ── Briefing runtime (roadmap §2) ────────────────────────────────────────
     // A second, deliberately small agent the BriefingSweep drives: aux model,
-    // read-only tool set (no shell/file/task/memory writes), and a policy
-    // approver whose inner is deny-all — there is never a human to prompt, so
-    // a `Risk::Normal` action passes only through an explicit `unattended`
-    // policy rule. Safe reads (web_fetch, skill view) work out of the box.
+    // read-only tool set (the plugins' `Scope::ALL` registrations — no
+    // shell/file/task/memory writes), and a policy approver whose inner is
+    // deny-all — there is never a human to prompt, so a `Risk::Normal` action
+    // passes only through an explicit `unattended` policy rule. Safe reads
+    // (web_fetch, skill view) work out of the box.
     // Sharing the run ledger (`runs: db`) makes every briefing execution
     // auditable via `komo run list`.
     // No saved grants here either — see the cron approver above.
@@ -708,32 +524,8 @@ pub async fn build(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),
     );
-    let mut briefing_tools = ToolExecutor::new(
-        ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
-            .with_turn_budget(model_config.max_turn_result_bytes)
-            .with_call_timeout_secs(model_config.tool_timeout_secs),
-    )
-    .with_approver(briefing_approver.clone())
-    .with_output_store(output_store.clone());
-    briefing_tools.register(Arc::new(TimeTool));
-    briefing_tools.register(Arc::new(WebFetchTool::new()));
-    briefing_tools.register(Arc::new(WebSearchTool::new()));
-    briefing_tools.register(Arc::new(SkillTool::new(
-        skills.clone(),
-        skill_store.clone(),
-    )));
-    if let Some(ha) = &config.runtime.homeassistant_tool {
-        briefing_tools.register(Arc::new(HomeAssistantTool::new(
-            ha.base_url.clone(),
-            ha.token.clone(),
-        )));
-    }
-    briefing_tools.drop_policy_denied(&config.runtime.policy.policy);
-    let briefing_tool_names: Vec<String> = briefing_tools
-        .definitions()
-        .iter()
-        .map(|t| t.name().to_string())
-        .collect();
+    let briefing_tools = executor_for(Scope::BRIEFING, briefing_approver, None);
+    let briefing_tool_names = tool_names_of(&briefing_tools);
     let briefing_note = skills_note_for(&briefing_tool_names);
     let briefing_builder = Arc::new(
         SystemPromptBuilder::new(&aux_config)
@@ -760,6 +552,7 @@ pub async fn build(
         history_window: model_config.max_history_messages,
         review: None,
         journal: None,
+        turn_hooks: registry.turn_hooks_for(Scope::BRIEFING),
     });
 
     Ok(Wiring {
@@ -797,31 +590,4 @@ impl Approver for UnattendedDeny {
              `unattended = true` 的 [policy] 允许规则才会放行；请改用不需要审批的做法。",
         )
     }
-}
-
-/// Build the note-vault handles: a lazily-opened index and its embedding client.
-///
-/// Neither touches the network here, so the only failures left are the ones a
-/// running process can never recover from — a backend name that does not parse,
-/// an embedding url that is not a url. Reaching the vault is deferred to
-/// [`komo_wiki::lazy::LazyWikiIndex`], which retries it per call.
-fn wiki_handles(
-    wiki: &komo_config::WikiConfig,
-) -> anyhow::Result<(
-    Arc<komo_wiki::lazy::LazyWikiIndex>,
-    Arc<dyn komo_core::domain::embedding::EmbeddingClient>,
-)> {
-    let index = komo_wiki::lazy::LazyWikiIndex::new(komo_wiki::WikiSettings {
-        backend: komo_wiki::WikiBackend::parse(&wiki.backend)?,
-        data_dir: wiki.data_dir.clone(),
-        url: wiki.url.clone(),
-        collection: wiki.collection.clone(),
-        // Credentials come from the environment, never config.toml.
-        api_key: std::env::var("QDRANT_API_KEY").ok(),
-    });
-    let embedder = komo_infra::embedding::OllamaEmbedder::new(
-        wiki.embedding.url.clone(),
-        wiki.embedding.model.clone(),
-    )?;
-    Ok((Arc::new(index), Arc::new(embedder)))
 }

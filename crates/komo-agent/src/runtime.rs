@@ -2,6 +2,7 @@ use crate::review_coordinator::{ReviewCoordinator, ReviewTrigger};
 use komo_core::domain::{
     cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
     events::{ToolEventSink, TurnEvent},
+    hooks::TurnHook,
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
     message::{Message, Role},
     repository::{MessageRepository, SessionRepository},
@@ -71,6 +72,10 @@ pub struct AgentRuntime {
     /// re-run. `None` — aux runtimes (delegate/cron/briefing) — journals
     /// nothing: their turns are re-dispatched whole, never resumed.
     pub journal: Option<Arc<dyn TurnJournalRepository>>,
+    /// Turn lifecycle observers (see `domain::hooks`). Registered at wiring,
+    /// awaited serially — a hook is a fast observer, never a worker. Empty for
+    /// every runtime without plugins contributing one.
+    pub turn_hooks: Vec<Arc<dyn TurnHook>>,
 }
 
 /// Binds one turn's journal writes to its ledger run: assigns `seq`, and disarms
@@ -324,6 +329,11 @@ impl AgentRuntime {
         };
         let is_fresh = resume_entries.is_none();
 
+        // Lifecycle hooks: the loop is about to drive its first model round.
+        for hook in &self.turn_hooks {
+            hook.turn_started(session_id).await;
+        }
+
         // Keep a handle on the run to read the tool-step count after the loop (the
         // counter is shared via `Arc`) and to fetch the steps themselves.
         let probe = run.clone();
@@ -419,6 +429,12 @@ impl AgentRuntime {
         let assistant_msg = Message::assistant(&reply).with_tool_note(tool_note);
         self.messages.save(session_id, &assistant_msg).await?;
         session.messages.push(assistant_msg);
+
+        // Lifecycle hooks: the turn delivered. Failed/cancelled turns never
+        // reach here — they surface through the run ledger instead.
+        for hook in &self.turn_hooks {
+            hook.turn_finished(session_id, &reply).await;
+        }
 
         // Post-turn review, detached from the reply path. Whether this turn is
         // due (cadence), which snapshot the reviewer sees, and the watermark
@@ -900,6 +916,7 @@ mod tests {
             history_window: 0,
             review: None,
             journal: None,
+            turn_hooks: Vec::new(),
         };
         (rt, received, interjected)
     }
@@ -1313,6 +1330,7 @@ mod tests {
             history_window: 0,
             review: None,
             journal: None,
+            turn_hooks: Vec::new(),
         };
 
         let result = rt.handle_input("cli:sf", "hi".into()).await;
@@ -1602,6 +1620,7 @@ mod tests {
             history_window: 0,
             review: None,
             journal: Some(db.clone()),
+            turn_hooks: Vec::new(),
         };
 
         let reply = rt
