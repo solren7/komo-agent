@@ -21,7 +21,6 @@ mod result;
 /// definition of "transient", so the tool path and the model path can't drift.
 pub(crate) mod retry;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +34,7 @@ pub use context::{
 
 use crate::tool_output_store::{Bounded, ToolOutputStore};
 use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
+use komo_core::domain::catalog::{CatalogSnapshot, ToolCatalog};
 use komo_core::domain::events::TurnEvent;
 use komo_core::domain::hooks::{HookDecision, ToolHook};
 use komo_core::domain::llm::{ToolCallReq, ToolOutcome};
@@ -165,15 +165,21 @@ pub struct ToolExecutor {
     core: Arc<ToolExecutionCore>,
 }
 
-/// The shared implementation: the immutable catalog plus the execution policy
-/// and the approver every migrated tool reaches through its [`ToolContext`].
+/// The shared implementation: the catalog plus the execution policy and the
+/// approver every migrated tool reaches through its [`ToolContext`].
 pub struct ToolExecutionCore {
-    /// Keyed by tool name. A `BTreeMap` so [`ToolExecutor::definitions`] yields
-    /// a stable, name-sorted catalog: the tool schemas are serialized into every
-    /// request, and a provider prompt cache matches on exact bytes — an
-    /// order that shifts across restarts (as `HashMap`'s did) invalidates the
-    /// whole cached prefix for no reason.
-    tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// What the model may call. Shared with whoever declares the schemas, so
+    /// the set the model is told about and the set this dispatches against are
+    /// the same object — see [`ToolCatalog`].
+    ///
+    /// Dispatch reads a [`CatalogSnapshot`], not this: within a turn the
+    /// catalog may change under us, and a call the model was invited to make
+    /// must not answer "unknown tool" a round later.
+    catalog: Arc<ToolCatalog>,
+    /// Set when this executor is pinned to one turn's view
+    /// ([`ToolExecutor::pin`]). `None` — the wiring-time and test executors —
+    /// reads the catalog's current snapshot per round.
+    pinned: Option<Arc<CatalogSnapshot>>,
     config: ToolExecutionConfig,
     /// The approver placed into each call's [`ToolContext`]. Defaults to
     /// deny-all; wiring installs the real (policy-wrapped) approver via
@@ -183,21 +189,60 @@ pub struct ToolExecutionCore {
     /// are truncated, with the tail lost — the behavior before roadmap item 10.
     output_store: Option<Arc<ToolOutputStore>>,
     /// Tool hooks, run around every call in registration order (first `Deny`
-    /// wins). Registered during wiring like the catalog, frozen with it.
+    /// wins). Registered during wiring; a pinned executor carries the same set.
     hooks: Vec<Arc<dyn ToolHook>>,
 }
 
 impl ToolExecutor {
     pub fn new(config: ToolExecutionConfig) -> Self {
+        Self::with_catalog(Arc::new(ToolCatalog::new()), config)
+    }
+
+    /// An executor over an existing catalog — the wiring path, where the model
+    /// backend needs the same catalog to declare schemas from.
+    pub fn with_catalog(catalog: Arc<ToolCatalog>, config: ToolExecutionConfig) -> Self {
         Self {
             core: Arc::new(ToolExecutionCore {
-                tools: BTreeMap::new(),
+                catalog,
+                pinned: None,
                 config,
                 approver: Arc::new(DenyAllApprover),
                 output_store: None,
                 hooks: Vec::new(),
             }),
         }
+    }
+
+    /// The catalog this executor dispatches against, for a caller that mounts
+    /// tools into it or declares its schemas.
+    pub fn catalog(&self) -> &Arc<ToolCatalog> {
+        &self.core.catalog
+    }
+
+    /// An executor pinned to the catalog as it is *now*, for one turn.
+    ///
+    /// The runtime pins at turn start and uses the result for every round: the
+    /// model is handed one set of schemas, so the executor has to keep
+    /// dispatching against that set even if a plugin mounts or unmounts
+    /// mid-turn. The mutation is not lost — the next turn pins the new set.
+    pub fn pin(&self) -> Self {
+        let snapshot = self.snapshot();
+        Self {
+            core: Arc::new(ToolExecutionCore {
+                catalog: self.core.catalog.clone(),
+                pinned: Some(snapshot),
+                config: self.core.config,
+                approver: self.core.approver.clone(),
+                output_store: self.core.output_store.clone(),
+                hooks: self.core.hooks.clone(),
+            }),
+        }
+    }
+
+    /// The catalog view this executor reads: its pinned turn snapshot, else the
+    /// catalog's current one.
+    pub fn snapshot(&self) -> Arc<CatalogSnapshot> {
+        self.core.snapshot()
     }
 
     /// Install the approver handed to every tool via its [`ToolContext`]. Called
@@ -229,20 +274,23 @@ impl ToolExecutor {
         core.hooks.push(hook);
     }
 
-    /// Add a tool to the catalog. Registration happens during wiring, before
-    /// the executor is shared — the catalog is immutable once clones exist.
+    /// Add a tool for the life of the process (the wiring path). A tool that
+    /// can be taken back out is mounted on the [`catalog`](Self::catalog)
+    /// instead, which hands back a guard.
+    ///
+    /// Takes `&mut self` although the catalog no longer needs it: registering
+    /// through an executor is the wiring-time gesture, and the borrow keeps it
+    /// from being reached for once the executor is shared.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        let core = Arc::get_mut(&mut self.core)
-            .expect("register tools during wiring, before the executor is shared");
-        core.tools.insert(tool.name().to_string(), tool);
+        self.core.catalog.register(tool);
     }
 
     /// The catalog as the model adapter needs it (schemas for function
-    /// calling), name-sorted so the serialized tool block is byte-stable
-    /// across restarts — a provider prompt cache matches on exact bytes. A
-    /// read-only view — execution always goes through the executor.
+    /// calling), name-sorted so the serialized tool block is byte-stable — a
+    /// provider prompt cache matches on exact bytes. A read-only view —
+    /// execution always goes through the executor.
     pub fn definitions(&self) -> Vec<Arc<dyn Tool>> {
-        self.core.tools.values().cloned().collect()
+        self.snapshot().tools().cloned().collect()
     }
 
     /// Drop the tools `policy` denies outright, returning their names (sorted) so
@@ -259,21 +307,11 @@ impl ToolExecutor {
     /// [`definitions`]: Self::definitions
     /// [`Policy::wholly_denied`]: komo_core::domain::policy::Policy::wholly_denied
     pub fn drop_policy_denied(&mut self, policy: &Policy) -> Vec<String> {
-        let core = Arc::get_mut(&mut self.core)
-            .expect("filter the catalog during wiring, before the executor is shared");
-        let mut removed: Vec<String> = core
-            .tools
-            .keys()
-            .filter(|name| {
-                policy_scope(name)
-                    .is_some_and(|(category, access)| policy.wholly_denied(category, access))
-            })
-            .cloned()
-            .collect();
+        let mut removed = self.core.catalog.retain(|name| {
+            policy_scope(name)
+                .is_some_and(|(category, access)| policy.wholly_denied(category, access))
+        });
         removed.sort();
-        for name in &removed {
-            core.tools.remove(name);
-        }
         removed
     }
 
@@ -295,6 +333,9 @@ impl ToolExecutor {
         calls: &[ToolCallReq],
         context: &ToolTurnContext,
     ) -> Vec<ToolOutcome> {
+        // One view for the whole round, so two calls in it can never see
+        // different catalogs. On a pinned executor this is the turn's view.
+        let catalog = self.snapshot();
         // Bound the per-round fan-out: a single malformed round can request far
         // more calls than any real parallel tool use. Calls past the ceiling get
         // a note without spawning a task or writing a ledger step, so a runaway
@@ -315,6 +356,7 @@ impl ToolExecutor {
             .map(|call| context.spin.observe(&call.name, &call.args))
             .collect();
 
+        let catalog = &catalog;
         let futures = calls.iter().zip(&verdicts).enumerate().map(
             |(i, (call, verdict))| async move {
                 let content = if i >= MAX_CALLS_PER_ROUND {
@@ -350,7 +392,7 @@ impl ToolExecutor {
                     // without the prompt prefix ever changing.
                     denial
                 } else {
-                    match self.core.tools.get(&call.name) {
+                    match catalog.get(&call.name) {
                         Some(tool) => match self
                             .core
                             .execute(tool.clone(), call.args.clone(), context)
@@ -380,6 +422,15 @@ impl ToolExecutor {
 }
 
 impl ToolExecutionCore {
+    /// This core's catalog view: the pinned turn snapshot when there is one,
+    /// else whatever the catalog holds right now.
+    fn snapshot(&self) -> Arc<CatalogSnapshot> {
+        match &self.pinned {
+            Some(pinned) => pinned.clone(),
+            None => self.catalog.snapshot(),
+        }
+    }
+
     /// Consult the tool hooks before a call runs. Registration order; the
     /// first `Deny` short-circuits (waterfall semantics) and its message is
     /// returned as the call's outcome content.
@@ -1793,6 +1844,69 @@ mod tests {
             let out = one(&executor, call("big", &format!("{{\"i\":{i}}}")), &ctx).await;
             assert_eq!(out.content.len(), 10_000);
         }
+    }
+
+    // ── Runtime mounting (domain::catalog) ───────────────────────────────────
+
+    /// A tool mounted after the executor was built is callable, and callable
+    /// through a *clone* — every executor over one catalog sees the same set,
+    /// which is what lets a plugin host mount into a running process.
+    #[tokio::test]
+    async fn a_tool_mounted_at_runtime_is_dispatchable_through_every_clone() {
+        let executor = executor(vec![], ToolExecutionConfig::default());
+        let shared = executor.clone();
+        let context = unledgered();
+
+        // Distinct arguments throughout: what is under test is the catalog,
+        // and byte-identical repeats would be stopped by the spin detector
+        // before they ever reached it.
+        let missing = one(&executor, call("echo", "before"), &context).await;
+        assert_eq!(missing.content, "error: unknown tool `echo`");
+
+        let mounted = executor.catalog().mount(Arc::new(EchoTool));
+        assert_eq!(
+            shared.definitions().len(),
+            1,
+            "a clone shares the catalog, not a copy of it"
+        );
+        let out = one(&shared, call("echo", "mounted"), &context).await;
+        assert_eq!(out.content, "echoed: mounted");
+
+        // And unmounting takes it back out of both.
+        drop(mounted);
+        let gone = one(&shared, call("echo", "after"), &context).await;
+        assert_eq!(gone.content, "error: unknown tool `echo`");
+        assert!(executor.definitions().is_empty());
+    }
+
+    /// A pinned executor keeps dispatching against the set it pinned. This is
+    /// the turn-scoped guarantee the runtime relies on: the model was handed
+    /// those schemas, so those are the tools that must answer.
+    #[tokio::test]
+    async fn a_pinned_executor_ignores_later_mounts_and_unmounts() {
+        let executor = executor(vec![Arc::new(EchoTool)], ToolExecutionConfig::default());
+        let pinned = executor.pin();
+        let context = unledgered();
+
+        let removed = executor.catalog().retain(|name| name == "echo");
+        assert_eq!(removed, vec!["echo"]);
+        let _late = executor.catalog().mount(Arc::new(NamedTool("late")));
+
+        // The pinned view still has echo and still does not have `late`.
+        let out = one(&pinned, call("echo", "hi"), &context).await;
+        assert_eq!(out.content, "echoed: hi");
+        let unseen = one(&pinned, call("late", "{}"), &context).await;
+        assert_eq!(unseen.content, "error: unknown tool `late`");
+
+        // A freshly pinned executor — the next turn — sees the new set.
+        let next = executor.pin();
+        assert_eq!(
+            next.definitions()
+                .iter()
+                .map(|t| t.name())
+                .collect::<Vec<_>>(),
+            vec!["late"]
+        );
     }
 
     // ── Tool hooks (domain::hooks) ───────────────────────────────────────────

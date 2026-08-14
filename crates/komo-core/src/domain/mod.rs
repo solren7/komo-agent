@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod briefing;
 pub mod cancel;
+pub mod catalog;
 pub mod context;
 pub mod cron;
 pub mod embedding;

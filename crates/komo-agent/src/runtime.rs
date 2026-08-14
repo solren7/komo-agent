@@ -494,6 +494,13 @@ impl AgentRuntime {
         run: RunContext,
         resume: Option<Vec<JournalEntry>>,
     ) -> anyhow::Result<TurnOutcome> {
+        // Pin the tool catalog for this turn. The model is handed one set of
+        // schemas below; a plugin mounting or unmounting mid-turn must not
+        // change what the loop then dispatches against, or a call the model was
+        // invited to make would answer "unknown tool" a round later. The
+        // mutation is not lost — the next turn pins the new set.
+        let tools = self.tool_executor.pin();
+
         // This turn's journal writer, bound to its ledger run — the loop and
         // the driver stay run-id-free.
         let journal: Option<Arc<dyn TurnJournal>> = self
@@ -508,7 +515,7 @@ impl AgentRuntime {
             run: Some(run),
             // Bound the turn's cumulative tool output (0 = unlimited), so a long
             // tool chain can't quietly overflow the context window.
-            budget: TurnResultBudget::new(self.tool_executor.turn_result_cap()),
+            budget: TurnResultBudget::new(tools.turn_result_cap()),
             // Fresh per turn: a repeat only means anything within the one
             // sequence of calls that is trying to accomplish one thing.
             spin: SpinDetector::default(),
@@ -582,7 +589,7 @@ impl AgentRuntime {
                         // calls themselves are spawned and still finish (see
                         // `domain::cancel`).
                         Self::until_cancelled(cancel, async {
-                            Ok(self.tool_executor.execute_round(&calls, &context).await)
+                            Ok(tools.execute_round(&calls, &context).await)
                         })
                         .await?
                     };
@@ -1382,6 +1389,77 @@ mod tests {
         assert_eq!(runs[0].tokens_in, 1_200);
         assert_eq!(runs[0].tokens_out, 340);
         assert_eq!(runs[0].tokens_cached, 900);
+    }
+
+    /// A turn dispatches against the catalog as it stood when the turn began.
+    ///
+    /// The model was handed one set of schemas; if a plugin unmounts a tool
+    /// mid-turn, the call the model was invited to make must still run rather
+    /// than come back "unknown tool" a round later. The mutation is not lost —
+    /// it lands in the catalog and the next turn sees it.
+    #[tokio::test]
+    async fn a_turn_keeps_dispatching_against_the_catalog_it_started_with() {
+        use komo_core::domain::catalog::Registration;
+
+        /// Unmounts itself the first time it is called — the sharpest version
+        /// of "the catalog changed mid-turn", since the change happens inside
+        /// the very round that is running.
+        struct SelfUnmounting(Mutex<Option<Registration>>);
+        #[async_trait]
+        impl Tool for SelfUnmounting {
+            fn name(&self) -> &'static str {
+                "vanishing"
+            }
+            fn description(&self) -> &'static str {
+                "unmounts itself when called"
+            }
+            async fn call(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &komo_core::domain::context::ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                // Dropping the registration takes it out of the catalog.
+                drop(self.0.lock().unwrap().take());
+                Ok(ToolOutput::text("still here"))
+            }
+        }
+
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_catalog_pin.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, received) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("vanishing", "{}")]),
+                tool_calls(vec![call("vanishing", "{}")]),
+                Step::Final("done".into()),
+            ],
+            vec![],
+            30,
+        );
+
+        let catalog = rt.tool_executor.catalog().clone();
+        let tool = Arc::new(SelfUnmounting(Mutex::new(None)));
+        let registration = catalog.mount(tool.clone());
+        *tool.0.lock().unwrap() = Some(registration);
+        assert_eq!(catalog.snapshot().len(), 1);
+
+        let reply = rt.handle_input("cli:pin", "go".into()).await.unwrap();
+        assert_eq!(reply, "done");
+
+        // Both rounds reached the tool, including the one that ran after it had
+        // already removed itself.
+        let rounds = received.lock().unwrap();
+        assert_eq!(rounds[0][0].content, "still here");
+        assert_eq!(
+            rounds[1][0].content, "still here",
+            "the turn's view is pinned; the unmount takes effect next turn"
+        );
+
+        // And the unmount really happened — the next turn would not see it.
+        assert!(catalog.snapshot().is_empty(), "the catalog itself moved on");
     }
 
     /// #3: the turn's tool activity is folded onto the assistant message, so the

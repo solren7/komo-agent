@@ -12,6 +12,7 @@ use tracing::warn;
 
 use komo_config::{ModelConfig, Provider, split_model_id};
 use komo_core::domain::{
+    catalog::ToolCatalog,
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
     message::{Message, Role},
     session::Session,
@@ -55,10 +56,16 @@ impl LlmClient for UnconfiguredLlm {
 /// than minting a new typed handle.
 pub struct ProviderLlm {
     client: Arc<ProviderClient>,
-    /// Tool schemas advertised to the provider. Only the *declaration* goes over
-    /// the wire: komo dispatches every requested call itself in
-    /// `ToolExecutor::execute_round`.
-    tools: Vec<ToolSchema>,
+    /// The catalog whose schemas are advertised to the provider. Only the
+    /// *declaration* goes over the wire: komo dispatches every requested call
+    /// itself in `ToolExecutor::execute_round`.
+    ///
+    /// Read per turn rather than copied once at wiring, so a tool mounted while
+    /// the process runs actually reaches the model. Rendering is name-sorted
+    /// and therefore byte-stable for an unchanged set — mounting something is
+    /// what costs the provider's cached prefix, not re-reading the catalog.
+    /// `None` for a tool-less backend (aux, delegate, reviewer).
+    tools: Option<Arc<ToolCatalog>>,
     /// The configured model: what a session with no override runs on.
     default_model: String,
     /// Which provider this is, for mapping a session's reasoning-effort level
@@ -299,6 +306,28 @@ fn merge_params(base: Option<Value>, extra: Value) -> Value {
 }
 
 impl ProviderLlm {
+    /// This turn's tool declarations, rendered from the shared catalog.
+    ///
+    /// Name-sorted (the catalog is), so the block is byte-identical between
+    /// turns whose tool set did not change — which is what keeps the provider's
+    /// cached prefix valid across a conversation. Read per turn rather than
+    /// copied at wiring, so a tool mounted while the process runs is one the
+    /// model can actually see.
+    fn tool_schemas(&self) -> Vec<ToolSchema> {
+        let Some(catalog) = &self.tools else {
+            return Vec::new();
+        };
+        catalog
+            .snapshot()
+            .tools()
+            .map(|tool| ToolSchema {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect()
+    }
+
     /// Assemble this turn's `(preamble, prompt, history)`: split the session
     /// into the latest user prompt + prior history, rebuild the system prompt,
     /// and inject the memory blocks (main agent only) — pinned into the
@@ -506,7 +535,9 @@ impl LlmClient for ProviderLlm {
         let turn_loop = TurnLoop {
             client: self.client.clone(),
             turn: self.model_for(preamble, session),
-            tools: self.tools.clone(),
+            // Taken once here, then re-sent unchanged every round: a turn
+            // declares one set of tools from its first round to its last.
+            tools: self.tool_schemas(),
             history,
             start: TurnStart::Prompt(Turn::user(prompt)),
             journal,
@@ -536,7 +567,7 @@ impl LlmClient for ProviderLlm {
                 preamble: rebuilt.preamble,
                 extra: rebuilt.extra,
             },
-            tools: self.tools.clone(),
+            tools: self.tool_schemas(),
             history: rebuilt.history,
             start: rebuilt.start,
             journal,
@@ -1217,19 +1248,10 @@ fn build_provider_llm(
     // Only the schemas cross to the provider: the executor stays the single
     // dispatcher, so there is exactly one execution semantics (retry/ledger/cap)
     // for every tool call.
-    let tool_defs: Vec<ToolSchema> = tools
-        .map(|executor| {
-            executor
-                .definitions()
-                .into_iter()
-                .map(|t| ToolSchema {
-                    name: t.name().to_string(),
-                    description: t.description().to_string(),
-                    parameters: t.parameters_schema(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // The catalog, not a copy of its schemas: `ProviderLlm::tool_schemas`
+    // renders it per turn, so a tool mounted after wiring is one the model can
+    // see without a restart.
+    let tool_catalog = tools.map(|executor| executor.catalog().clone());
 
     let wire = wire_for(config.provider);
     // Auth and the static headers are resolved together because Codex's headers
@@ -1277,7 +1299,7 @@ fn build_provider_llm(
 
     Ok(Arc::new(ProviderLlm {
         client: Arc::new(ProviderClient { endpoint, wire }),
-        tools: tool_defs,
+        tools: tool_catalog,
         default_model: config.model.clone(),
         provider: config.provider,
         cache_family: cache_family.map(str::to_string),
