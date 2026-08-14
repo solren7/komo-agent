@@ -233,15 +233,30 @@ pub async fn task_list(control: &OperatorControl) -> anyhow::Result<()> {
 
 /// A step's measured duration, at the precision a reader cares about: whole
 /// milliseconds below a second, then one decimal, then whole seconds.
-/// Token usage as a compact ` (12.3k tok)` suffix for the run list; empty when
-/// the provider reported nothing (0 = unknown, never "free").
-fn fmt_tokens(tokens_in: i64, tokens_out: i64) -> String {
+/// Token usage as a compact `  12.3k tok 78%↺` suffix for the run list; empty
+/// when the provider reported nothing (0 = unknown, never "free").
+///
+/// The trailing figure is the prompt-cache hit rate, shown only when the
+/// provider reported hits — a run list is where a broken prefix shows up as a
+/// column of low numbers, which no per-turn token count would reveal.
+fn fmt_tokens(tokens_in: i64, tokens_out: i64, tokens_cached: i64) -> String {
     let total = tokens_in.saturating_add(tokens_out);
-    match total {
-        0 => String::new(),
+    let tokens = match total {
+        0 => return String::new(),
         n if n < 1000 => format!("  {n} tok"),
         n => format!("  {:.1}k tok", n as f64 / 1000.0),
+    };
+    match hit_rate(tokens_in, tokens_cached) {
+        Some(rate) => format!("{tokens} {:.0}%↺", rate * 100.0),
+        None => tokens,
     }
+}
+
+/// The cache hit rate, or `None` when there is nothing to report: no prompt
+/// (unknown) or no hits at all, which reads the same as a provider that does
+/// not report cache accounting — better silent than a misleading `0%`.
+fn hit_rate(tokens_in: i64, tokens_cached: i64) -> Option<f64> {
+    (tokens_in > 0 && tokens_cached > 0).then(|| tokens_cached as f64 / tokens_in as f64)
 }
 
 fn fmt_elapsed(ms: i64) -> String {
@@ -284,7 +299,7 @@ pub async fn run_list(control: &OperatorControl, limit: usize) -> anyhow::Result
             if r.recoverable { " ⟲" } else { "" },
             local_time(r.started_at),
             if r.plan.is_empty() { "-" } else { &r.plan },
-            fmt_tokens(r.tokens_in, r.tokens_out),
+            fmt_tokens(r.tokens_in, r.tokens_out, r.tokens_cached),
             oneline(&r.input, 60),
         );
     }
@@ -320,7 +335,18 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
     // 0/0 means the provider reported no usage (or the row predates the columns),
     // so say nothing rather than claim a free turn.
     if run.tokens_in != 0 || run.tokens_out != 0 {
-        println!("tokens  {} in / {} out", run.tokens_in, run.tokens_out);
+        let cached = match hit_rate(run.tokens_in, run.tokens_cached) {
+            Some(rate) => format!(
+                " ({} cached, {:.0}% hit rate)",
+                run.tokens_cached,
+                rate * 100.0
+            ),
+            None => String::new(),
+        };
+        println!(
+            "tokens  {} in{cached} / {} out",
+            run.tokens_in, run.tokens_out
+        );
     }
     println!("input   {}", oneline(&run.input, 200));
     if !run.error.is_empty() {
@@ -462,5 +488,24 @@ mod tests {
         assert_eq!(fmt_elapsed(2500), "2.5s");
         assert_eq!(fmt_elapsed(9999), "10.0s");
         assert_eq!(fmt_elapsed(12_000), "12s");
+    }
+
+    /// The hit rate rides along with the token count when the provider reported
+    /// cache hits, and stays out of the way when it didn't.
+    #[test]
+    fn the_run_list_shows_a_hit_rate_only_when_there_is_one() {
+        assert_eq!(fmt_tokens(0, 0, 0), "", "no usage reported says nothing");
+        assert_eq!(fmt_tokens(700, 100, 0), "  800 tok");
+        assert_eq!(fmt_tokens(9_000, 1_000, 7_200), "  10.0k tok 80%↺");
+        // A cold first turn is a real 0%, but it reads identically to a
+        // provider that reports no cache accounting at all — so say neither.
+        assert_eq!(fmt_tokens(9_000, 1_000, 0), "  10.0k tok");
+    }
+
+    #[test]
+    fn a_hit_rate_needs_both_a_prompt_and_hits() {
+        assert_eq!(hit_rate(1_000, 250), Some(0.25));
+        assert_eq!(hit_rate(0, 0), None, "no prompt is unknown, not 0%");
+        assert_eq!(hit_rate(1_000, 0), None, "no hits reads as unreported");
     }
 }

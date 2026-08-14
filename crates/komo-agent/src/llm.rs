@@ -829,6 +829,7 @@ impl TurnLoop {
         self.usage.add(TokenUsage {
             input: completion.usage.input,
             output: completion.usage.output,
+            cached_input: completion.usage.cached_input,
         });
         self.rounds += 1;
         // Per-round token accounting, which is the only honest way to tune the

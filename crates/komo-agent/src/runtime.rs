@@ -229,6 +229,7 @@ impl AgentRuntime {
         if let Ok((_, usage)) = &outcome {
             run.tokens_in = usage.input;
             run.tokens_out = usage.output;
+            run.tokens_cached = usage.cached_input;
         }
         let outcome = outcome.map(|(reply, _)| reply);
         match &outcome {
@@ -793,10 +794,13 @@ mod tests {
             Ok(self.steps.pop_front().expect("script exhausted at step()"))
         }
         fn usage(&self) -> TokenUsage {
-            // A fixed, non-zero pair, so a test can tell "recorded" from "unknown".
+            // Fixed, non-zero counts, so a test can tell "recorded" from
+            // "unknown". `cached_input` is a subset of `input`, as the provider
+            // layer guarantees.
             TokenUsage {
                 input: 1_200,
                 output: 340,
+                cached_input: 900,
             }
         }
     }
@@ -1364,9 +1368,12 @@ mod tests {
     }
 
     /// #5: what the turn cost is recorded on the run, so `komo run list` can price
-    /// a conversation. 0 stays reserved for "the provider told us nothing".
+    /// a conversation — and how much of the prompt the provider's cache served,
+    /// which is the only way to tell a prompt change that broke prefix
+    /// stability from one that didn't. 0 stays reserved for "the provider told
+    /// us nothing".
     #[tokio::test]
-    async fn a_finished_turn_records_its_token_usage() {
+    async fn a_finished_turn_records_its_token_usage_and_cache_hits() {
         let db = Arc::new(Db::connect(&sqlite_url("komo_rt_tokens.db")).await.unwrap());
         let (rt, _) = scripted_runtime(db.clone(), vec![Step::Final("hi".into())], vec![], 30);
         rt.handle_input("cli:tok", "hello".into()).await.unwrap();
@@ -1374,6 +1381,7 @@ mod tests {
         let runs = RunRepository::list(&*db, 10).await.unwrap();
         assert_eq!(runs[0].tokens_in, 1_200);
         assert_eq!(runs[0].tokens_out, 340);
+        assert_eq!(runs[0].tokens_cached, 900);
     }
 
     /// #3: the turn's tool activity is folded onto the assistant message, so the

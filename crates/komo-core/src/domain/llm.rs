@@ -28,8 +28,13 @@ pub enum Step {
 /// the ledger treats both as absent, same convention as `elapsed_ms`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
+    /// Total prompt tokens, cache hits included (the provider layer normalizes
+    /// the wire formats to this one meaning).
     pub input: i64,
     pub output: i64,
+    /// The part of `input` the provider served from its prefix cache — always a
+    /// subset, so [`hit_rate`](Self::hit_rate) is a real ratio.
+    pub cached_input: i64,
 }
 
 impl TokenUsage {
@@ -38,10 +43,22 @@ impl TokenUsage {
     pub fn add(&mut self, other: TokenUsage) {
         self.input = self.input.saturating_add(other.input);
         self.output = self.output.saturating_add(other.output);
+        self.cached_input = self.cached_input.saturating_add(other.cached_input);
     }
 
     pub fn is_zero(&self) -> bool {
         self.input == 0 && self.output == 0
+    }
+
+    /// What fraction of the prompt the provider's cache served, or `None` when
+    /// there is nothing to divide by — a turn that reported no input at all,
+    /// which is *unknown* rather than a 0% hit rate.
+    ///
+    /// The number worth watching: a tool loop whose later rounds don't climb
+    /// means something upstream is changing the request prefix between rounds,
+    /// and every round is paying full price to re-send the same context.
+    pub fn hit_rate(&self) -> Option<f64> {
+        (self.input > 0).then(|| self.cached_input as f64 / self.input as f64)
     }
 }
 
@@ -194,5 +211,64 @@ impl TurnDriver for OneShotDriver {
         _interjected: Option<String>,
     ) -> anyhow::Result<Step> {
         Ok(Step::Final(self.0.take().unwrap_or_default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rounds fold together, cache hits included — a turn's rate is over the
+    /// whole turn, not just its last round.
+    #[test]
+    fn usage_accumulates_every_count_across_rounds() {
+        let mut usage = TokenUsage::default();
+        usage.add(TokenUsage {
+            input: 1_000,
+            output: 100,
+            cached_input: 0,
+        });
+        usage.add(TokenUsage {
+            input: 1_500,
+            output: 50,
+            cached_input: 1_000,
+        });
+        assert_eq!(usage.input, 2_500);
+        assert_eq!(usage.output, 150);
+        assert_eq!(usage.cached_input, 1_000);
+        assert_eq!(usage.hit_rate(), Some(0.4));
+    }
+
+    /// Nothing to divide by is *unknown*, not a 0% hit rate — the same
+    /// convention every zero in this struct follows.
+    #[test]
+    fn a_turn_that_reported_no_prompt_has_no_hit_rate() {
+        assert_eq!(TokenUsage::default().hit_rate(), None);
+        assert_eq!(
+            TokenUsage {
+                input: 0,
+                output: 40,
+                cached_input: 0,
+            }
+            .hit_rate(),
+            None
+        );
+    }
+
+    /// A saturating fold: a provider reporting nonsense must not panic a turn.
+    #[test]
+    fn accumulation_saturates_rather_than_overflowing() {
+        let mut usage = TokenUsage {
+            input: i64::MAX,
+            output: i64::MAX,
+            cached_input: i64::MAX,
+        };
+        usage.add(TokenUsage {
+            input: 10,
+            output: 10,
+            cached_input: 10,
+        });
+        assert_eq!(usage.input, i64::MAX);
+        assert_eq!(usage.cached_input, i64::MAX);
     }
 }

@@ -100,6 +100,13 @@ pub struct Run {
     pub tokens_in: i64,
     #[serde(default)]
     pub tokens_out: i64,
+    /// The part of `tokens_in` the provider served from its prefix cache — a
+    /// subset, so `tokens_cached / tokens_in` is the turn's cache hit rate.
+    /// Recorded because it is the only way to tell a prompt-assembly change
+    /// that broke prefix stability from one that didn't: the token count barely
+    /// moves either way, the hit rate collapses.
+    #[serde(default)]
+    pub tokens_cached: i64,
     /// Set on a run that continues an interrupted one from its turn journal —
     /// the audit link from the continuation back to the run whose context it
     /// picked up. `None` for ordinary turns and digest-primed resumes (those
@@ -124,6 +131,7 @@ impl Run {
             ended_at: None,
             tokens_in: 0,
             tokens_out: 0,
+            tokens_cached: 0,
             resumed_from: None,
         }
     }

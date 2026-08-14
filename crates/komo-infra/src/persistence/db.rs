@@ -172,6 +172,8 @@ struct RunRecord {
     /// `RUN_COLUMNS`); 0 = unknown, which is what a pre-column row reads as.
     tokens_in: i64,
     tokens_out: i64,
+    /// Cache-served part of `tokens_in`. Additive column; 0 = unknown.
+    tokens_cached: i64,
 
     /// Run id this run continued from (journal resume). Additive column;
     /// empty = none, same convention as `structured`.
@@ -305,6 +307,10 @@ impl Db {
                 ),
                 ("tokens_in", "\"tokens_in\" integer NOT NULL DEFAULT 0"),
                 ("tokens_out", "\"tokens_out\" integer NOT NULL DEFAULT 0"),
+                (
+                    "tokens_cached",
+                    "\"tokens_cached\" integer NOT NULL DEFAULT 0",
+                ),
                 ("resumed_from", "\"resumed_from\" text NOT NULL DEFAULT ''"),
             ];
             ensure_columns(p, "run_records", RUN_COLUMNS).await?;
@@ -1164,6 +1170,7 @@ impl RunRepository for Db {
                 ended_at: run.ended_at.unwrap_or(0),
                 tokens_in: run.tokens_in,
                 tokens_out: run.tokens_out,
+                tokens_cached: run.tokens_cached,
                 resumed_from: run.resumed_from.clone().unwrap_or_default(),
             })
             .exec(&mut conn)
@@ -1219,6 +1226,7 @@ impl RunRepository for Db {
                 .ended_at(run.ended_at.unwrap_or(0))
                 .tokens_in(run.tokens_in)
                 .tokens_out(run.tokens_out)
+                .tokens_cached(run.tokens_cached)
                 .exec(&mut conn)
                 .await?;
             Ok(())
@@ -1422,6 +1430,7 @@ fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
         ended_at: (record.ended_at != 0).then_some(record.ended_at),
         tokens_in: record.tokens_in,
         tokens_out: record.tokens_out,
+        tokens_cached: record.tokens_cached,
         resumed_from: (!record.resumed_from.is_empty()).then_some(record.resumed_from),
     })
 }
@@ -1771,6 +1780,7 @@ mod tests {
             ended_at: Some(started_at + 1),
             tokens_in: 0,
             tokens_out: 0,
+            tokens_cached: 0,
             resumed_from: None,
         };
         for (id, t) in [("run-a", 100), ("run-b", 200), ("run-c", 300)] {
@@ -2503,8 +2513,8 @@ mod tests {
         let runs = RunRepository::list(&db, 10).await.unwrap();
         assert!(runs[0].recoverable, "interrupted run became resumable");
         assert_eq!(
-            (runs[0].tokens_in, runs[0].tokens_out),
-            (0, 0),
+            (runs[0].tokens_in, runs[0].tokens_out, runs[0].tokens_cached),
+            (0, 0, 0),
             "pre-column rows read as unknown usage, not as a free turn"
         );
 
@@ -2512,11 +2522,15 @@ mod tests {
         let mut fresh = Run::start("cli:old", "how much did that cost");
         fresh.tokens_in = 900;
         fresh.tokens_out = 120;
+        fresh.tokens_cached = 700;
         RunRepository::start(&db, &fresh).await.unwrap();
         fresh.status = RunStatus::Done;
         RunRepository::finish(&db, &fresh).await.unwrap();
         let stored = RunRepository::get(&db, &fresh.id).await.unwrap().unwrap();
-        assert_eq!((stored.tokens_in, stored.tokens_out), (900, 120));
+        assert_eq!(
+            (stored.tokens_in, stored.tokens_out, stored.tokens_cached),
+            (900, 120, 700)
+        );
     }
 
     /// A stale watermark write (the runtime reviewer's detached task finishing

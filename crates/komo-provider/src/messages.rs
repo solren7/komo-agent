@@ -374,11 +374,17 @@ fn read_usage(usage: Option<&Value>) -> Usage {
         return Usage::default();
     };
     let field = |name: &str| usage.get(name).and_then(Value::as_i64).unwrap_or(0);
+    // Anthropic reports three *disjoint* prompt counts: `input_tokens` is what
+    // was neither read from nor written to the cache. `Usage::input` is the
+    // total, so they are summed — reporting only `input_tokens` would make this
+    // provider's `tokens_in` mean something different from every other one's,
+    // and would put `cached_input` outside the total it is supposed to be a
+    // subset of.
+    let cache_read = field("cache_read_input_tokens");
     Usage {
-        input: field("input_tokens"),
+        input: field("input_tokens") + field("cache_creation_input_tokens") + cache_read,
         output: field("output_tokens"),
-        // Anthropic splits cache accounting in two; reads are the hits.
-        cached_input: field("cache_read_input_tokens"),
+        cached_input: cache_read,
     }
 }
 
@@ -593,15 +599,36 @@ mod tests {
         assert!(error.is_retryable());
     }
 
+    /// Anthropic's three prompt counts are disjoint, so `input` is their sum —
+    /// otherwise this provider's `tokens_in` would exclude exactly the tokens
+    /// every other provider's includes, and the hit rate would read 80/100
+    /// here instead of the true 80/200.
     #[test]
-    fn usage_reads_input_output_and_cache_hits() {
+    fn usage_totals_the_three_disjoint_prompt_counts() {
         let usage = read_usage(Some(&json!({
             "input_tokens": 100,
             "output_tokens": 20,
+            "cache_creation_input_tokens": 20,
             "cache_read_input_tokens": 80
         })));
-        assert_eq!(usage.input, 100);
+        assert_eq!(usage.input, 200, "uncached + cache-write + cache-read");
         assert_eq!(usage.output, 20);
         assert_eq!(usage.cached_input, 80);
+        assert!(
+            usage.cached_input <= usage.input,
+            "cache hits are a subset of the prompt"
+        );
+    }
+
+    /// A response with no cache accounting at all still reports its prompt in
+    /// full — the missing fields read as zero, not as a smaller total.
+    #[test]
+    fn usage_without_cache_fields_is_just_the_prompt() {
+        let usage = read_usage(Some(&json!({
+            "input_tokens": 100,
+            "output_tokens": 20
+        })));
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.cached_input, 0);
     }
 }

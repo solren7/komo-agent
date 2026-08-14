@@ -107,11 +107,19 @@ pub struct ToolSchema {
 /// means none, matching `domain::llm::TokenUsage`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// **Total** prompt tokens the round sent, cache hits included.
+    ///
+    /// Normalized here because the providers disagree: the Responses wire
+    /// reports a total with `cached_tokens` as a subset of it, while Anthropic
+    /// reports three disjoint counts (uncached / cache-write / cache-read) that
+    /// have to be summed. Left as each provider reports it, `tokens_in` means a
+    /// different thing per provider and `cached_input / input` is not a rate at
+    /// all — for Anthropic it would exceed 1.
     pub input: i64,
     pub output: i64,
-    /// Prompt tokens served from the provider's prefix cache, when reported.
-    /// Logged rather than billed — it is how we tell whether the cache-warming
-    /// work in `RigLlm::assemble` is actually paying off.
+    /// The part of `input` the provider served from its prefix cache — always a
+    /// subset, so `cached_input / input` is the round's cache hit rate. Zero is
+    /// *unknown* as much as it is "no hits", like every other count here.
     pub cached_input: i64,
 }
 
