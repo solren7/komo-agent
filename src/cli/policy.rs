@@ -140,7 +140,7 @@ pub fn check(
 ) -> anyhow::Result<()> {
     let Some(cat) = Category::parse(category) else {
         anyhow::bail!(
-            "unknown category `{category}` (expected shell | file | network | homeassistant | mcp | wiki)"
+            "unknown category `{category}` (expected shell | file | network | homeassistant | mcp | wiki | plugin)"
         );
     };
 
@@ -193,6 +193,15 @@ pub fn check(
                 "rebuild" => Risk::Dangerous,
                 _ => Risk::Normal,
             },
+        ),
+        Category::Plugin => (
+            ActionRef::Plugin {
+                tool: target.to_string(),
+            },
+            // Mirror `PyTool`: plugin code is unsandboxed and arrived without
+            // anyone reading it, so it is always a `Normal` that must be
+            // granted rather than assumed.
+            Risk::Normal,
         ),
         Category::Mcp => {
             let Some((server, tool)) = target.split_once('.') else {

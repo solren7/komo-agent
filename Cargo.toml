@@ -20,6 +20,8 @@ komo-services = { path = "crates/komo-services" }
 komo-tools = { path = "crates/komo-tools" }
 # The generic MCP client, used by wiring to mount `[mcp.servers.*]` tools.
 komo-mcp = { path = "crates/komo-mcp" }
+# The out-of-process Python plugin host (`~/.komo/plugins/*.py`).
+komo-pyhost = { path = "crates/komo-pyhost" }
 # The agent: tool loop, gateway, sweeps, and the provider client it drives.
 komo-agent = { path = "crates/komo-agent" }
 # Note-vault vector search. Its own crate so its ~130 vector dependencies stay
@@ -134,6 +136,7 @@ members = [
     "crates/komo-core",
     "crates/komo-config",
     "crates/komo-provider",
+    "crates/komo-pyhost",
     "crates/komo-mcp",
     "crates/komo-infra",
     "crates/komo-services",

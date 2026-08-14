@@ -44,6 +44,10 @@ pub enum ActionRef {
     /// actions differ enormously in cost and consequence — `rebuild` drops the
     /// index before refilling it.
     Wiki { action: String },
+    /// A tool a local plugin registered, matched against the plugin's own tool
+    /// name (un-namespaced, so a rule reads `value = "strlen"` rather than
+    /// carrying komo's `py__` catalog prefix).
+    Plugin { tool: String },
 }
 
 /// A request for the user to approve a side-effecting action.

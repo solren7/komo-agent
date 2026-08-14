@@ -240,8 +240,14 @@ pub async fn build(
     // silences a plugin uniformly. MCP/wiki failures degrade (warn, boot on).
     let roster = plugins::builtin();
     let gate = plugins::PluginGate::new(config, &roster);
+    // The catalogs exist before phase 1 so a plugin that mounts tools *later*
+    // — the python plugin host, which can gain a tool the moment a file is
+    // written — has something to mount into. Static contributions still go
+    // through the registry; wiring fills each catalog from it below.
+    let catalogs = Arc::new(plugins::ScopedCatalogs::default());
     let tool_cx = ToolCx {
         config,
+        catalogs: catalogs.clone(),
         db: db.clone(),
         kanban: kanban.clone(),
         cron_jobs: cron_jobs.clone(),
@@ -290,7 +296,8 @@ pub async fn build(
                         approver: Arc<dyn Approver>,
                         delegate: Option<Arc<DelegateTool>>|
      -> ToolExecutor {
-        let mut tools = ToolExecutor::new(
+        let mut tools = ToolExecutor::with_catalog(
+            catalogs.of(scope).clone(),
             ToolExecutionConfig::with_result_cap(model_config.max_tool_result_bytes)
                 .with_turn_budget(model_config.max_turn_result_bytes)
                 .with_call_timeout_secs(model_config.tool_timeout_secs),

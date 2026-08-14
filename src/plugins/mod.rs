@@ -28,6 +28,7 @@
 
 pub mod channels;
 pub mod mcp;
+pub mod pyhost;
 pub mod sweeps;
 pub mod tools;
 pub mod wiki;
@@ -41,6 +42,7 @@ use komo_agent::gateway::{Channel, MaintenanceService};
 use komo_agent::review_coordinator::ReviewCoordinator;
 use komo_agent::runtime::AgentRuntime;
 use komo_config::ConfigSnapshot;
+use komo_core::domain::catalog::ToolCatalog;
 use komo_core::domain::hooks::{ToolHook, TurnHook};
 use komo_core::domain::tool::Tool;
 use komo_infra::persistence::{db::Db, kanban::KanbanDb};
@@ -149,6 +151,7 @@ pub fn builtin() -> Vec<Arc<dyn Plugin>> {
         Arc::new(wiki::WikiPlugin),
         Arc::new(tools::HomeAssistantPlugin),
         Arc::new(mcp::McpPlugin),
+        Arc::new(pyhost::PyHostPlugin),
         Arc::new(channels::FeishuPlugin),
         Arc::new(channels::TelegramPlugin),
         Arc::new(channels::WeChatPlugin),
@@ -261,11 +264,65 @@ run_phase!(
 
 // ── Phase 1: tools ───────────────────────────────────────────────────────────
 
+/// One tool catalog per runtime.
+///
+/// Separate rather than shared because the runtimes deliberately differ: the
+/// briefing agent gets read-only tools, the others get the full set. A plugin
+/// mounting at runtime picks which of them it belongs in — and a `Scope` is how
+/// it says so, the same vocabulary the static registrations use.
+pub struct ScopedCatalogs {
+    main: Arc<ToolCatalog>,
+    subagent: Arc<ToolCatalog>,
+    cron: Arc<ToolCatalog>,
+    briefing: Arc<ToolCatalog>,
+}
+
+impl Default for ScopedCatalogs {
+    fn default() -> Self {
+        Self {
+            main: Arc::new(ToolCatalog::new()),
+            subagent: Arc::new(ToolCatalog::new()),
+            cron: Arc::new(ToolCatalog::new()),
+            briefing: Arc::new(ToolCatalog::new()),
+        }
+    }
+}
+
+impl ScopedCatalogs {
+    /// The catalog for one runtime.
+    pub fn of(&self, runtime: Scope) -> &Arc<ToolCatalog> {
+        match runtime {
+            Scope::SUBAGENT => &self.subagent,
+            Scope::CRON => &self.cron,
+            Scope::BRIEFING => &self.briefing,
+            // MAIN, and any composite — a caller asking for "the catalog" of a
+            // multi-runtime scope means the conversation's.
+            _ => &self.main,
+        }
+    }
+
+    /// Every catalog `scope` covers, for a plugin mounting into all of them at
+    /// once (`Scope::AGENTIC` is the usual one: everything but the unattended
+    /// briefing).
+    pub fn covered_by(&self, scope: Scope) -> Vec<Arc<ToolCatalog>> {
+        [Scope::MAIN, Scope::SUBAGENT, Scope::CRON, Scope::BRIEFING]
+            .into_iter()
+            .filter(|runtime| scope.contains(*runtime))
+            .map(|runtime| self.of(runtime).clone())
+            .collect()
+    }
+}
+
 /// Shared dependencies phase-1 plugins construct tools from. All host-built:
 /// the host owns storage, workspace and the memory/skill services; plugins
 /// own what is made of them.
 pub struct ToolCx<'a> {
     pub config: &'a ConfigSnapshot,
+    /// The per-runtime catalogs, created before this phase so a plugin that
+    /// mounts tools *later* (a plugin host connecting, a server appearing) has
+    /// something to mount into. Static contributions go through
+    /// [`ToolRegistry::tool`] instead — wiring fills the catalogs from it.
+    pub catalogs: Arc<ScopedCatalogs>,
     pub db: Arc<Db>,
     pub kanban: Arc<KanbanDb>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
@@ -607,6 +664,7 @@ mod tests {
         let memory_repo: Arc<dyn MemoryRepository> = Arc::new(memory_db);
         ToolCx {
             config,
+            catalogs: Arc::new(ScopedCatalogs::default()),
             db: db.clone(),
             kanban: Arc::new(
                 komo_infra::persistence::kanban::KanbanDb::connect("turso::memory:")

@@ -104,6 +104,10 @@ fn policy_scope(name: &str) -> Option<(Category, Option<Access>)> {
         // prefix covers them all — a `deny mcp any` rule drops the lot from the
         // catalog rather than paying a schema each to refuse them per call.
         name if name.starts_with("mcp__") => Some((Category::Mcp, None)),
+        // Same trick for plugin-registered tools (`py__<tool>`): one prefix
+        // covers a set whose members are only known at runtime, so a
+        // `deny plugin any` rule is enforceable even though the names were not.
+        name if name.starts_with("py__") => Some((Category::Plugin, None)),
         _ => None,
     }
 }

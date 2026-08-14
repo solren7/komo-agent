@@ -3424,6 +3424,7 @@ dependencies = [
  "komo-infra",
  "komo-mcp",
  "komo-provider",
+ "komo-pyhost",
  "komo-services",
  "komo-tools",
  "komo-wiki",
@@ -3571,6 +3572,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "komo-pyhost"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "komo-services"
 version = "0.1.0"
 dependencies = [
@@ -3603,6 +3616,7 @@ dependencies = [
  "komo-core",
  "komo-infra",
  "komo-mcp",
+ "komo-pyhost",
  "komo-services",
  "libc",
  "reqwest 0.13.4",

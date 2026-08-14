@@ -27,6 +27,15 @@ pub enum Category {
     Mcp,
     /// Note-vault index maintenance (`wiki_index`), targeted by action name.
     Wiki,
+    /// Tools a local plugin registered (`~/.komo/plugins/*.py`), targeted by
+    /// the plugin's own tool name.
+    ///
+    /// Its own category rather than folded into [`Mcp`](Self::Mcp): both are
+    /// code komo did not write, but a plugin is *local* code the operator (or
+    /// the agent, under approval) authored on this machine, while an MCP server
+    /// is a remote party. An operator who trusts their own plugins should not
+    /// have to trust every remote to say so.
+    Plugin,
 }
 
 impl Category {
@@ -40,6 +49,7 @@ impl Category {
             "homeassistant" | "ha" => Some(Self::HomeAssistant),
             "mcp" => Some(Self::Mcp),
             "wiki" => Some(Self::Wiki),
+            "plugin" | "plugins" => Some(Self::Plugin),
             _ => None,
         }
     }
@@ -229,6 +239,7 @@ impl Rule {
                 None,
             ),
             ActionRef::Wiki { action } => (Category::Wiki, Matcher::Exact, action.clone(), None),
+            ActionRef::Plugin { tool } => (Category::Plugin, Matcher::Exact, tool.clone(), None),
         };
         Some(Rule {
             channels: Some(vec![channel.to_string()]),
@@ -329,6 +340,7 @@ impl Rule {
                 .matcher
                 .matches(&self.value, &format!("{server}.{tool}")),
             ActionRef::Wiki { action } => self.matcher.matches(&self.value, action),
+            ActionRef::Plugin { tool } => self.matcher.matches(&self.value, tool),
         }
     }
 }
@@ -702,6 +714,7 @@ pub fn category_str(c: Category) -> &'static str {
         Category::HomeAssistant => "homeassistant",
         Category::Mcp => "mcp",
         Category::Wiki => "wiki",
+        Category::Plugin => "plugin",
     }
 }
 
@@ -723,6 +736,7 @@ fn category_of(action: &ActionRef) -> Category {
         ActionRef::Service { .. } => Category::HomeAssistant,
         ActionRef::Mcp { .. } => Category::Mcp,
         ActionRef::Wiki { .. } => Category::Wiki,
+        ActionRef::Plugin { .. } => Category::Plugin,
     }
 }
 

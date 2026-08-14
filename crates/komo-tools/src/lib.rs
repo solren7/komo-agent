@@ -23,6 +23,7 @@ pub mod http;
 pub mod logs;
 pub mod mcp;
 pub mod memory;
+pub mod plugin;
 pub mod read;
 pub mod reminder;
 pub mod session;
