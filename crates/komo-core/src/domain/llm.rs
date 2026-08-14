@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::session::Session;
+use super::turn_journal::{JournalEntry, TurnJournal};
 
 /// One model round-trip's outcome inside komo's own tool loop. The loop lives
 /// in `AgentRuntime` (not rig — roadmap §7), so it can insert control points
@@ -138,6 +139,10 @@ pub trait LlmClient: Send + Sync {
     /// produced; `None` when nothing is watching. A backend is free to ignore it
     /// (the default one-shot driver does).
     ///
+    /// `journal` is the turn journal to record this turn's provider-level state
+    /// into (see `domain::turn_journal`); `None` for callers that don't keep
+    /// one (aux paths, tests). Backends without provider-shaped state ignore it.
+    ///
     /// The default is a single-shot driver wrapping [`complete`](LlmClient::complete):
     /// it answers in one round with no tool calls. Tool-less backends (and test
     /// stubs) inherit this for free; the real provider client overrides it with a
@@ -146,9 +151,31 @@ pub trait LlmClient: Send + Sync {
         &self,
         session: &Session,
         _deltas: Option<Arc<dyn DeltaSink>>,
+        _journal: Option<Arc<dyn TurnJournal>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
         let reply = self.complete(session).await?;
         Ok(Box::new(OneShotDriver(Some(reply))))
+    }
+
+    /// Reopen an interrupted turn from its journal rows, returning a driver
+    /// that continues from exactly where the turn stopped (same model, same
+    /// prompt bytes, tool rounds already paid for replayed from the journal
+    /// instead of re-run).
+    ///
+    /// `journal` records the *continuation* under its own run, so a second
+    /// interruption resumes from the continuation rather than from scratch.
+    ///
+    /// Default: unsupported — the caller falls back to the digest-primed fresh
+    /// turn (`domain::run::resume_prompt`). Only the provider-backed client
+    /// can rebuild provider-shaped state.
+    async fn resume_turn(
+        &self,
+        _session: &Session,
+        _entries: &[JournalEntry],
+        _deltas: Option<Arc<dyn DeltaSink>>,
+        _journal: Option<Arc<dyn TurnJournal>>,
+    ) -> anyhow::Result<Box<dyn TurnDriver>> {
+        anyhow::bail!("this backend cannot resume a turn from a journal")
     }
 }
 

@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::run::Run;
+
 /// Processes one inbound message for a session and returns the agent's reply.
 ///
 /// This is the seam between an ingress channel (which knows a transport — a unix
@@ -10,6 +12,16 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait MessageHandler: Send + Sync {
     async fn handle(&self, session_id: &str, input: String) -> anyhow::Result<String>;
+
+    /// Continue an interrupted run from its turn journal, in place — no new
+    /// user message, the tool rounds already paid for replayed rather than
+    /// re-run. `Ok(None)` = this handler can't (no journal, or the run isn't
+    /// continuable); the caller falls back to a digest-primed [`handle`] turn.
+    ///
+    /// [`handle`]: MessageHandler::handle
+    async fn resume_interrupted(&self, _run: &Run) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Sends a message back into the conversation a turn belongs to, on the same

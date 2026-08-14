@@ -45,6 +45,13 @@ impl MessageHandler for AgentRuntime {
     async fn handle(&self, session_id: &str, input: String) -> anyhow::Result<String> {
         self.handle_input(session_id, input).await
     }
+
+    async fn resume_interrupted(
+        &self,
+        run: &komo_core::domain::run::Run,
+    ) -> anyhow::Result<Option<String>> {
+        AgentRuntime::resume_interrupted(self, run).await
+    }
 }
 
 /// A long-lived ingress: accepts inbound messages over some transport and routes

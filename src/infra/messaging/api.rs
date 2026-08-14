@@ -1204,17 +1204,29 @@ async fn resume_run(
     } else {
         SessionContext::detached(&run.session_id)
     };
-    let reply = with_session(ctx, state.handler.handle(&run.session_id, input)).await?;
+    // Journal-continue first: the interrupted turn picks up exactly where it
+    // stopped, tool rounds already paid for replayed instead of re-run. Only
+    // when the run isn't continuable (no journal, transcript already answered)
+    // does the digest-primed fresh turn run — yesterday's behavior, verbatim.
+    let (reply, continued) =
+        match with_session(ctx.clone(), state.handler.resume_interrupted(&run)).await? {
+            Some(reply) => (reply, true),
+            None => (
+                with_session(ctx, state.handler.handle(&run.session_id, input)).await?,
+                false,
+            ),
+        };
 
     if let Err(error) = state.actions.runs.mark_resumed(&id).await {
         warn!(%error, run_id = %id, "failed to clear recoverable flag after resume");
     }
-    info!(run_id = %id, session = %run.session_id, "run resumed");
+    info!(run_id = %id, session = %run.session_id, continued, "run resumed");
     Ok(Json(ResumeOutcome {
         run_id: id,
         session_id: run.session_id,
         steps: steps.len(),
         reply,
+        continued,
     })
     .into_response())
 }

@@ -545,6 +545,7 @@ pub async fn build(
         // A sub-agent's transcript is scratch work, not a conversation to learn
         // from — the reviewer only ever sees the real one.
         review: None,
+        journal: None,
     });
     let delegate = Arc::new(DelegateTool::new(
         subagent_runtime,
@@ -633,6 +634,9 @@ pub async fn build(
         // model will replay (no full-transcript read on long chat sessions).
         history_window: model_config.max_history_messages,
         review: Some(review.clone()),
+        // The one runtime whose turns are worth resuming: conversations. The
+        // aux runtimes below journal nothing — their turns re-dispatch whole.
+        journal: Some(db.clone()),
     };
 
     // ── Cron agent runtime (general cron, agent mode) ────────────────────────
@@ -688,6 +692,7 @@ pub async fn build(
         max_turns: model_config.max_turns,
         history_window: model_config.max_history_messages,
         review: None,
+        journal: None,
     });
 
     // ── Briefing runtime (roadmap §2) ────────────────────────────────────────
@@ -754,6 +759,7 @@ pub async fn build(
         max_turns: BRIEFING_MAX_TURNS,
         history_window: model_config.max_history_messages,
         review: None,
+        journal: None,
     });
 
     Ok(Wiring {

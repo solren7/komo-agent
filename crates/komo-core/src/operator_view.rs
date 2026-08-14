@@ -78,6 +78,11 @@ pub struct ResumeOutcome {
     /// How many completed steps the priming digest handed to the model.
     pub steps: usize,
     pub reply: String,
+    /// `true` when the turn was *continued* from its journal (exact state,
+    /// no re-run); `false` for the digest-primed fresh turn. `default` so an
+    /// older gateway's response still parses.
+    #[serde(default)]
+    pub continued: bool,
 }
 
 /// One candidate in the dreaming preview, carrying the signals behind its

@@ -100,6 +100,12 @@ pub struct Run {
     pub tokens_in: i64,
     #[serde(default)]
     pub tokens_out: i64,
+    /// Set on a run that continues an interrupted one from its turn journal —
+    /// the audit link from the continuation back to the run whose context it
+    /// picked up. `None` for ordinary turns and digest-primed resumes (those
+    /// are fresh turns, not continuations).
+    #[serde(default)]
+    pub resumed_from: Option<String>,
 }
 
 impl Run {
@@ -118,6 +124,7 @@ impl Run {
             ended_at: None,
             tokens_in: 0,
             tokens_out: 0,
+            resumed_from: None,
         }
     }
 }

@@ -15,7 +15,12 @@
 use serde::{Deserialize, Serialize};
 
 /// One message in the conversation sent to the provider.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serde on this family (and [`Completion`]) exists for exactly one consumer:
+/// the turn journal, which persists an in-flight turn's provider-level state so
+/// an interrupted turn can be resumed byte-faithfully. The wire codecs never
+/// serialize these shapes — each renders its own provider format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Turn {
     User(Vec<UserBlock>),
     Assistant {
@@ -44,7 +49,7 @@ impl Turn {
 
 /// A block inside a user message: either something the human said or the result
 /// of a tool the model asked for.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UserBlock {
     Text(String),
     ToolResult {
@@ -58,7 +63,7 @@ pub enum UserBlock {
 }
 
 /// A block inside an assistant message.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AssistantBlock {
     Text(String),
     ToolCall {
@@ -100,7 +105,7 @@ pub struct ToolSchema {
 
 /// Tokens one provider response reported. Zero means *unknown* as much as it
 /// means none, matching `domain::llm::TokenUsage`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input: i64,
     pub output: i64,
@@ -112,10 +117,11 @@ pub struct Usage {
 
 /// One completed model round-trip: the assistant message it produced, plus what
 /// it cost.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Completion {
     pub id: Option<String>,
     pub blocks: Vec<AssistantBlock>,
+    #[serde(default)]
     pub usage: Usage,
 }
 
@@ -129,5 +135,57 @@ impl Completion {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_and_completion_survive_a_serde_round_trip() {
+        let turns = vec![
+            Turn::User(vec![
+                UserBlock::Text("hi".into()),
+                UserBlock::ToolResult {
+                    id: "item_1".into(),
+                    call_id: Some("call_1".into()),
+                    text: "result body".into(),
+                },
+            ]),
+            Turn::Assistant {
+                id: Some("msg_1".into()),
+                blocks: vec![
+                    AssistantBlock::Reasoning(Reasoning {
+                        id: Some("rs_1".into()),
+                        summary: vec!["thinking…".into()],
+                        encrypted: Some("opaque-blob".into()),
+                    }),
+                    AssistantBlock::Text("let me check".into()),
+                    AssistantBlock::ToolCall {
+                        id: "item_2".into(),
+                        call_id: None,
+                        name: "shell".into(),
+                        args: r#"{"command":"ls"}"#.into(),
+                    },
+                ],
+            },
+        ];
+        let json = serde_json::to_string(&turns).unwrap();
+        let back: Vec<Turn> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, turns);
+
+        let completion = Completion {
+            id: Some("msg_2".into()),
+            blocks: vec![AssistantBlock::Text("done".into())],
+            usage: Usage {
+                input: 10,
+                output: 5,
+                cached_input: 8,
+            },
+        };
+        let json = serde_json::to_string(&completion).unwrap();
+        let back: Completion = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, completion);
     }
 }

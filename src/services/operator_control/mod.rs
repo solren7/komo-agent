@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 pub use request::*;
 
-use crate::domain::run::RunRepository;
+use crate::domain::run::{Run, RunRepository};
 use crate::infra::gateway_client::GatewayClient;
 use komo_config::RuntimeConfig;
 use komo_infra::persistence::{db::Db, kanban::KanbanDb};
@@ -107,17 +107,19 @@ impl OperatorControl {
     /// action runs server-side (trusted loopback). On the direct backend the
     /// turn itself must run in the caller's process — interactive approval
     /// needs a human at the terminal — so the caller supplies `local_turn`,
-    /// which receives the already-open stores plus the session id and priming
-    /// input, and returns the reply. Eligibility, the priming digest, and the
-    /// at-most-once `recoverable` clear all stay in here.
+    /// which receives the already-open stores plus the run and the digest
+    /// priming input, and returns the reply plus whether it *continued* from
+    /// the turn journal (vs re-running fresh from the digest). Eligibility,
+    /// the priming digest, and the at-most-once `recoverable` clear all stay
+    /// in here.
     pub async fn resume_run<F, Fut>(
         &self,
         id: Option<String>,
         local_turn: F,
     ) -> anyhow::Result<ResumeOutcome>
     where
-        F: FnOnce(Arc<Db>, Arc<KanbanDb>, String, String) -> Fut,
-        Fut: Future<Output = anyhow::Result<String>>,
+        F: FnOnce(Arc<Db>, Arc<KanbanDb>, Run, String) -> Fut,
+        Fut: Future<Output = anyhow::Result<(String, bool)>>,
     {
         let target_id = match id {
             Some(id) => id,
@@ -149,8 +151,8 @@ impl OperatorControl {
                     }
                     actions::ResumeTarget::Ready { run, steps, input } => {
                         let kanban = direct.kanban().await?.clone();
-                        let reply =
-                            local_turn(db.clone(), kanban, run.session_id.clone(), input).await?;
+                        let session_id = run.session_id.clone();
+                        let (reply, continued) = local_turn(db.clone(), kanban, run, input).await?;
                         // Clear the flag only after a turn was actually
                         // dispatched; best-effort, like every ledger write.
                         if let Err(error) =
@@ -160,9 +162,10 @@ impl OperatorControl {
                         }
                         Ok(ResumeOutcome {
                             run_id: target_id,
-                            session_id: run.session_id,
+                            session_id,
                             steps: steps.len(),
                             reply,
+                            continued,
                         })
                     }
                 }
@@ -329,14 +332,14 @@ mod tests {
         let control = direct(temp_urls("resume"));
         // Nothing recoverable at all.
         let err = control
-            .resume_run(None, |_, _, _, _| async { Ok(String::new()) })
+            .resume_run(None, |_, _, _, _| async { Ok((String::new(), false)) })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no recoverable runs"));
         // An explicit unknown id.
         let err = control
             .resume_run(Some("run-x".into()), |_, _, _, _| async {
-                Ok(String::new())
+                Ok((String::new(), false))
             })
             .await
             .unwrap_err();
@@ -352,7 +355,7 @@ mod tests {
         RunRepository::start(db.as_ref(), &run).await.unwrap();
         let err = control
             .resume_run(Some(run_id.clone()), |_, _, _, _| async {
-                Ok(String::new())
+                Ok((String::new(), false))
             })
             .await
             .unwrap_err();
@@ -364,17 +367,19 @@ mod tests {
             .await
             .unwrap();
         let outcome = control
-            .resume_run(Some(run_id.clone()), |_, _, session, input| async move {
-                assert_eq!(session, "cli:test");
+            .resume_run(Some(run_id.clone()), |_, _, run, input| async move {
+                assert_eq!(run.session_id, "cli:test");
                 assert!(input.contains("hello"), "priming digest carries the input");
-                Ok("done".to_string())
+                Ok(("done".to_string(), false))
             })
             .await
             .unwrap();
         assert_eq!(outcome.run_id, run_id);
         assert_eq!(outcome.reply, "done");
         let again = control
-            .resume_run(Some(run_id), |_, _, _, _| async { Ok(String::new()) })
+            .resume_run(Some(run_id), |_, _, _, _| async {
+                Ok((String::new(), false))
+            })
             .await
             .unwrap_err();
         assert!(

@@ -3,13 +3,17 @@ use komo_core::domain::{
     cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
     events::{ToolEventSink, TurnEvent},
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
-    message::Message,
+    message::{Message, Role},
     repository::{MessageRepository, SessionRepository},
     run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
     session::Session,
+    turn_journal::{JournalEntry, JournalKind, TurnJournal, TurnJournalRepository},
 };
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+use async_trait::async_trait;
 
 use tracing::{Instrument, info, info_span, warn};
 
@@ -62,6 +66,51 @@ pub struct AgentRuntime {
     /// Post-turn reviews go through the shared coordinator (also driven by the
     /// gateway's scheduled sweep); `None` = no reflective reviewing.
     pub review: Option<Arc<ReviewCoordinator>>,
+    /// Turn-journal store: each turn's provider-level state, persisted so an
+    /// interrupted turn can be continued (`resume_interrupted`) instead of
+    /// re-run. `None` — aux runtimes (delegate/cron/briefing) — journals
+    /// nothing: their turns are re-dispatched whole, never resumed.
+    pub journal: Option<Arc<dyn TurnJournalRepository>>,
+}
+
+/// Binds one turn's journal writes to its ledger run: assigns `seq`, and disarms
+/// itself after the first failed write — the journal buys resumability, and a
+/// broken store must cost exactly that, not per-round latency or the turn.
+struct RunJournal {
+    repo: Arc<dyn TurnJournalRepository>,
+    run_id: String,
+    seq: AtomicI64,
+    broken: AtomicBool,
+}
+
+impl RunJournal {
+    fn new(repo: Arc<dyn TurnJournalRepository>, run_id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            repo,
+            run_id: run_id.to_string(),
+            seq: AtomicI64::new(0),
+            broken: AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl TurnJournal for RunJournal {
+    async fn record(&self, kind: JournalKind, payload: String) {
+        if self.broken.load(Ordering::Relaxed) {
+            return;
+        }
+        let entry = JournalEntry {
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            kind,
+            payload,
+        };
+        if let Err(error) = self.repo.append(&self.run_id, &entry).await {
+            warn!(%error, run_id = %self.run_id,
+                "turn journal write failed; journaling disabled for this turn");
+            self.broken.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -86,12 +135,69 @@ impl AgentRuntime {
         self.run_turn(session_id, user_input).await
     }
 
+    /// Continue an interrupted run from its turn journal: rebuild the exact
+    /// provider-level state the turn died with and drive the same agent loop
+    /// forward — the tool rounds already paid for are replayed from the
+    /// journal, not re-run. The continuation is its own ledger [`Run`], linked
+    /// back through `resumed_from`.
+    ///
+    /// `Ok(None)` = this run *cannot* be continued (no journal store, no rows,
+    /// or the transcript already ends in a reply); nothing was touched, and the
+    /// caller falls back to the digest-primed fresh turn. `Err` = the
+    /// continuation was attempted and genuinely failed.
+    pub async fn resume_interrupted(&self, original: &Run) -> anyhow::Result<Option<String>> {
+        let Some(repo) = self.journal.as_ref() else {
+            return Ok(None);
+        };
+        let entries = repo.load(&original.id).await?;
+        if entries.is_empty() {
+            info!(run_id = %original.id, "no turn journal; falling back to digest resume");
+            return Ok(None);
+        }
+        // A continuation appends an assistant reply with no new user message,
+        // so the transcript must still end on the interrupted turn's user
+        // message. Ending on anything else means the reply actually landed
+        // (crash in the gap before the ledger closed), or the crash predated
+        // the user message — either way a fresh turn is the right shape.
+        // Checked here, before a ledger run is opened, so the refusal leaves
+        // no failed-run residue; `turn_body` re-checks as a backstop.
+        let ends_on_user = self
+            .sessions
+            .find_windowed(&original.session_id, self.history_window)
+            .await?
+            .and_then(|s| s.messages.last().map(|m| m.role == Role::User))
+            .unwrap_or(false);
+        if !ends_on_user {
+            info!(run_id = %original.id,
+                "transcript does not end on a user message; falling back to digest resume");
+            return Ok(None);
+        }
+
+        let mut run = Run::start(&original.session_id, &original.input);
+        run.resumed_from = Some(original.id.clone());
+        let turn = self.run_ledgered(run, TurnKind::Resume { entries });
+        // Same ambient-context bridge as `handle_input`: session-scoped tools
+        // and the approvers read the turn's session from the task-local.
+        let reply = if current_session().is_none() {
+            let ctx = SessionContext::detached(&original.session_id);
+            with_session(ctx, turn).await?
+        } else {
+            turn.await?
+        };
+        Ok(Some(reply))
+    }
+
     /// One turn = one [`Run`]. Opens a ledger entry, runs the turn body under a
     /// `RunContext` (so tool calls record steps) and a `run` tracing span, then
     /// finalizes the entry with the outcome. All ledger writes are best-effort:
     /// a ledger failure is logged but never changes the turn's result.
     async fn run_turn(&self, session_id: &str, user_input: String) -> anyhow::Result<String> {
-        let mut run = Run::start(session_id, &user_input);
+        let run = Run::start(session_id, &user_input);
+        self.run_ledgered(run, TurnKind::Fresh { user_input }).await
+    }
+
+    async fn run_ledgered(&self, mut run: Run, kind: TurnKind) -> anyhow::Result<String> {
+        let session_id = run.session_id.clone();
         if let Err(error) = self.runs.start(&run).await {
             warn!(%error, "failed to open run ledger entry (non-fatal)");
         }
@@ -103,7 +209,7 @@ impl AgentRuntime {
         let probe = ctx.clone();
 
         let outcome = self
-            .turn_body(session_id, user_input, ctx)
+            .turn_body(&session_id, kind, ctx)
             .instrument(span)
             .await;
 
@@ -144,16 +250,39 @@ impl AgentRuntime {
             warn!(%error, "failed to finalize run ledger entry (non-fatal)");
         }
 
+        // Journal lifecycle: a delivered or deliberately-stopped turn has
+        // nothing left to resume, so its rows go; a *failed* turn keeps them
+        // (they are the debugging record of what the model actually saw, and
+        // the seed of a future failed-turn resume). A continuation that
+        // delivered also clears the original's rows — the interruption it was
+        // covering is over. Best-effort like every ledger interaction.
+        let stopped_clean = matches!(run.status, RunStatus::Done) || run.error == CANCELLED_ERROR;
+        if stopped_clean && let Some(repo) = &self.journal {
+            if let Err(error) = repo.delete(&run.id).await {
+                warn!(%error, run_id = %run.id, "failed to clear turn journal (non-fatal)");
+            }
+            if matches!(run.status, RunStatus::Done)
+                && let Some(original) = &run.resumed_from
+                && let Err(error) = repo.delete(original).await
+            {
+                warn!(%error, run_id = %original,
+                    "failed to clear the resumed run's turn journal (non-fatal)");
+            }
+        }
+
         outcome
     }
 
-    /// The turn's actual work: persist the user message, drive the agent loop
-    /// (komo owns it — model round-trip, execute requested tools, feed results
-    /// back, repeat), persist the reply, and kick off the periodic reviewer.
+    /// The turn's actual work: persist the user message (fresh turns), drive
+    /// the agent loop (komo owns it — model round-trip, execute requested
+    /// tools, feed results back, repeat), persist the reply, and kick off the
+    /// periodic reviewer. A resumed turn differs only at the edges: its user
+    /// message is already in the transcript, and its driver reopens mid-loop
+    /// from the journal instead of starting fresh.
     async fn turn_body(
         &self,
         session_id: &str,
-        user_input: String,
+        kind: TurnKind,
         run: RunContext,
     ) -> anyhow::Result<(String, TokenUsage)> {
         // Load only the recent window for the agent loop — the LLM windows the
@@ -173,9 +302,27 @@ impl AgentRuntime {
             }
         };
 
-        let user_msg = Message::user(&user_input);
-        self.messages.save(session_id, &user_msg).await?;
-        session.messages.push(user_msg);
+        let resume_entries = match kind {
+            TurnKind::Fresh { user_input } => {
+                let user_msg = Message::user(&user_input);
+                self.messages.save(session_id, &user_msg).await?;
+                session.messages.push(user_msg);
+                None
+            }
+            TurnKind::Resume { entries } => {
+                // A continuation appends an assistant reply without a new user
+                // message, so the transcript must still end on the interrupted
+                // turn's user message. Ending on an assistant means the reply
+                // actually landed (crash in the gap before the ledger closed) —
+                // nothing to resume.
+                anyhow::ensure!(
+                    session.messages.last().map(|m| m.role == Role::User) == Some(true),
+                    "transcript already ends in a reply — nothing to resume"
+                );
+                Some(entries)
+            }
+        };
+        let is_fresh = resume_entries.is_none();
 
         // Keep a handle on the run to read the tool-step count after the loop (the
         // counter is shared via `Arc`) and to fetch the steps themselves.
@@ -184,7 +331,7 @@ impl AgentRuntime {
             reply,
             usage,
             interjections,
-        } = match self.run_agent_loop(&session, run).await {
+        } = match self.run_agent_loop(&session, run, resume_entries).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 // The turn failed *after* the user message was persisted. Persist
@@ -206,7 +353,9 @@ impl AgentRuntime {
                 // "(已取消)" pair that every later turn replays. The run ledger
                 // still records the cancelled run: the transcript is the
                 // conversation, the ledger is the audit trail.
-                if is_cancelled(&error) && probe.steps_count() == 0 {
+                // (Never on a resume: the trailing user message there belongs
+                // to the interrupted turn, not to this continuation.)
+                if is_fresh && is_cancelled(&error) && probe.steps_count() == 0 {
                     match self.messages.delete_recent(session_id, 1).await {
                         Ok(_) => return Err(error),
                         // Rewind failed — fall through and leave the tombstone,
@@ -326,7 +475,14 @@ impl AgentRuntime {
         &self,
         session: &Session,
         run: RunContext,
+        resume: Option<Vec<JournalEntry>>,
     ) -> anyhow::Result<TurnOutcome> {
+        // This turn's journal writer, bound to its ledger run — the loop and
+        // the driver stay run-id-free.
+        let journal: Option<Arc<dyn TurnJournal>> = self
+            .journal
+            .as_ref()
+            .map(|repo| RunJournal::new(repo.clone(), &run.run_id) as Arc<dyn TurnJournal>);
         // The executor gets the turn's context explicitly: the run handle this
         // turn opened, and the session established by the dispatcher / api /
         // handle_input (read once here — the one ambient-to-explicit bridge).
@@ -355,7 +511,14 @@ impl AgentRuntime {
             .clone()
             .map(|sink| Arc::new(StreamingDeltas(sink)) as Arc<dyn DeltaSink>);
 
-        let mut driver = self.llm.begin_turn(session, deltas).await?;
+        let mut driver = match &resume {
+            None => self.llm.begin_turn(session, deltas, journal).await?,
+            Some(entries) => {
+                self.llm
+                    .resume_turn(session, entries, deltas, journal)
+                    .await?
+            }
+        };
         let mut step = Self::until_cancelled(cancel, driver.first()).await?;
         let mut rounds = 0usize;
         // The model's most recent narration alongside its tool calls. Kept so the
@@ -484,6 +647,15 @@ impl DeltaSink for StreamingDeltas {
     }
 }
 
+/// What kind of turn [`AgentRuntime::turn_body`] is driving.
+enum TurnKind {
+    /// An ordinary user turn: persist the input, open a fresh driver.
+    Fresh { user_input: String },
+    /// A continuation of an interrupted turn: the user message is already in
+    /// the transcript, and the driver reopens from these journal rows.
+    Resume { entries: Vec<JournalEntry> },
+}
+
 /// What one pass of the agent loop produced.
 struct TurnOutcome {
     reply: String,
@@ -547,6 +719,8 @@ mod tests {
         received: Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
         /// Mid-turn user messages the loop handed to `step()`, in order.
         interjected: Arc<Mutex<Vec<String>>>,
+        /// How many journal rows `resume_turn` was handed; `None` until called.
+        resumed_entries: Arc<Mutex<Option<usize>>>,
     }
 
     #[async_trait]
@@ -558,6 +732,7 @@ mod tests {
             &self,
             _session: &Session,
             _deltas: Option<Arc<dyn DeltaSink>>,
+            _journal: Option<Arc<dyn TurnJournal>>,
         ) -> anyhow::Result<Box<dyn TurnDriver>> {
             // One turn per test, so hand the whole script to the driver.
             let steps = std::mem::take(&mut *self.script.lock().unwrap());
@@ -566,6 +741,16 @@ mod tests {
                 received: self.received.clone(),
                 interjected: self.interjected.clone(),
             }))
+        }
+        async fn resume_turn(
+            &self,
+            session: &Session,
+            entries: &[JournalEntry],
+            deltas: Option<Arc<dyn DeltaSink>>,
+            journal: Option<Arc<dyn TurnJournal>>,
+        ) -> anyhow::Result<Box<dyn TurnDriver>> {
+            self.resumed_entries.lock().unwrap().replace(entries.len());
+            self.begin_turn(session, deltas, journal).await
         }
     }
 
@@ -705,6 +890,7 @@ mod tests {
                 script: Mutex::new(script.into()),
                 received: received.clone(),
                 interjected: interjected.clone(),
+                resumed_entries: Arc::new(Mutex::new(None)),
             }),
             sessions: db.clone(),
             messages: db.clone(),
@@ -713,6 +899,7 @@ mod tests {
             max_turns,
             history_window: 0,
             review: None,
+            journal: None,
         };
         (rt, received, interjected)
     }
@@ -1101,6 +1288,7 @@ mod tests {
             &self,
             _session: &Session,
             _deltas: Option<Arc<dyn DeltaSink>>,
+            _journal: Option<Arc<dyn TurnJournal>>,
         ) -> anyhow::Result<Box<dyn TurnDriver>> {
             anyhow::bail!("provider down")
         }
@@ -1124,6 +1312,7 @@ mod tests {
             max_turns: 30,
             history_window: 0,
             review: None,
+            journal: None,
         };
 
         let result = rt.handle_input("cli:sf", "hi".into()).await;
@@ -1354,5 +1543,171 @@ mod tests {
         // note instead of executing, so exactly two ledger steps.
         let steps = RunRepository::steps(&*db, &runs[0].id).await.unwrap();
         assert_eq!(steps.len(), 2);
+    }
+
+    /// Stage an interrupted turn: a session whose transcript ends on the user
+    /// message (the crash landed before any reply), its failed ledger run, and
+    /// `count` journal rows. Returns the original run.
+    async fn seed_interrupted(db: &Arc<Db>, session_id: &str, count: i64) -> Run {
+        use komo_core::domain::turn_journal::{JournalEntry, JournalKind, TurnJournalRepository};
+        SessionRepository::save(&**db, &Session::new(session_id))
+            .await
+            .unwrap();
+        MessageRepository::save(&**db, session_id, &Message::user("do the thing"))
+            .await
+            .unwrap();
+        let run = Run::start(session_id, "do the thing");
+        RunRepository::start(&**db, &run).await.unwrap();
+        for seq in 0..count {
+            TurnJournalRepository::append(
+                &**db,
+                &run.id,
+                &JournalEntry {
+                    seq,
+                    kind: if seq == 0 {
+                        JournalKind::Envelope
+                    } else {
+                        JournalKind::Assistant
+                    },
+                    payload: "{}".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        run
+    }
+
+    #[tokio::test]
+    async fn resume_interrupted_continues_without_a_new_user_message() {
+        use komo_core::domain::turn_journal::TurnJournalRepository;
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_resume.db")).await.unwrap());
+        let original = seed_interrupted(&db, "cli:rs1", 2).await;
+
+        let resumed_entries = Arc::new(Mutex::new(None));
+        let rt = AgentRuntime {
+            llm: Arc::new(ScriptedLlm {
+                script: Mutex::new(vec![Step::Final("resumed reply".into())].into()),
+                received: Arc::new(Mutex::new(Vec::new())),
+                interjected: Arc::new(Mutex::new(Vec::new())),
+                resumed_entries: resumed_entries.clone(),
+            }),
+            sessions: db.clone(),
+            messages: db.clone(),
+            runs: db.clone(),
+            tool_executor: ToolExecutor::new(
+                komo_services::tool_execution::ToolExecutionConfig::default(),
+            ),
+            max_turns: 30,
+            history_window: 0,
+            review: None,
+            journal: Some(db.clone()),
+        };
+
+        let reply = rt
+            .resume_interrupted(&original)
+            .await
+            .unwrap()
+            .expect("this run is continuable");
+        assert_eq!(reply, "resumed reply");
+        // The driver was reopened from the journal, not begun fresh.
+        assert_eq!(*resumed_entries.lock().unwrap(), Some(2));
+
+        // The continuation appended exactly one assistant message — the
+        // interrupted turn's own user message still opens the pair.
+        let session = SessionRepository::find(&*db, "cli:rs1")
+            .await
+            .unwrap()
+            .unwrap();
+        let roles: Vec<Role> = session.messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant]);
+        assert_eq!(session.messages[1].content, "resumed reply");
+
+        // The continuation is its own ledger run, linked back.
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        let continuation = runs
+            .iter()
+            .find(|r| r.resumed_from.as_deref() == Some(original.id.as_str()))
+            .expect("a continuation run linked to the original");
+        assert_eq!(continuation.status, RunStatus::Done);
+
+        // Delivered ⇒ both journals cleared: the continuation's own, and the
+        // original's (the interruption it covered is over).
+        assert!(
+            TurnJournalRepository::load(&*db, &original.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            TurnJournalRepository::load(&*db, &continuation.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_a_transcript_that_already_ends_in_a_reply() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_resume_guard.db"))
+                .await
+                .unwrap(),
+        );
+        let original = seed_interrupted(&db, "cli:rs2", 1).await;
+        // The reply actually landed (crash in the gap before the ledger
+        // closed) — the transcript ends on an assistant message.
+        MessageRepository::save(&*db, "cli:rs2", &Message::assistant("already delivered"))
+            .await
+            .unwrap();
+
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![Step::Final("should not run".into())],
+            vec![],
+            30,
+        );
+        let rt = AgentRuntime {
+            journal: Some(db.clone()),
+            ..rt
+        };
+
+        let outcome = rt.resume_interrupted(&original).await.unwrap();
+        assert!(outcome.is_none(), "must decline, not continue");
+        // Nothing was appended to the transcript, and no ledger run opened.
+        let session = SessionRepository::find(&*db, "cli:rs2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.messages.len(), 2);
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        assert_eq!(runs.len(), 1, "only the original run exists");
+    }
+
+    #[tokio::test]
+    async fn resume_without_journal_rows_fails_before_touching_anything() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_resume_norows.db"))
+                .await
+                .unwrap(),
+        );
+        // An interrupted run that never got a journal (pre-journal build, or
+        // the write failed) — the caller must fall back to the digest path.
+        let original = seed_interrupted(&db, "cli:rs3", 0).await;
+        let (rt, _) = scripted_runtime(db.clone(), vec![], vec![], 30);
+        let rt = AgentRuntime {
+            journal: Some(db.clone()),
+            ..rt
+        };
+        let outcome = rt.resume_interrupted(&original).await.unwrap();
+        assert!(
+            outcome.is_none(),
+            "no rows ⇒ decline so the digest path runs"
+        );
+        let session = SessionRepository::find(&*db, "cli:rs3")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.messages.len(), 1, "transcript untouched");
     }
 }

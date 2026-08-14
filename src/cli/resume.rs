@@ -1,10 +1,12 @@
-//! `komo run resume` — re-dispatch an interrupted turn from the run ledger.
+//! `komo run resume` — pick an interrupted turn back up from the run ledger.
 //!
-//! The ledger is an audit record, not a checkpoint, so resume runs one *fresh*
-//! turn in the interrupted run's session, primed with the original input and a
-//! digest of the steps that had completed (`domain::run::resume_prompt`). The
-//! model judges which side effects already took hold; new side effects go
-//! through approval as usual.
+//! Two tiers. When the run left a turn journal, the turn is *continued*: the
+//! exact provider-level state it died with is rebuilt and driven forward, so
+//! the tool rounds already paid for are replayed, not re-run. Otherwise —
+//! pre-journal runs, a failed journal write — it falls back to one *fresh*
+//! turn primed with the original input and a digest of the completed steps
+//! (`domain::run::resume_prompt`). Either way the model judges which side
+//! effects already took hold; new side effects go through approval as usual.
 //!
 //! Eligibility, priming, and the at-most-once `recoverable` clear live in
 //! [`OperatorControl::resume_run`]. Only the local turn itself is supplied
@@ -29,7 +31,7 @@ pub async fn run(
     id: Option<String>,
 ) -> anyhow::Result<()> {
     let outcome = control
-        .resume_run(id, |db, kanban, session_id, input| async move {
+        .resume_run(id, |db, kanban, run, input| async move {
             // Same construction as the chat TUI's local mode: interactive
             // approval at the TTY.
             let approver: Arc<dyn Approver> = Arc::new(CliApprover::new());
@@ -39,13 +41,25 @@ pub async fn run(
             let runtime = wiring::build(config, db, kanban, cron_jobs, approver)
                 .await?
                 .runtime;
-            runtime.handle_input(&session_id, input).await
+            // Journal-continue first; digest-primed fresh turn as the fallback
+            // (same order as the gateway's resume endpoint).
+            match runtime.resume_interrupted(&run).await? {
+                Some(reply) => Ok((reply, true)),
+                None => Ok((runtime.handle_input(&run.session_id, input).await?, false)),
+            }
         })
         .await?;
-    println!(
-        "Resumed {} (session {}, {} completed step(s) handed to the model).\n",
-        outcome.run_id, outcome.session_id, outcome.steps
-    );
+    if outcome.continued {
+        println!(
+            "Resumed {} (session {}, continued from its turn journal).\n",
+            outcome.run_id, outcome.session_id
+        );
+    } else {
+        println!(
+            "Resumed {} (session {}, {} completed step(s) handed to the model).\n",
+            outcome.run_id, outcome.session_id, outcome.steps
+        );
+    }
     println!("Agent: {}", outcome.reply);
     Ok(())
 }

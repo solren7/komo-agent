@@ -82,6 +82,44 @@ pub(crate) async fn ensure_columns(
     Ok(())
 }
 
+/// In-place migration for a whole table added to a model set after db files
+/// already exist — the table-level sibling of [`ensure_columns`], and the same
+/// raw-connection window (before the pooled driver opens the file).
+///
+/// `push_schema` only runs for brand-new files and is not idempotent, so
+/// without this a new *table* meant deleting the db file — acceptable for
+/// genuinely disposable data, but state.db also carries every chat transcript.
+/// `ddl` must be the exact statements `push_schema` would emit for the model
+/// (lock the parity with a test); they run only when `table` is absent.
+pub(crate) async fn ensure_table(path: &Path, table: &str, ddl: &[&str]) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+        .build()
+        .await
+        .with_context(|| format!("opening {} for table migration", path.display()))?;
+    let conn = db.connect()?;
+    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+
+    // Any column at all means the table exists; PRAGMA on a missing table
+    // yields no rows.
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info(\"{table}\")"), ())
+        .await
+        .with_context(|| format!("probing for table {table}"))?;
+    if rows.next().await?.is_some() {
+        return Ok(());
+    }
+
+    for stmt in ddl {
+        conn.execute(stmt, ())
+            .await
+            .with_context(|| format!("creating table `{table}` in place"))?;
+    }
+    tracing::info!(table, "created missing table in place");
+    Ok(())
+}
+
 /// Shared prologue for every Turso-backed `connect(url)`: parse the
 /// `turso:<path>` url to its bare filesystem path (`None` for in-memory), ensure
 /// the parent dir exists, stage any legacy SQLite file aside, and report whether

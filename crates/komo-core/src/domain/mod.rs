@@ -22,6 +22,7 @@ pub mod skill;
 pub mod task;
 pub mod todo;
 pub mod tool;
+pub mod turn_journal;
 pub mod wiki;
 pub mod workday;
 pub mod workspace;

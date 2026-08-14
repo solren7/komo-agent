@@ -307,6 +307,9 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
     println!("run     {}", run.id);
     println!("session {}", run.session_id);
     println!("status  {}", run.status.as_str());
+    if let Some(original) = &run.resumed_from {
+        println!("resumed continuation of {original} (from its turn journal)");
+    }
     println!("started {}", local_time(run.started_at));
     if let Some(ended) = run.ended_at {
         println!("ended   {}", local_time(ended));
