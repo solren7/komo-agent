@@ -343,11 +343,22 @@ pub async fn build(
     // disagree about what a program may call.
     let code_note_for = |tools: &ToolExecutor| -> Option<String> {
         let snapshot = tools.snapshot();
-        snapshot
+        let note = snapshot
             .get("run_code")
             .is_some()
             .then(|| komo_tools::run_code::sdk_note(&snapshot))
-            .flatten()
+            .flatten()?;
+        // The *actual* plugins directory, because the model otherwise guesses:
+        // "~/.komo/plugins" is only the default, and under Docker the home is
+        // /data — a deployment lost a round of turns to exactly that guess.
+        // Byte-stable per deployment (the home never changes at runtime), so
+        // the prompt cache is untouched.
+        Some(format!(
+            "{note}\nDurable composition belongs in a plugin: a `*.py` file with \
+             `@tool` functions saved into `{}` is hot-loaded within seconds and \
+             becomes a `py__<name>` tool — no restart.",
+            config.runtime.home.join("plugins").display()
+        ))
     };
     let tool_names_of = |tools: &ToolExecutor| -> Vec<String> {
         tools

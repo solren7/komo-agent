@@ -63,8 +63,9 @@ provider = "deepseek"
 
 # --- python plugins ----------------------------------------------------------
 
-# On by default: the gateway creates ~/.komo/plugins/ at startup and runs an
-# out-of-process python3 host. Every *.py there with an @tool decorator becomes
+# On by default: the gateway creates $KOMO_HOME/plugins/ at startup (so
+# ~/.komo/plugins unless KOMO_HOME moved it — `komo doctor` prints the real
+# path) and runs an out-of-process python3 host. Every *.py there with an @tool decorator becomes
 # a py__<name> tool (hot-reloaded on save), and run_code lets the agent write
 # programs that call its own tools. Requires python3 on PATH.
 # [plugins.pyhost]

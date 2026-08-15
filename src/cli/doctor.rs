@@ -159,9 +159,10 @@ fn plugin_health(config: &ConfigSnapshot, health: Option<&serde_json::Value>) {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     match run_code {
-        Some(true) => {
-            println!("  {OK} host wired, run_code + {mounted} python tool(s) mounted")
-        }
+        Some(true) => println!(
+            "  {OK} host wired, run_code + {mounted} python tool(s) mounted ({})",
+            dir.display()
+        ),
         // The gateway answered and run_code is not in its catalog: opted out,
         // predates default-on, or python3 is missing (the gateway log says
         // which).
