@@ -157,29 +157,28 @@ impl GatewayClient {
         })
     }
 
-    /// The version an advertised gateway reports on `/health`, if one answers.
+    /// Whatever an advertised gateway reports on `/health`, if one answers.
     ///
-    /// For `komo doctor`'s version comparison: the CLI and the gateway are
-    /// installed by separate steps (`cargo install` vs the app bundle a
-    /// `gateway restart` rebuilds), so they drift apart routinely — and a
-    /// mismatch surfaces as a deserialization error deep in some command, not
-    /// as anything that names the cause. `None` means no gateway is advertised
-    /// or it did not answer; absence of a *comparison* is not a failure.
-    pub async fn advertised_server_version() -> Option<String> {
+    /// For `komo doctor`: the payload carries the gateway's build (the CLI and
+    /// the gateway are installed by separate steps, so they drift routinely,
+    /// and a mismatch surfaces as a deserialization error deep in some command
+    /// rather than as anything naming the cause) and its plugin state (mounted
+    /// live, invisible from the filesystem). `None` means no gateway is
+    /// advertised or it did not answer; the absence of a report is not itself
+    /// a failure.
+    pub async fn advertised_health() -> Option<Value> {
         let info = rendezvous::read()?;
         let http = reqwest::Client::builder()
             .timeout(PROBE_TIMEOUT)
             .build()
             .ok()?;
-        let body: Value = http
-            .get(format!("{}/health", info.base_url()))
+        http.get(format!("{}/health", info.base_url()))
             .send()
             .await
             .ok()?
             .json()
             .await
-            .ok()?;
-        Some(body.get("version")?.as_str()?.to_string())
+            .ok()
     }
 
     /// One quick unauthenticated `/health` probe. Shared by [`from_info`] and

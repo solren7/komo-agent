@@ -91,6 +91,9 @@ use std::net::SocketAddr;
 #[derive(Clone)]
 struct AppState {
     api_key: Arc<String>,
+    /// The main runtime's tool catalog — read per request, so `/health` reports
+    /// what is mounted *now* (python plugins mount and unmount live).
+    tools: Arc<komo_core::domain::catalog::ToolCatalog>,
     handler: Arc<dyn MessageHandler>,
     actions: Arc<OperatorActions>,
     /// Channel names enabled on this gateway (for `/api/status`).
@@ -168,6 +171,7 @@ impl ApiChannel {
         config: &ApiConfig,
         handler: Arc<dyn MessageHandler>,
         actions: Arc<OperatorActions>,
+        tools: Arc<komo_core::domain::catalog::ToolCatalog>,
         channels: Vec<String>,
         home: Option<String>,
         models: ModelMenu,
@@ -184,6 +188,7 @@ impl ApiChannel {
                 api_key: Arc::new(config.server_key.clone()),
                 handler,
                 actions,
+                tools,
                 channels: Arc::new(channels),
                 home,
                 provider: Arc::new(models.provider),
@@ -513,8 +518,19 @@ struct ChatMessage {
     content: String,
 }
 
-async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "version": crate::cli::VERSION }))
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    // Plugin state rides along so `komo doctor` can tell "not enabled" from
+    // "enabled but the running gateway predates the plugins directory" — the
+    // second is invisible from the filesystem alone. Counts only, no names:
+    // /health answers unauthenticated.
+    let snapshot = state.tools.snapshot();
+    let run_code = snapshot.get("run_code").is_some();
+    let plugin_tools = snapshot.names().filter(|n| n.starts_with("py__")).count();
+    Json(json!({
+        "status": "ok",
+        "version": crate::cli::VERSION,
+        "plugins": { "run_code": run_code, "tools": plugin_tools },
+    }))
 }
 
 async fn list_models() -> impl IntoResponse {

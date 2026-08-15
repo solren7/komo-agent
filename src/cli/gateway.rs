@@ -116,6 +116,9 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         Arc::new(MacosNotifier),
     ));
 
+    // Taken before the runtime moves into the handler: /health reports what the
+    // main catalog has mounted, live.
+    let tool_catalog = wired.runtime.tool_executor.catalog().clone();
     let handler: Arc<dyn MessageHandler> = Arc::new(wired.runtime);
     let sessions: Arc<dyn SessionRepository> = db.clone();
     let todos: Arc<dyn SessionTodoRepository> = db.clone();
@@ -205,6 +208,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             api,
             handler.clone(),
             actions,
+            tool_catalog,
             enabled,
             config_home.clone(),
             crate::infra::messaging::api::ModelMenu::from_config(&rt.model),

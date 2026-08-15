@@ -35,11 +35,12 @@ pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyho
 
     // The operator backend was resolved once by the caller; the db-backed
     // sections below reuse it, and the gateway line reports which side it hit.
-    gateway_health(control.via_gateway()).await;
+    let health = gateway_health(control.via_gateway()).await;
 
     issue_health(config);
     model_health(config);
     memory_health(config, control).await;
+    plugin_health(config, health.as_ref());
     schedule_health(config);
     policy_health(config, control).await;
     println!("\nchannels:");
@@ -98,18 +99,23 @@ async fn cron_health(control: &OperatorControl) {
 
 /// Is a gateway process actually running and answering? (The channel lines
 /// below describe *configuration*; this is the live process.)
-async fn gateway_health(reachable: bool) {
+async fn gateway_health(reachable: bool) -> Option<serde_json::Value> {
     match (rendezvous::read(), reachable) {
         (Some(info), true) => {
             println!(
                 "\ngateway: {OK} running (pid {}, api {}:{})",
                 info.pid, info.bind, info.port
             );
+            let health = crate::infra::gateway_client::GatewayClient::advertised_health().await;
             // The comparison the build stamp exists for. The two processes are
             // installed by separate steps, so drift is routine — and without
             // this line it surfaces as a deserialization error somewhere deep,
             // days later, with both sides claiming "0.1.0".
-            match crate::infra::gateway_client::GatewayClient::advertised_server_version().await {
+            match health
+                .as_ref()
+                .and_then(|h| h.get("version"))
+                .and_then(|v| v.as_str())
+            {
                 Some(server) if server != crate::cli::VERSION => println!(
                     "  {BAD} gateway is {server} but this CLI is {} — `komo gateway restart` syncs them",
                     crate::cli::VERSION
@@ -117,6 +123,7 @@ async fn gateway_health(reachable: bool) {
                 Some(server) => println!("  {OK} version {server} (matches this CLI)"),
                 None => println!("  ! gateway did not report a version"),
             }
+            return health;
         }
         (Some(info), false) => println!(
             "\ngateway: {BAD} advertised (pid {}) but not answering — stale {} or mid-restart?",
@@ -124,6 +131,44 @@ async fn gateway_health(reachable: bool) {
             rendezvous::path().display()
         ),
         (None, _) => println!("\ngateway: {OFF} not running (db opened directly)"),
+    }
+    None
+}
+
+/// The python plugin host: enabled at all, and — the invisible half — whether
+/// the *running* gateway knows about it. The host is opted into by the plugins
+/// directory existing at boot, so a directory created afterwards changes
+/// nothing until a restart, with no error anywhere: run_code and every py__
+/// tool are simply absent. That is indistinguishable from "not enabled" unless
+/// something compares the filesystem against the live catalog.
+fn plugin_health(config: &ConfigSnapshot, health: Option<&serde_json::Value>) {
+    println!("\nplugins:");
+    let dir = config.runtime.home.join("plugins");
+    let plugins = health.and_then(|h| h.get("plugins"));
+    let run_code = plugins
+        .and_then(|p| p.get("run_code"))
+        .and_then(|v| v.as_bool());
+    let mounted = plugins
+        .and_then(|p| p.get("tools"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    match (dir.is_dir(), run_code) {
+        (false, _) => println!(
+            "  {OFF} not enabled — `mkdir {}` and restart to get run_code + python plugins",
+            dir.display()
+        ),
+        (true, Some(true)) => {
+            println!("  {OK} host wired, run_code + {mounted} python tool(s) mounted")
+        }
+        (true, Some(false)) => println!(
+            "  {BAD} {} exists but the running gateway predates it — `komo gateway restart`",
+            dir.display()
+        ),
+        // No live report: an older gateway, or none running at all.
+        (true, None) => println!(
+            "  ! {} exists; live state unknown (gateway not answering or older than this CLI)",
+            dir.display()
+        ),
     }
 }
 
