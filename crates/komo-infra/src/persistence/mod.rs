@@ -39,6 +39,69 @@ pub(crate) fn sqlite_backup_path(path: &Path) -> PathBuf {
 /// `expected` maps column name → full column DDL. Every column listed MUST be
 /// `NOT NULL` with a `DEFAULT` (or be nullable), or `ALTER TABLE ADD COLUMN`
 /// fails on a non-empty table.
+/// Drop columns this komo no longer models, if the file still has them.
+///
+/// The dual of [`ensure_columns`], and the reason it has to exist: removing a
+/// field from a model removes it from *new* files only. Every store already on
+/// disk keeps the column — and a column declared `NOT NULL` without a default
+/// (which is what `push_schema` writes for a plain `String` field) then fails
+/// every insert that no longer mentions it. The store does not report a schema
+/// problem; it just stops accepting writes.
+///
+/// Best-effort per column: a drop that fails is logged and skipped, because a
+/// store that is merely carrying a dead column is in better shape than one that
+/// refuses to open.
+pub(crate) async fn drop_retired_columns(
+    path: &Path,
+    table: &str,
+    retired: &[&str],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+        .build()
+        .await
+        .with_context(|| format!("opening {} to retire columns", path.display()))?;
+    let conn = db.connect()?;
+    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+
+    let mut existing = std::collections::HashSet::new();
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info(\"{table}\")"), ())
+        .await
+        .with_context(|| format!("reading {table} columns"))?;
+    while let Some(row) = rows.next().await? {
+        if let turso::Value::Text(name) = row.get_value(1)? {
+            existing.insert(name);
+        }
+    }
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    for name in retired {
+        if !existing.contains(*name) {
+            continue;
+        }
+        match conn
+            .execute(
+                &format!("ALTER TABLE \"{table}\" DROP COLUMN \"{name}\""),
+                (),
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(column = name, table, "dropped retired column in place"),
+            Err(error) => tracing::warn!(
+                column = name,
+                table,
+                %error,
+                "could not drop a retired column; writes may fail if it is NOT NULL"
+            ),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn ensure_columns(
     path: &Path,
     table: &str,

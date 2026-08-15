@@ -415,7 +415,18 @@ async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
             "\"embedding_model\" text NOT NULL DEFAULT ''",
         ),
     ];
-    crate::persistence::ensure_columns(path, "memory_records", EXPECTED).await
+    crate::persistence::ensure_columns(path, "memory_records", EXPECTED).await?;
+
+    // Columns this komo no longer models. `recall_query_hashes` backed the
+    // dream-promotion query-diversity signal, added 2026-07-03 and dropped when
+    // promotion moved to truth signals (2026-08-12) — but dropping it from the
+    // model left it in every store built in between, `NOT NULL` and with no
+    // default, so every insert after the upgrade failed the constraint and the
+    // store silently stopped accepting memories. Durable data may only change
+    // additively (see AGENTS.md); this is the repair for the one time it did
+    // not.
+    const RETIRED: &[&str] = &["recall_query_hashes"];
+    crate::persistence::drop_retired_columns(path, "memory_records", RETIRED).await
 }
 
 /// Read every memory row from a legacy SQLite db file (opened with toasty's
@@ -529,6 +540,61 @@ mod tests {
     /// columns existed must gain them **in place** on connect — additive ALTER, no
     /// data loss — rather than force a destructive reset. Memories are durable
     /// personal data; "delete the file" is not an available migration.
+    /// A db that still carries a column this komo no longer models must stay
+    /// writable.
+    ///
+    /// `recall_query_hashes` was added 2026-07-03 and dropped from the model on
+    /// 2026-08-12. Dropping it from the model does not drop it from anyone's
+    /// file — every store created or upgraded in between still has the column,
+    /// still `NOT NULL`, and an insert that never mentions it fails the
+    /// constraint. Which is a memory store that has silently stopped accepting
+    /// memories.
+    #[tokio::test]
+    async fn a_store_carrying_a_retired_column_still_accepts_writes() {
+        let home = std::env::temp_dir().join("komo-test-mem-retired-col");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("memory.db");
+
+        // A store as it looked between those two dates: today's columns plus the
+        // one that was retired.
+        {
+            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute(
+                "CREATE TABLE \"memory_records\" (\
+                 \"id\" TEXT NOT NULL, \"kind\" TEXT NOT NULL, \"content\" TEXT NOT NULL, \
+                 \"status\" TEXT NOT NULL, \"confidence\" TEXT NOT NULL, \"importance\" BIGINT NOT NULL, \
+                 \"pinned\" BOOLEAN NOT NULL, \"scope_type\" TEXT NOT NULL, \"scope_key\" TEXT NOT NULL, \
+                 \"source\" TEXT NOT NULL, \"source_message_id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, \
+                 \"updated_at\" BIGINT NOT NULL, \"expires_at\" BIGINT NOT NULL, \"last_used_at\" BIGINT NOT NULL, \
+                 \"recall_query_hashes\" TEXT NOT NULL, \
+                 PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+
+        let db = MemoryDb::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        let mut memory = Memory::new(MemoryKind::Fact, "a memory written after the upgrade");
+        memory.id = "mem-after".to_string();
+        db.save(&memory)
+            .await
+            .expect("a retired column must not block a write");
+
+        let rows = db.list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, "a memory written after the upgrade");
+    }
+
     #[tokio::test]
     async fn adds_missing_columns_in_place() {
         let path = std::env::temp_dir().join("komo_memory_db_addcol.db");
