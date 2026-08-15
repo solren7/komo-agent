@@ -23,7 +23,12 @@ services:
     # pulling from ghcr (e.g. a Dockhand git stack on the NAS), set
     # KOMO_PULL_POLICY=build and a non-clashing KOMO_TAG such as `local`.
     # The default remains pull-from-registry.
-    build: .
+    build:
+      context: .
+      args:
+        # `docker compose build` cannot run git itself; interpolate it in:
+        #   KOMO_BUILD=$(git rev-parse --short=7 HEAD) docker compose build
+        KOMO_BUILD: ${KOMO_BUILD:-}
     container_name: komo
     restart: unless-stopped
     pull_policy: ${KOMO_PULL_POLICY:-always}

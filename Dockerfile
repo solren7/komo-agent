@@ -19,7 +19,9 @@
 #             line for this API"; see the runtime stage for the size tradeoff)
 #
 # Build for the NAS's architecture, NOT your laptop's. On Apple Silicon:
-#   docker buildx build --platform linux/amd64 -t ghcr.io/solren7/komo:latest --push .
+#   docker buildx build --platform linux/amd64 \
+#     --build-arg KOMO_BUILD=$(git rev-parse --short=7 HEAD) \
+#     -t ghcr.io/solren7/komo:latest --push .
 # Deployment lives in compose.yaml (registry pull by default; a Dockhand git
 # stack sets KOMO_PULL_POLICY=build to build natively on the NAS).
 
@@ -37,6 +39,13 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY . .
+
+# The commit this image is built from. .dockerignore excludes .git on purpose,
+# so build.rs cannot ask the repo — pass it in (see the buildx line above);
+# unset, the binary reports `+unknown` and `komo doctor` cannot tell two such
+# builds apart.
+ARG KOMO_BUILD=
+ENV KOMO_BUILD=$KOMO_BUILD
 
 # Cache the cargo registry and target dir across builds (BuildKit). The target
 # dir is a cache mount, so the binary must be copied out to a real layer.

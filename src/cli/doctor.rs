@@ -120,6 +120,13 @@ async fn gateway_health(reachable: bool) -> Option<serde_json::Value> {
                     "  {BAD} gateway is {server} but this CLI is {} — `komo gateway restart` syncs them",
                     crate::cli::VERSION
                 ),
+                // Two builds stamped `unknown` compare equal whether or not
+                // they are the same build — which is the drift-invisibility
+                // this line exists to prevent. Say so instead of vouching.
+                Some(server) if server.contains("unknown") => println!(
+                    "  ! version {server} on both sides, but an unknown stamp cannot \
+                     tell two builds apart — build with KOMO_BUILD set (see Dockerfile)"
+                ),
                 Some(server) => println!("  {OK} version {server} (matches this CLI)"),
                 None => println!("  ! gateway did not report a version"),
             }

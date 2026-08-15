@@ -14,7 +14,15 @@
 use std::process::Command;
 
 fn main() {
-    let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    // Fallback order: the repo itself, then a `KOMO_BUILD` handed in from
+    // outside, then `unknown`. The env leg exists for Docker: .dockerignore
+    // deliberately excludes .git (context size), so inside the build there is
+    // no repo to ask — the Dockerfile's `ARG KOMO_BUILD` carries the commit
+    // across the boundary instead.
+    println!("cargo:rerun-if-env-changed=KOMO_BUILD");
+    let commit = git(&["rev-parse", "--short=7", "HEAD"])
+        .or_else(|| std::env::var("KOMO_BUILD").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "unknown".into());
     // A dirty tree is its own kind of build: the commit no longer identifies
     // what is running, and saying so is the whole point of the stamp.
     let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
