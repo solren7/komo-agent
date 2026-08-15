@@ -49,6 +49,9 @@ pub struct Wiring {
     pub aux_llm: Arc<dyn LlmClient>,
     /// The markdown memory store, also read by the briefing sweep.
     pub memories: Arc<dyn MemoryRepository>,
+    /// The hybrid query service, so the operator surface can drive an embedding
+    /// backfill through the same one recall uses.
+    pub memory_query: Arc<komo_services::memory_query::MemoryQueryService>,
     /// The governed skill store (`~/.komo/skills`, files — roadmap §9), shared
     /// with the gateway's api channel.
     pub skills: Arc<FsSkillStore>,
@@ -81,7 +84,7 @@ pub struct Wiring {
 /// matching every turn, which looks exactly like "memory just doesn't work".
 /// A warning, never a fatal — the same call komo makes for a missing model key
 /// or a token-less HA channel. Recall keeps working without it.
-async fn build_embedder(
+pub(crate) async fn build_embedder(
     config: Option<&komo_config::EmbeddingConfig>,
 ) -> Option<Arc<dyn EmbeddingClient>> {
     let config = config?;
@@ -600,6 +603,7 @@ pub async fn build(
         review,
         aux_llm,
         memories: memory_repo,
+        memory_query: memory_query.clone(),
         skills: skill_store,
         clarify,
         briefing_runtime,

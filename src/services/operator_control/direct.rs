@@ -274,6 +274,14 @@ impl DirectOperatorAdapter {
                     archived: summary.memories_archived,
                 }
             }
+            // Backfill needs an embedder, which is assembled with the rest of
+            // the agent at gateway wiring. Rather than build a second one here
+            // (a second place for the embedding config to be read, and to drift),
+            // this path reports what to do about it.
+            OperatorCommand::MemoryBackfill => anyhow::bail!(
+                "memory backfill runs in the gateway (it owns the embedding client) — \
+                 start it with `komo gateway start`, then re-run this"
+            ),
             OperatorCommand::MemoryRepairScopes => OperatorCommandResult::MemoryScopesRepaired {
                 repaired: actions::repair_memory_scopes(self.memory().await?.as_ref()).await?,
             },

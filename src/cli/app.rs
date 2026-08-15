@@ -382,6 +382,12 @@ enum MemoryAction {
     /// recall can reach them again. Safe to re-run; chat-channel scopes are
     /// left alone.
     RepairScopes,
+    /// Embed every memory that still lacks a current vector.
+    ///
+    /// Recall embeds lazily — one small batch per read — which leaves a library
+    /// that has never been embedded lexical-only for a long time, and lexical
+    /// matching cannot cross languages. This does the whole library at once.
+    Backfill,
 }
 
 #[derive(Subcommand)]
@@ -624,6 +630,7 @@ pub async fn run() -> anyhow::Result<()> {
                 MemoryAction::Triage => memory::triage(&control).await,
                 MemoryAction::Report => memory::report(&control).await,
                 MemoryAction::RepairScopes => memory::repair_scopes(&control).await,
+                MemoryAction::Backfill => memory::backfill(&control).await,
             }
         }
         Some(Commands::Dream { apply }) => dream::run(&operator(&config).await?, apply).await,

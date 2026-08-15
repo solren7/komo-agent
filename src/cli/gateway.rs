@@ -198,6 +198,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             pairings: pairings.clone(),
             home: db.clone(),
             cron_jobs: cron_jobs.clone(),
+            memory_query: Some(wired.memory_query.clone()),
             wiki: wired.wiki.take(),
         });
         gateway = gateway.add_channel(Box::new(ApiChannel::new(

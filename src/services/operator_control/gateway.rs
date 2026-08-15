@@ -95,6 +95,9 @@ impl GatewayOperatorAdapter {
                 let (promoted, archived) = self.client.dream_apply().await?;
                 OperatorCommandResult::DreamApplied { promoted, archived }
             }
+            OperatorCommand::MemoryBackfill => OperatorCommandResult::MemoryBackfilled {
+                embedded: self.client.memory_backfill().await?,
+            },
             OperatorCommand::MemoryRepairScopes => OperatorCommandResult::MemoryScopesRepaired {
                 repaired: self.client.memory_repair_scopes().await?,
             },

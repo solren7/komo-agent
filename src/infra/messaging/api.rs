@@ -326,6 +326,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
         .route("/api/memories/repair-scopes", post(memory_repair_scopes))
+        .route("/api/memories/backfill", post(memory_backfill))
         .route("/api/wiki/search", post(wiki_search))
         .route("/api/wiki/status", get(wiki_status))
         .route("/api/wiki/index", post(wiki_index))
@@ -1389,6 +1390,13 @@ async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError
         "archived": summary.memories_archived,
     }))
     .into_response())
+}
+
+/// Embed every memory still missing a current vector (backs
+/// `komo memory backfill`). Slow by nature: one model call per batch.
+async fn memory_backfill(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let embedded = state.actions.memory_backfill().await?;
+    Ok(Json(json!({ "embedded": embedded })).into_response())
 }
 
 /// Widen memories stranded in an ephemeral `api` channel scope to `Global`

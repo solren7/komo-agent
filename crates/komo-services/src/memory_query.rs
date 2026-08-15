@@ -174,6 +174,64 @@ impl MemoryQueryService {
             tracing::debug!(written, model = %model, "memory embedding backfill");
         });
     }
+
+    /// Embed everything that still lacks a current vector, and wait for it.
+    ///
+    /// The background pass above is deliberately lazy — it embeds one batch per
+    /// read so a turn never waits on the model. That is right for a store that
+    /// gains memories a few at a time, and wrong for one that has never been
+    /// embedded at all: at a batch per read, a library of any size stays
+    /// half-lexical for days, and cross-language recall is broken the whole
+    /// time. This is the operator's way to say "do it now".
+    ///
+    /// Returns how many memories were embedded. A batch that fails to embed
+    /// stops the run rather than spinning: whatever went wrong with the model
+    /// will go wrong with the next batch too.
+    pub async fn backfill_all(&self) -> anyhow::Result<usize> {
+        let Some(embedder) = self.embedder.clone() else {
+            anyhow::bail!(
+                "no embedding model is configured — set `[memory] embedding_model` \
+                 (and `embedding_url`) in ~/.komo/config.toml"
+            );
+        };
+        let model = embedder.model_id().to_string();
+        let mut written = 0usize;
+
+        loop {
+            let all = self.memories.list().await?;
+            let stale: Vec<Memory> = all
+                .into_iter()
+                .filter(|m| m.embedding_for(&model).is_none())
+                .take(self.backfill_batch)
+                .collect();
+            if stale.is_empty() {
+                break;
+            }
+
+            let texts: Vec<String> = stale.iter().map(|m| m.content.clone()).collect();
+            let vectors = embedder
+                .embed(&texts)
+                .await
+                .map_err(|e| anyhow::anyhow!("embedding failed after {written} memories: {e}"))?;
+
+            let mut wrote_this_round = 0usize;
+            for (mut memory, vector) in stale.into_iter().zip(vectors) {
+                memory.embedding = vector;
+                memory.embedding_model = model.clone();
+                // Same reasoning as the background pass: an embedding is an
+                // index rebuild, not an edit, so `updated_at` stays put.
+                self.memories.save(&memory).await?;
+                wrote_this_round += 1;
+            }
+            written += wrote_this_round;
+            // Nothing moved despite stale rows: saving is not sticking, and
+            // looping would never terminate.
+            if wrote_this_round == 0 {
+                break;
+            }
+        }
+        Ok(written)
+    }
 }
 
 #[cfg(test)]

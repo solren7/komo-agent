@@ -101,6 +101,10 @@ pub struct OperatorActions {
     /// like an empty vault. A vault that is merely *unreachable* is still
     /// `Some`: opening retries per call, so it must not read as unconfigured.
     pub wiki: Option<WikiOps>,
+    /// The hybrid query service, when an embedder is configured. `None` leaves
+    /// `memory_backfill` reporting that there is nothing to embed *with* —
+    /// which is the honest answer, not an empty run.
+    pub memory_query: Option<Arc<komo_services::memory_query::MemoryQueryService>>,
 }
 
 impl OperatorActions {
@@ -244,6 +248,16 @@ impl OperatorActions {
     /// Widen memories stranded in an ephemeral `api` channel scope to `Global`.
     pub async fn repair_memory_scopes(&self) -> anyhow::Result<usize> {
         repair_memory_scopes(self.memories.as_ref()).await
+    }
+
+    /// Embed every memory still missing a current vector.
+    pub async fn memory_backfill(&self) -> anyhow::Result<usize> {
+        let Some(query) = &self.memory_query else {
+            anyhow::bail!(
+                "no embedding model is configured — set `[memory] embedding_model` in ~/.komo/config.toml"
+            );
+        };
+        query.backfill_all().await
     }
 
     pub async fn runs(&self, limit: usize) -> anyhow::Result<Vec<Run>> {

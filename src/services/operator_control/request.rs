@@ -97,6 +97,10 @@ pub enum OperatorCommand {
     DreamApply,
     /// Widen memories stranded in an ephemeral `api` channel scope to `Global`.
     MemoryRepairScopes,
+    /// Embed every memory that still lacks a current vector, and wait for it.
+    /// Minutes-long on a library that has never been embedded: the gateway
+    /// adapter gives this the same long timeout `WikiIndex` gets.
+    MemoryBackfill,
     /// Index the note vault. Minutes-long: the gateway adapter gives this
     /// command its own, far longer timeout than every other operator call.
     WikiIndex { rebuild: bool },
@@ -137,6 +141,10 @@ pub enum OperatorCommandResult {
     /// How many memories were widened to `Global`.
     MemoryScopesRepaired {
         repaired: usize,
+    },
+    /// How many memories gained an embedding.
+    MemoryBackfilled {
+        embedded: usize,
     },
     /// The created job (with its computed `next_run_at`).
     CronAdded(Box<CronJob>),

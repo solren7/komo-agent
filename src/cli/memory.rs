@@ -349,6 +349,20 @@ fn line(m: &Memory) -> String {
 /// turn. This repairs the ones written before that was fixed; real chat
 /// channels keep their scope, which is a privacy boundary rather than an
 /// accident.
+/// Embed every memory still missing a current vector.
+pub async fn backfill(control: &OperatorControl) -> anyhow::Result<()> {
+    match control.command(OperatorCommand::MemoryBackfill).await? {
+        OperatorCommandResult::MemoryBackfilled { embedded: 0 } => {
+            println!("every memory already has a current embedding");
+        }
+        OperatorCommandResult::MemoryBackfilled { embedded } => {
+            println!("embedded {embedded} memories");
+        }
+        _ => unreachable!("MemoryBackfill answers with MemoryBackfilled"),
+    }
+    Ok(())
+}
+
 pub async fn repair_scopes(control: &OperatorControl) -> anyhow::Result<()> {
     match control.command(OperatorCommand::MemoryRepairScopes).await? {
         OperatorCommandResult::MemoryScopesRepaired { repaired: 0 } => {

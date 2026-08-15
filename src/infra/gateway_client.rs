@@ -561,6 +561,26 @@ impl GatewayClient {
         Ok((promoted, archived))
     }
 
+    /// Embed every memory still missing a current vector, server-side; returns
+    /// how many gained one. Slow by nature — a never-embedded library calls the
+    /// model once per batch — so it rides the long timeout, like wiki indexing.
+    pub async fn memory_backfill(&self) -> anyhow::Result<usize> {
+        // `streaming_http` for the same reason wiki indexing uses it: this calls
+        // the embedding model once per batch, so it outlives the ordinary
+        // operator timeout on a library that has never been embedded.
+        let resp = self
+            .streaming_http
+            .post(self.url("/api/memories/backfill"))
+            .bearer_auth(&self.key)
+            .json(&json!({}))
+            .send()
+            .await?;
+        let mut map: Map<String, Value> = checked(resp).await?.json().await?;
+        Ok(serde_json::from_value(
+            map.remove("embedded").unwrap_or(Value::from(0)),
+        )?)
+    }
+
     /// Widen memories stranded in an ephemeral `api` channel scope to `Global`
     /// server-side; returns how many moved.
     pub async fn memory_repair_scopes(&self) -> anyhow::Result<usize> {
