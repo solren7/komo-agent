@@ -35,14 +35,15 @@ pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyho
 
     // The operator backend was resolved once by the caller; the db-backed
     // sections below reuse it, and the gateway line reports which side it hit.
-    gateway_health(control.via_gateway());
+    gateway_health(control.via_gateway()).await;
 
     issue_health(config);
     model_health(config);
+    memory_health(config, control).await;
     schedule_health(config);
     policy_health(config, control).await;
     println!("\nchannels:");
-    channel_health(config);
+    channel_health(config).await;
     home_channel_health(control, config).await;
     cron_health(control).await;
     run_health(control).await;
@@ -97,18 +98,78 @@ async fn cron_health(control: &OperatorControl) {
 
 /// Is a gateway process actually running and answering? (The channel lines
 /// below describe *configuration*; this is the live process.)
-fn gateway_health(reachable: bool) {
+async fn gateway_health(reachable: bool) {
     match (rendezvous::read(), reachable) {
-        (Some(info), true) => println!(
-            "\ngateway: {OK} running (pid {}, api {}:{})",
-            info.pid, info.bind, info.port
-        ),
+        (Some(info), true) => {
+            println!(
+                "\ngateway: {OK} running (pid {}, api {}:{})",
+                info.pid, info.bind, info.port
+            );
+            // The comparison the build stamp exists for. The two processes are
+            // installed by separate steps, so drift is routine — and without
+            // this line it surfaces as a deserialization error somewhere deep,
+            // days later, with both sides claiming "0.1.0".
+            match crate::infra::gateway_client::GatewayClient::advertised_server_version().await {
+                Some(server) if server != crate::cli::VERSION => println!(
+                    "  {BAD} gateway is {server} but this CLI is {} — `komo gateway restart` syncs them",
+                    crate::cli::VERSION
+                ),
+                Some(server) => println!("  {OK} version {server} (matches this CLI)"),
+                None => println!("  ! gateway did not report a version"),
+            }
+        }
         (Some(info), false) => println!(
             "\ngateway: {BAD} advertised (pid {}) but not answering — stale {} or mid-restart?",
             info.pid,
             rendezvous::path().display()
         ),
         (None, _) => println!("\ngateway: {OFF} not running (db opened directly)"),
+    }
+}
+
+/// The memory store's semantic arm: configured, and actually covering the
+/// library. Both halves failed silently this year — no `[memory]` section
+/// leaves recall lexical-only (cross-language recall structurally broken, no
+/// error anywhere), and a store written before embeddings were configured
+/// stays unembedded for weeks because backfill is lazy. Neither is visible
+/// unless something counts.
+async fn memory_health(config: &ConfigSnapshot, control: &OperatorControl) {
+    println!("\nmemory:");
+    let Some(embedding) = &config.runtime.embedding else {
+        println!(
+            "  ! embeddings not configured — recall is lexical-only, so a Chinese \
+             question cannot reach an English memory; set [memory] embedding_model"
+        );
+        return;
+    };
+    let memories = match control.query(OperatorQuery::Memories).await {
+        Ok(OperatorQueryResult::Memories(memories)) => memories,
+        Ok(_) => unreachable!("Memories query answers with Memories"),
+        Err(error) => {
+            println!("  {BAD} could not read the memory store: {error:#}");
+            return;
+        }
+    };
+    if memories.is_empty() {
+        println!("  {OK} empty store (model {})", embedding.model);
+        return;
+    }
+    let covered = memories
+        .iter()
+        .filter(|m| m.embedding_for(&embedding.model).is_some())
+        .count();
+    if covered == memories.len() {
+        println!(
+            "  {OK} embeddings {covered}/{} (model {})",
+            memories.len(),
+            embedding.model
+        );
+    } else {
+        println!(
+            "  {BAD} embeddings {covered}/{} for model {} — run `komo memory backfill`",
+            memories.len(),
+            embedding.model
+        );
     }
 }
 
@@ -227,17 +288,27 @@ async fn policy_health(config: &ConfigSnapshot, control: &OperatorControl) {
 }
 
 /// One line per ingress channel: enabled?, credentials present?
-fn channel_health(config: &ConfigSnapshot) {
+async fn channel_health(config: &ConfigSnapshot) {
     let rt = &config.runtime;
-    fn line<T>(label: &str, state: &ChannelState<T>) {
-        match state {
-            ChannelState::Ready(_) => println!("  {OK} {label:<14} enabled"),
-            ChannelState::Disabled => println!("  {OFF} {label:<14} disabled"),
-            ChannelState::Misconfigured(e) => println!("  {BAD} {label:<14} {e}"),
-        }
+    // Enabled is a statement about the config; these lines are about the world.
+    // A channel whose credential the platform rejects on every poll must not
+    // print {OK} — that is how a dead telegram token stayed invisible for a day.
+    match &rt.feishu {
+        ChannelState::Ready(_) => match super::channel::check_feishu_live(config).await {
+            Ok(()) => println!("  {OK} {:<14} enabled, credentials accepted", "feishu"),
+            Err(e) => println!("  {BAD} {:<14} enabled but failing: {e:#}", "feishu"),
+        },
+        ChannelState::Disabled => println!("  {OFF} {:<14} disabled", "feishu"),
+        ChannelState::Misconfigured(e) => println!("  {BAD} {:<14} {e}", "feishu"),
     }
-    line("feishu", &rt.feishu);
-    line("telegram", &rt.telegram);
+    match &rt.telegram {
+        ChannelState::Ready(_) => match super::channel::check_telegram_live(config).await {
+            Ok(bot) => println!("  {OK} {:<14} enabled, @{bot} answers", "telegram"),
+            Err(e) => println!("  {BAD} {:<14} enabled but failing: {e:#}", "telegram"),
+        },
+        ChannelState::Disabled => println!("  {OFF} {:<14} disabled", "telegram"),
+        ChannelState::Misconfigured(e) => println!("  {BAD} {:<14} {e}", "telegram"),
+    }
     // The api channel is always on (it's how the CLI reaches a running gateway);
     // `enabled` only widens it from loopback-only to externally reachable.
     match &rt.api {

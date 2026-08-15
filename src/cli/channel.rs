@@ -252,7 +252,10 @@ fn require_ready<'a, T>(name: &str, state: &'a ChannelState<T>) -> anyhow::Resul
     }
 }
 
-async fn probe_feishu(config: &ConfigSnapshot) -> anyhow::Result<()> {
+/// Verify feishu credentials against the live API. Shared with `komo doctor`,
+/// which reports liveness per enabled channel — a config line saying "enabled"
+/// while the credential 401s on every poll is doctor lying by omission.
+pub(crate) async fn check_feishu_live(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let channel = require_ready("feishu", &config.runtime.feishu)?;
     let response = http_client()?
         .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
@@ -272,11 +275,18 @@ async fn probe_feishu(config: &ConfigSnapshot) -> anyhow::Result<()> {
                 .unwrap_or("unknown error")
         );
     }
+    Ok(())
+}
+
+async fn probe_feishu(config: &ConfigSnapshot) -> anyhow::Result<()> {
+    check_feishu_live(config).await?;
     println!("✓ feishu credentials accepted");
     Ok(())
 }
 
-async fn probe_telegram(config: &ConfigSnapshot) -> anyhow::Result<()> {
+/// Verify telegram credentials against the live API; the bot's username on
+/// success. Shared with `komo doctor` — see [`check_feishu_live`].
+pub(crate) async fn check_telegram_live(config: &ConfigSnapshot) -> anyhow::Result<String> {
     let channel = require_ready("telegram", &config.runtime.telegram)?;
     let response = http_client()?
         .get(format!(
@@ -298,7 +308,14 @@ async fn probe_telegram(config: &ConfigSnapshot) -> anyhow::Result<()> {
                 .unwrap_or("unknown error")
         );
     }
-    let identity = body["result"]["username"].as_str().unwrap_or("bot");
+    Ok(body["result"]["username"]
+        .as_str()
+        .unwrap_or("bot")
+        .to_string())
+}
+
+async fn probe_telegram(config: &ConfigSnapshot) -> anyhow::Result<()> {
+    let identity = check_telegram_live(config).await?;
     println!("✓ telegram credentials accepted (@{identity})");
     Ok(())
 }

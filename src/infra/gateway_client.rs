@@ -157,6 +157,31 @@ impl GatewayClient {
         })
     }
 
+    /// The version an advertised gateway reports on `/health`, if one answers.
+    ///
+    /// For `komo doctor`'s version comparison: the CLI and the gateway are
+    /// installed by separate steps (`cargo install` vs the app bundle a
+    /// `gateway restart` rebuilds), so they drift apart routinely — and a
+    /// mismatch surfaces as a deserialization error deep in some command, not
+    /// as anything that names the cause. `None` means no gateway is advertised
+    /// or it did not answer; absence of a *comparison* is not a failure.
+    pub async fn advertised_server_version() -> Option<String> {
+        let info = rendezvous::read()?;
+        let http = reqwest::Client::builder()
+            .timeout(PROBE_TIMEOUT)
+            .build()
+            .ok()?;
+        let body: Value = http
+            .get(format!("{}/health", info.base_url()))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        Some(body.get("version")?.as_str()?.to_string())
+    }
+
     /// One quick unauthenticated `/health` probe. Shared by [`from_info`] and
     /// `komo health` (the Docker HEALTHCHECK command).
     pub async fn health_ok(http: &reqwest::Client, base: &str) -> bool {
