@@ -376,6 +376,9 @@ impl ToolExecutor {
         let catalog = &catalog;
         let futures = calls.iter().zip(&verdicts).enumerate().map(
             |(i, (call, verdict))| async move {
+                // Only a call that actually reached its tool has one; every
+                // refusal below answers with text alone.
+                let mut structured = serde_json::Value::Null;
                 let content = if i >= MAX_CALLS_PER_ROUND {
                     format!(
                         "error: too many tool calls in one round (limit {MAX_CALLS_PER_ROUND}); \
@@ -415,7 +418,10 @@ impl ToolExecutor {
                             .execute(tool.clone(), call.args.clone(), context)
                             .await
                         {
-                            Ok(out) => out,
+                            Ok((out, view)) => {
+                                structured = view;
+                                out
+                            }
                             Err(error) => format!("tool `{}` failed: {error:#}", call.name),
                         },
                         None => format!("error: unknown tool `{}`", call.name),
@@ -425,6 +431,7 @@ impl ToolExecutor {
                     id: call.id.clone(),
                     call_id: call.call_id.clone(),
                     content,
+                    structured,
                 };
                 // Post hooks observe what the model will see — including
                 // refusals and error content — for every call in the round.
@@ -485,12 +492,17 @@ impl ToolExecutionCore {
     /// 5. retry per the transient classification (typed hint first)
     /// 6. record the (original, truncated) step — best-effort
     /// 7. cap the LLM-facing result
+    ///
+    /// Answers with the model-facing text *and* the tool's structured view: the
+    /// text has been capped and may have been swapped for a preview, so a caller
+    /// that needs the result as data cannot recover it by parsing what comes
+    /// back. `Null` for a tool that reports no structured view.
     pub async fn execute(
         &self,
         tool: Arc<dyn Tool>,
         input: String,
         context: &ToolTurnContext,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, serde_json::Value)> {
         let name = tool.name();
 
         // Ledger bookkeeping (only when this turn is recorded). Capture the
@@ -729,7 +741,7 @@ impl ToolExecutionCore {
                 started_at,
                 ended_at,
                 elapsed_ms,
-                structured: cap_structured(structured),
+                structured: cap_structured(structured.clone()),
                 output_paths: bounded
                     .as_ref()
                     .map(|b| {
@@ -749,10 +761,11 @@ impl ToolExecutionCore {
         // the turn is over budget, it is swapped for a short note so a long tool
         // chain can't quietly overflow the context window (the ledger — and, for
         // an over-limit result, the stored file — still have the real thing).
-        bounded.map(|b| match context.budget.admit(b.text) {
+        let text = bounded.map(|b| match context.budget.admit(b.text) {
             Ok(out) => out,
             Err(note) => note,
-        })
+        })?;
+        Ok((text, structured))
     }
 
     /// Size one result for the model: the store's head+tail preview when a store

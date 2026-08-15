@@ -28,7 +28,7 @@ from pathlib import Path
 
 import komo_plugin
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 # How often to re-stat the plugin directory. A plugin appearing is the agent
 # having just written a file, so this wants to be quick; stat-ing a handful of
@@ -113,6 +113,25 @@ class ToolError(Exception):
         self.message = message
 
 
+class Text(str):
+    """What a tool call returns: the text, with the same result as data beside it.
+
+    A tool's text is laid out to be *read* — `read` returns a header line and
+    `N│` gutters, `grep` returns indented `Line N:` entries — so a program that
+    computes on it ends up re-parsing a display page, and gets it wrong. This is
+    that text (it is a `str`, so every existing use keeps working) with the
+    tool's structured view on `.structured`, or `None` when the tool reports
+    none.
+    """
+
+    __slots__ = ("structured",)
+
+    def __new__(cls, content, structured=None):
+        text = super().__new__(cls, content)
+        text.structured = structured
+        return text
+
+
 class Tools:
     """The `tools` object a program calls komo's own tools through.
 
@@ -141,7 +160,7 @@ class Tools:
             )
             if result.get("is_error"):
                 raise ToolError(name, result.get("content", ""))
-            return result.get("content", "")
+            return Text(result.get("content", ""), result.get("structured"))
 
         call.__name__ = name
         return call

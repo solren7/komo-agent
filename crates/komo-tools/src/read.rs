@@ -224,6 +224,12 @@ fn page(path: &Path, text: &str, offset: Option<usize>, limit: Option<usize>) ->
             "offset": start,
             "shown": shown,
             "next_offset": next,
+            // The page as data: the same lines, without the header or the line
+            // gutter, and without the per-line clipping — which is layout, and a
+            // reader's concern rather than a program's. This is what a `run_code`
+            // program computes on; parsing the rendered page instead is how the
+            // first ones got their line counts wrong. Never sent to the model.
+            "text": lines[start - 1..][..shown].join("\n"),
         }))
 }
 
@@ -522,6 +528,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    }
+
+    /// The rendered page is for a reader; a `run_code` program computes on the
+    /// structured view instead, so the page's own lines have to be in it —
+    /// without the header, the gutter, or the per-line clipping, all of which
+    /// are layout.
+    #[tokio::test]
+    async fn the_structured_view_carries_the_page_as_data() {
+        let (tool, dir) = tool_in("structured");
+        std::fs::write(dir.join("f.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let out = tool
+            .call(
+                json!({ "path": "f.txt", "offset": 2, "limit": 2 }),
+                &detached_ctx("cli:t"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.structured["text"], "two\nthree");
+        assert_eq!(out.structured["total_lines"], 4);
+        // The text the model sees still carries the layout.
+        assert!(out.text.contains("2│two"), "{}", out.text);
     }
 
     #[tokio::test]

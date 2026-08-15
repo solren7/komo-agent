@@ -42,7 +42,7 @@ const HOST_SOURCE: &str = include_str!("../python/host.py");
 
 /// Bumped when the wire contract changes. The host reports the version it
 /// speaks in its manifest; a mismatch is refused rather than half-understood.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Ceiling on one request to the host. A plugin doing real work can be slow, so
 /// this is generous — it exists to catch a host that stopped answering, not to
@@ -132,6 +132,29 @@ pub struct CodeResult {
     /// What the program returned, or `None` when it returned nothing.
     #[serde(default)]
     pub result: Option<serde_json::Value>,
+}
+
+/// What one of a program's tool calls answers with.
+///
+/// Two channels, because a tool's text is laid out for a reader and a program is
+/// not one: `content` is the string the model would have been shown, and
+/// `structured` is the same result as data — `Null` for a tool that reports no
+/// structured view. A program that has to *compute* on a result reads the second
+/// rather than re-parsing the first.
+pub struct ToolAnswer {
+    pub content: String,
+    pub structured: serde_json::Value,
+}
+
+impl ToolAnswer {
+    /// An answer carrying text alone — what a tool with no structured view
+    /// gives.
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            structured: serde_json::Value::Null,
+        }
+    }
 }
 
 /// One komo tool call a running program made.
@@ -328,7 +351,7 @@ impl PyHost {
     ) -> Result<CodeResult, PyHostError>
     where
         F: Fn(String, serde_json::Value) -> Fut,
-        Fut: std::future::Future<Output = Result<String, String>>,
+        Fut: std::future::Future<Output = Result<ToolAnswer, String>>,
     {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
@@ -363,15 +386,22 @@ impl PyHost {
                     )),
                 },
                 Some(request) = calls_rx.recv() => {
-                    let (content, is_error) = match dispatch(request.name, request.args).await {
-                        Ok(content) => (content, false),
-                        Err(message) => (message, true),
+                    let (answer, is_error) = match dispatch(request.name, request.args).await {
+                        Ok(answer) => (answer, false),
+                        Err(message) => (
+                            ToolAnswer { content: message, structured: serde_json::Value::Null },
+                            true,
+                        ),
                     };
                     // Answer even if the send fails: a host that went away is
                     // about to fail the program's response too.
                     let _ = self.send(serde_json::json!({
                         "id": request.id,
-                        "result": { "content": content, "is_error": is_error },
+                        "result": {
+                            "content": answer.content,
+                            "structured": answer.structured,
+                            "is_error": is_error,
+                        },
                     }));
                 }
             }
@@ -1017,14 +1047,14 @@ def fine(session_id, round):
     /// Dispatch that answers every call by echoing what it was asked for, and
     /// records the calls in order.
     fn recording_dispatch() -> (
-        impl Fn(String, serde_json::Value) -> std::future::Ready<Result<String, String>>,
+        impl Fn(String, serde_json::Value) -> std::future::Ready<Result<ToolAnswer, String>>,
         Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     ) {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
         let dispatch = move |name: String, args: serde_json::Value| {
             recorder.lock().unwrap().push((name.clone(), args.clone()));
-            std::future::ready(Ok(format!("{name} says hi")))
+            std::future::ready(Ok(ToolAnswer::text(format!("{name} says hi"))))
         };
         (dispatch, seen)
     }
@@ -1065,6 +1095,64 @@ return {"first": first, "second": second}
         assert_eq!(calls[0].0, "read");
         assert_eq!(calls[0].1["path"], "a.txt");
         assert_eq!(calls[1].0, "shell");
+
+        host.shutdown().await;
+    }
+
+    /// A result reaches the program on two channels: the text it would show a
+    /// reader, and the same result as data. The program computes on the second
+    /// — parsing the first is what got the early programs' answers wrong.
+    #[tokio::test]
+    async fn a_tool_result_carries_its_structured_view_into_the_program() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("codemode-structured");
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+
+        let result = host
+            .run_code(
+                r#"
+out = tools.read(path="a.txt")
+return {"text": str(out), "lines": out.structured["total_lines"]}
+"#,
+                |_name, _args| {
+                    std::future::ready(Ok(ToolAnswer {
+                        // Laid out for a reader, exactly as `read` renders it.
+                        content: "a.txt (lines 1-2 of 2)\n1│one\n2│two".to_string(),
+                        structured: serde_json::json!({ "total_lines": 2 }),
+                    }))
+                },
+            )
+            .await
+            .unwrap();
+
+        let value = result.result.expect("the program returned a value");
+        // Still a `str`: a program that only wants the text is untouched by the
+        // second channel existing.
+        assert!(value["text"].as_str().unwrap().contains("1│one"));
+        assert_eq!(value["lines"], 2);
+
+        host.shutdown().await;
+    }
+
+    /// A tool with no structured view hands the program `None` rather than
+    /// something it has to tell apart from real data.
+    #[tokio::test]
+    async fn a_tool_without_a_structured_view_answers_none() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("codemode-nostructure");
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+
+        let result = host
+            .run_code("return tools.time().structured is None", |_n, _a| {
+                std::future::ready(Ok(ToolAnswer::text("9am")))
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.result.unwrap(), true);
 
         host.shutdown().await;
     }
@@ -1111,7 +1199,7 @@ except ToolError as error:
 
         let error = host
             .run_code("return tools.read(\"/etc/hosts\")", |_n, _a| {
-                std::future::ready(Ok(String::new()))
+                std::future::ready(Ok(ToolAnswer::text("")))
             })
             .await
             .expect_err("a positional call cannot be dispatched");
@@ -1134,7 +1222,7 @@ except ToolError as error:
 
         let error = host
             .run_code("return 1 / 0", |_n, _a| {
-                std::future::ready(Ok(String::new()))
+                std::future::ready(Ok(ToolAnswer::text("")))
             })
             .await
             .expect_err("a raising program is an error");
@@ -1151,7 +1239,7 @@ except ToolError as error:
         // Still usable afterwards.
         let ok = host
             .run_code("return 2 + 2", |_n, _a| {
-                std::future::ready(Ok(String::new()))
+                std::future::ready(Ok(ToolAnswer::text("")))
             })
             .await
             .unwrap();
@@ -1173,10 +1261,10 @@ except ToolError as error:
         // Each program's dispatch answers with its own marker, so a crossed
         // call would come back with the other program's answer.
         let one = host.run_code("return tools.whoami()", |_n, _a| {
-            std::future::ready(Ok("first".to_string()))
+            std::future::ready(Ok(ToolAnswer::text("first")))
         });
         let two = host.run_code("return tools.whoami()", |_n, _a| {
-            std::future::ready(Ok("second".to_string()))
+            std::future::ready(Ok(ToolAnswer::text("second")))
         });
         let (one, two) = tokio::join!(one, two);
         assert_eq!(one.unwrap().result.unwrap(), "first");
@@ -1197,7 +1285,7 @@ except ToolError as error:
 
         let result = host
             .run_code("print('side effect only')", |_n, _a| {
-                std::future::ready(Ok(String::new()))
+                std::future::ready(Ok(ToolAnswer::text("")))
             })
             .await
             .unwrap();

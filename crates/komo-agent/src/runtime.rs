@@ -582,6 +582,7 @@ impl AgentRuntime {
                                 id: call.id.clone(),
                                 call_id: call.call_id.clone(),
                                 content: BUDGET_REACHED_NOTE.to_string(),
+                                structured: serde_json::Value::Null,
                             })
                             .collect()
                     } else {

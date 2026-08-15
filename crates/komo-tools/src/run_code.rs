@@ -30,7 +30,7 @@ use komo_core::domain::catalog::CatalogSnapshot;
 use komo_core::domain::context::ToolContext;
 use komo_core::domain::llm::ToolCallReq;
 use komo_core::domain::tool::{APPROVAL_BOUND, Tool, ToolError, ToolOutput, parse_args};
-use komo_pyhost::{PyHostError, SharedHost};
+use komo_pyhost::{PyHostError, SharedHost, ToolAnswer};
 use komo_services::tool_execution::{
     SpinDetector, ToolTurnContext, TurnResultBudget, WeakToolExecutor,
 };
@@ -203,7 +203,7 @@ async fn dispatch(
     callable: &Arc<CatalogSnapshot>,
     name: String,
     args: Value,
-) -> Result<String, String> {
+) -> Result<ToolAnswer, String> {
     if NOT_CALLABLE.contains(&name.as_str()) {
         return Err(format!(
             "`{name}` cannot be called from a program; call it directly instead"
@@ -231,14 +231,21 @@ async fn dispatch(
     let mut outcomes = executor
         .execute_round(std::slice::from_ref(&call), turn)
         .await;
-    let content = outcomes.pop().map(|o| o.content).unwrap_or_default();
+    let outcome = outcomes.pop();
+    let content = outcome
+        .as_ref()
+        .map(|o| o.content.clone())
+        .unwrap_or_default();
     // The executor answers a failure as content (the model is meant to recover
     // from it), so "did this work" has to be read off the text — the same
     // convention every other reader of an outcome uses.
     if content.starts_with("error:") || content.starts_with("tool `") {
         return Err(content);
     }
-    Ok(content)
+    Ok(ToolAnswer {
+        content,
+        structured: outcome.map(|o| o.structured).unwrap_or(Value::Null),
+    })
 }
 
 /// Turn a finished program into the model's answer.
@@ -283,15 +290,15 @@ pub fn sdk_note(catalog: &CatalogSnapshot) -> Option<String> {
     Some(format!(
         "Inside `run_code`, these are callable as Python functions with keyword \
          arguments. Each is the same gated tool you can call directly, and each \
-         returns the tool's output as a **str** (parse it yourself if you need \
-         structure); a failure raises `ToolError`.\n{}\n\
+         returns the tool's output as a **str**; a failure raises \
+         `ToolError`.\n{}\n\
          That str is the same text you would be shown — laid out for reading, \
          not for parsing. `read` returns a header line and then `N│text` \
          gutters; `grep` returns `Found N matches` and indented `Line N:` \
-         entries. Computing on either means stripping the layout first, so when \
-         a program needs the bytes themselves, ask a shell for them \
-         (`tools.shell(command=\"cat f\")`) rather than un-formatting a display \
-         page.",
+         entries. Do not compute on that layout. Every result also carries \
+         `.structured`, the same result as data (`read` puts the page's own \
+         lines in `.structured[\"text\"]`), which is `None` only for a tool that \
+         reports no structured view — reach for a shell when that happens.",
         lines.join("\n")
     ))
 }
@@ -387,14 +394,14 @@ mod tests {
     /// Saying "str" was not enough: the first programs written against this note
     /// parsed `read`'s display page as data and computed line counts off the
     /// header and the gutter. The note has to say the text is laid out for
-    /// reading, and where to go for the bytes.
+    /// reading, and name the channel that carries the result as data.
     #[test]
     fn the_note_warns_that_output_is_display_text() {
         let catalog = ToolCatalog::new();
         catalog.register(Arc::new(Fake("read", schema(&["path"], &[]))));
         let note = sdk_note(&catalog.snapshot()).unwrap();
         assert!(note.contains("N│text"), "{note}");
-        assert!(note.contains("tools.shell"), "{note}");
+        assert!(note.contains(".structured"), "{note}");
     }
 
     /// Byte stability is the whole reason this is worth generating rather than

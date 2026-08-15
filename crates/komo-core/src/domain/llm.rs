@@ -79,6 +79,13 @@ pub struct ToolOutcome {
     pub id: String,
     pub call_id: Option<String>,
     pub content: String,
+    /// The tool's machine-readable view, `Null` when it has none.
+    ///
+    /// Never sent to the model — `content` is what costs tokens. It exists for
+    /// the readers that are not the model: the ledger, post-execute hooks, and
+    /// a `run_code` program, which has to *compute* on a result whose text was
+    /// laid out to be read.
+    pub structured: serde_json::Value,
 }
 
 /// Receives assistant output as the provider produces it, mid-round.
