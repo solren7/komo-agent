@@ -54,13 +54,25 @@ process's own log mid-conversation.
 
 | File | Contents | Durability |
 |---|---|---|
-| `~/.komo/state.db` | sessions, messages, todos, reminders, pairings, settings, run ledger | disposable — delete freely |
+| `~/.komo/state.db` | session *metadata*, todos, reminders, pairings, settings, run ledger, turn journal | disposable — delete freely |
+| `~/.komo/sessions/` | transcripts — one append-only `.jsonl` per session | disposable |
 | `~/.komo/kanban.db` | cross-session tasks | durable |
 | `~/.komo/memory.db` | long-term memories | durable |
 | `~/.komo/cron.db` | scheduled cron jobs | durable |
 | `~/.komo/permissions.json` | saved approval grants | durable |
-| `~/.komo/tool-output/` | over-limit tool results (7-day retention) | disposable |
+| `~/.komo/tool-output/` | over-limit tool results + per-session `index.jsonl` (7-day retention) | disposable |
 | `~/.komo/skills/` | skill files (filesystem is the source of truth) | durable |
+
+Transcripts are **files, not rows** (`persistence/message_log.rs`), because they
+are the one thing here that is purely appended — so they pay no schema cost: a
+field added later reads as its default on every line written before it existed,
+and a change deeper than that dispatches on the line's `v`. Session *metadata*
+stays a row because it is *updated* (title, status, model, review watermark).
+`MessageRepository` is the log; `SessionRepository` reads the two together.
+Rows left in the old `message_records` table move out on connect, once. Anything
+that used to count messages in SQL must now go through the log — the review
+sweep and `mark_reviewed`'s clamp are the two that do, and a missed one pins
+every watermark at zero.
 
 Schema-change rules (toasty's `push_schema` runs only for **new** db files, and
 is not idempotent):
@@ -71,9 +83,10 @@ is not idempotent):
 - **Column additions never need a reset**: `komo-infra/src/persistence/mod.rs::ensure_columns`
   ALTERs in place on connect. Extend `EXPECTED` in `memory_db.rs` for
   `MemoryRecord` columns, and the matching list in `db.rs::connect` for
-  state.db (`SESSION_COLUMNS` / `MESSAGE_COLUMNS` / `RUN_COLUMNS` /
-  `STEP_COLUMNS`). Columns must be NOT NULL + DEFAULT, or nullable.
+  state.db (`SESSION_COLUMNS` / `RUN_COLUMNS` / `STEP_COLUMNS`). Columns must be
+  NOT NULL + DEFAULT, or nullable.
   Durable data (memory.db) must **only** ever change additively.
+- **A `Message` field change needs neither**: it is a JSONL line, not a column.
 
 Turso/toasty invariants (`komo-infra`'s `persistence/`, `memory/memory_db.rs` —
 the only places the ORM appears; model structs private to their file):
