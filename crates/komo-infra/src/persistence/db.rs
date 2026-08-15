@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -5,8 +6,8 @@ use toasty_driver_turso::Turso;
 use tracing::info;
 
 use crate::persistence::{
-    DEFAULT_POOL_SIZE, ensure_columns, ensure_table, prepare_turso_path, turso_marker_path,
-    with_write_retry,
+    DEFAULT_POOL_SIZE, ensure_columns, ensure_table, message_log::MessageLog, prepare_turso_path,
+    turso_marker_path, with_write_retry,
 };
 
 use komo_core::domain::{
@@ -62,6 +63,12 @@ struct SessionRecord {
     messages: toasty::Deferred<Vec<MessageRecord>>,
 }
 
+/// Transcripts as they were stored before they became files.
+///
+/// Nothing writes here any more — `MessageRepository` is the log
+/// (`super::message_log`). The model stays declared so `connect` can read an
+/// upgrading komo's rows once and move them out; a db whose table is empty has
+/// nothing left to migrate, which is why the migration needs no marker.
 #[derive(Debug, toasty::Model)]
 struct MessageRecord {
     // UUIDv7 string key (time-ordered) rather than `#[auto]` autoincrement:
@@ -261,6 +268,11 @@ const BRIEFING_MARK_KEY: &str = "briefing_last_handled";
 /// use [`with_write_retry`] for MVCC commit conflicts.
 pub struct Db {
     inner: Arc<toasty::Db>,
+    /// Transcripts, which are files rather than rows — see
+    /// [`message_log`](super::message_log) for why. Session *metadata* is still
+    /// a row here: it is updated (title, status, model, watermark), and a log is
+    /// the wrong shape for a value that changes.
+    messages: MessageLog,
 }
 
 impl Db {
@@ -355,9 +367,94 @@ impl Db {
             }
         }
 
-        Ok(Self {
+        // Transcripts sit beside state.db, so `KOMO_HOME` carries them without
+        // this needing to know about it. An in-memory db (tests) gets a
+        // directory of its own per connection, which is what keeps two tests
+        // from reading each other's transcripts.
+        let transcript_home = match &path {
+            Some(p) => p
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            None => std::env::temp_dir().join(format!("komo-mem-{}", uuid::Uuid::now_v7())),
+        };
+        let messages = MessageLog::open(&transcript_home)?;
+
+        let this = Self {
             inner: Arc::new(db),
-        })
+            messages,
+        };
+        // Move any transcript still in the table out to its file. One-time and
+        // idempotent, the same shape as the legacy-SQLite staging above: a komo
+        // that upgrades keeps its conversations without the operator being told
+        // to delete anything.
+        if !is_new {
+            this.migrate_messages_to_log().await?;
+        }
+        Ok(this)
+    }
+
+    /// Move transcripts out of `message_records` and into their files, once.
+    ///
+    /// Runs on every connect to an existing db and does nothing when the table
+    /// is already empty, so there is no marker to keep in sync — the table being
+    /// empty *is* the marker. Rows are deleted only after their file is written,
+    /// so an interrupted migration re-runs rather than losing a transcript.
+    async fn migrate_messages_to_log(&self) -> anyhow::Result<()> {
+        let mut conn = self.inner.connection().await?;
+        let Ok(rows) = toasty::query!(MessageRecord).exec(&mut conn).await else {
+            // No such table: a db from before messages were rows at all.
+            return Ok(());
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        // Group by session, preserving the id order the table used for ordering
+        // (UUIDv7, millisecond-precise) — that order becomes the file's order,
+        // which is what the log uses from then on.
+        let mut by_session: std::collections::BTreeMap<String, Vec<MessageRecord>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            by_session
+                .entry(row.session_id.clone())
+                .or_default()
+                .push(row);
+        }
+
+        let mut moved = 0usize;
+        for (session_id, mut rows) in by_session {
+            // A transcript already on disk means a previous run got this far;
+            // appending again would duplicate it.
+            if !self.messages.is_empty(&session_id).await? {
+                continue;
+            }
+            rows.sort_by(|a, b| a.id.cmp(&b.id));
+            for row in &rows {
+                self.messages
+                    .append(
+                        &session_id,
+                        &Message {
+                            role: parse_role(&row.role),
+                            content: row.content.clone(),
+                            timestamp: row.timestamp,
+                            tool_note: row.tool_note.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            moved += rows.len();
+            for row in rows {
+                row.delete().exec(&mut conn).await?;
+            }
+        }
+        if moved > 0 {
+            info!(
+                messages = moved,
+                "moved transcripts out of state.db into ~/.komo/sessions"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -383,10 +480,11 @@ impl Db {
 impl SessionRepository for Db {
     async fn find(&self, id: &str) -> anyhow::Result<Option<Session>> {
         let mut conn = self.inner.connection().await?;
-        match SessionRecord::get_by_id(&mut conn, id).await {
-            Ok(record) => Ok(Some(session_from_record(&mut conn, record).await?)),
-            Err(_) => Ok(None),
-        }
+        let Ok(record) = SessionRecord::get_by_id(&mut conn, id).await else {
+            return Ok(None);
+        };
+        let messages = self.messages.list(id).await?;
+        Ok(Some(session_from_record(record, messages)))
     }
 
     async fn find_windowed(&self, id: &str, limit: usize) -> anyhow::Result<Option<Session>> {
@@ -398,37 +496,11 @@ impl SessionRepository for Db {
         let Ok(record) = SessionRecord::get_by_id(&mut conn, id).await else {
             return Ok(None);
         };
-        // Pull the most recent `limit` messages via the `session_id` index
-        // (ORDER BY ... DESC LIMIT pushes both down to SQL), then restore
-        // chronological order for the caller. Ordering is by id, not
-        // `timestamp`: ids are UUIDv7 (millisecond-ordered) while `timestamp` is
-        // whole seconds, so windowing by the latter could split or scramble a
-        // user/assistant pair created inside the same second.
-        let mut rows = toasty::query!(
-            MessageRecord FILTER .session_id == #id ORDER BY .id DESC LIMIT #limit
-        )
-        .exec(&mut conn)
-        .await?;
-        rows.sort_by(|a, b| a.id.cmp(&b.id));
-        let messages: Vec<Message> = rows
-            .into_iter()
-            .map(|r| Message {
-                role: parse_role(&r.role),
-                content: r.content,
-                timestamp: r.timestamp,
-                tool_note: r.tool_note,
-            })
-            .collect();
-        Ok(Some(Session {
-            id: record.id,
-            workspace: record.workspace,
-            messages,
-            created_at: record.created_at,
-            title: record.title,
-            status: record.status,
-            model: record.model,
-            effort: record.effort,
-        }))
+        // The window is the tail of the file. What the table needed a UUIDv7 key
+        // to reconstruct — the order of two messages written inside one second —
+        // the log gets from the order they were appended in.
+        let messages = self.messages.window(id, limit).await?;
+        Ok(Some(session_from_record(record, messages)))
     }
 
     async fn list(&self) -> anyhow::Result<Vec<Session>> {
@@ -438,7 +510,8 @@ impl SessionRepository for Db {
 
         let mut sessions = Vec::with_capacity(rows.len());
         for record in rows {
-            sessions.push(session_from_record(&mut conn, record).await?);
+            let messages = self.messages.list(&record.id).await?;
+            sessions.push(session_from_record(record, messages));
         }
         Ok(sessions)
     }
@@ -497,8 +570,8 @@ impl SessionRepository for Db {
 
         let mut removed = 0usize;
         for record in rows {
-            let msgs = record.messages().exec(&mut conn).await?;
-            if msgs.is_empty() {
+            if self.messages.is_empty(&record.id).await? {
+                // No transcript file to remove — that is what empty means here.
                 record.delete().exec(&mut conn).await?;
                 removed += 1;
             }
@@ -511,31 +584,48 @@ impl SessionRepository for Db {
     }
 
     async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>> {
-        // Transactional: creating the archive, moving each message, and resetting
-        // the live row must all land or none — a mid-sequence failure used to
-        // leave a half-archived transcript. Wrapped in with_write_retry: a
-        // transaction that loses an MVCC commit rolls back cleanly, so re-running
-        // the whole closure never double-applies.
-        with_write_retry(|| async {
+        // Nothing to archive if the session is absent or already empty. Checked
+        // before anything moves, because the transcript move below is not part
+        // of the transaction that follows it.
+        {
+            let mut conn = self.inner.connection().await?;
+            if SessionRecord::get_by_id(&mut conn, session_id)
+                .await
+                .is_err()
+                || self.messages.is_empty(session_id).await?
+            {
+                return Ok(None);
+            }
+        }
+        // The transcript moves *first*, and deliberately. The two steps cannot
+        // be made atomic — one is a rename, the other a database transaction —
+        // so the question is which half-done state is safer. This order leaves,
+        // at worst, a transcript filed under an id with no metadata row: `/new`
+        // did what the user asked (the conversation is cleared) and the history
+        // is recoverable by hand. The other order leaves the live conversation
+        // still readable after `/new` said it was archived, which is the failure
+        // that lies to the user.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let archived_id = format!("{session_id}#{now}");
+        self.messages.rename(session_id, &archived_id).await?;
+
+        // Wrapped in with_write_retry: a transaction that loses an MVCC commit
+        // rolls back cleanly, so re-running the whole closure never
+        // double-applies.
+        let archived_id = with_write_retry(|| async {
+            let archived_id = archived_id.clone();
             let mut conn = self.inner.connection().await?;
             let mut tx = conn.transaction().await?;
-            // Nothing to archive if the session is absent or already empty.
             let Ok(mut live) = SessionRecord::get_by_id(&mut tx, session_id).await else {
                 return Ok(None);
             };
-            let msgs = live.messages().exec(&mut tx).await?;
-            if msgs.is_empty() {
-                return Ok(None);
-            }
 
-            // Move the transcript to a fresh archive session, preserving its start
-            // time; the live row stays and is now empty for the next conversation.
-            // The archive inherits the live session's review watermark (its
-            // transcript, hence its user-turn count, is unchanged) so an
-            // already-reviewed conversation isn't re-reviewed under the archive id,
-            // while any unreviewed tail still is.
-            let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            let archived_id = format!("{session_id}#{now}");
+            // Give the moved transcript a session row, preserving the original's
+            // start time; the live row stays and is now empty for the next
+            // conversation. The archive inherits the live session's review
+            // watermark (its transcript, hence its user-turn count, is unchanged)
+            // so an already-reviewed conversation isn't re-reviewed under the
+            // archive id, while any unreviewed tail still is.
             let prior_reviewed = live.reviewed_through;
             toasty::create!(SessionRecord {
                 id: archived_id.clone(),
@@ -549,26 +639,14 @@ impl SessionRepository for Db {
             })
             .exec(&mut tx)
             .await?;
-            let archive = SessionRecord::get_by_id(&mut tx, &archived_id).await?;
-            for msg in msgs {
-                toasty::create!(in archive.messages() {
-                    id: uuid::Uuid::now_v7().to_string(),
-                    role: msg.role.clone(),
-                    content: msg.content.clone(),
-                    timestamp: msg.timestamp,
-                    tool_note: msg.tool_note.clone(),
-                })
-                .exec(&mut tx)
-                .await?;
-                msg.delete().exec(&mut tx).await?;
-            }
             // The live row is now a fresh, empty conversation: reset its watermark
             // so the first new turn isn't compared against the archived count.
             live.update().reviewed_through(0).exec(&mut tx).await?;
             tx.commit().await?;
             Ok(Some(archived_id))
         })
-        .await
+        .await?;
+        Ok(archived_id)
     }
 
     async fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
@@ -650,23 +728,19 @@ impl SessionRepository for Db {
     async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
         let mut conn = self.inner.connection().await?;
         let sessions = toasty::query!(SessionRecord).exec(&mut conn).await?;
-        // Per-session COUNT pushed down to SQL (via the `session_id` index, same
-        // pattern as `count_user_turns`), so no message body is ever
-        // materialized just to size the sweep. Sessions accumulate (`/new`
-        // archives keep their transcripts), so a full user-message scan here
-        // would deserialize every transcript's content each cycle.
+        // One transcript read per session. This is the sweep that pays most for
+        // moving messages out of the table: the count used to push down to SQL
+        // through the `session_id` index, and now every session's file is read
+        // and parsed. Sessions accumulate (`/new` archives keep their
+        // transcripts), so this grows with the archive, not with what is active.
+        // Acceptable because the sweep runs on the order of half-hourly — but it
+        // is the first thing to reach for a per-file count cache if it ever
+        // stops being.
         let mut candidates = Vec::with_capacity(sessions.len());
         for s in sessions {
-            let sid = &s.id;
-            let role = format!("{:?}", Role::User).to_lowercase();
-            let n = toasty::query!(
-                MessageRecord FILTER .session_id == #sid AND .role == #role
-            )
-            .count()
-            .exec(&mut conn)
-            .await?;
+            let user_turns = self.messages.count_user_turns(&s.id).await?;
             candidates.push(ReviewCandidate {
-                user_turns: n as usize,
+                user_turns,
                 reviewed_through: s.reviewed_through.max(0) as usize,
                 id: s.id,
             });
@@ -684,13 +758,7 @@ impl SessionRepository for Db {
             // fresh conversation), or after a later, larger mark. Clamp to the
             // live user-turn count (a rotated transcript has fewer turns than
             // the stale mark) and never regress the stored value.
-            let role = format!("{:?}", Role::User).to_lowercase();
-            let live = toasty::query!(
-                MessageRecord FILTER .session_id == #session_id AND .role == #role
-            )
-            .count()
-            .exec(&mut conn)
-            .await? as i64;
+            let live = self.messages.count_user_turns(session_id).await? as i64;
             let new = (through as i64).min(live).max(record.reviewed_through);
             if new != record.reviewed_through {
                 record
@@ -709,106 +777,27 @@ impl SessionRepository for Db {
 
 #[async_trait]
 impl MessageRepository for Db {
+    // Every method here is the log's; the table is gone. What used to be a
+    // query with an index, an ORDER BY and a UUIDv7 key is a file read — see
+    // `super::message_log` for why that trade is worth making.
     async fn list_by_session(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
-        let mut conn = self.inner.connection().await?;
-        // A session that was never created (e.g. the GUI loading history for a
-        // freshly-minted client-side session id) simply has no transcript —
-        // return empty rather than erroring, mirroring `find_windowed`.
-        let Ok(record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
-            return Ok(Vec::new());
-        };
-        let mut rows = record.messages().exec(&mut conn).await?;
-        // Same reason as `find_windowed`: `timestamp` is only second-precision,
-        // so a fast turn's messages sort by their UUIDv7 ids instead.
-        rows.sort_by(|a, b| a.id.cmp(&b.id));
-        let messages: Vec<Message> = rows
-            .into_iter()
-            .map(|r| Message {
-                role: parse_role(&r.role),
-                content: r.content,
-                timestamp: r.timestamp,
-                tool_note: r.tool_note,
-            })
-            .collect();
-        Ok(messages)
+        self.messages.list(session_id).await
     }
 
     async fn count_user_turns(&self, session_id: &str) -> anyhow::Result<usize> {
-        let mut conn = self.inner.connection().await?;
-        // COUNT(*) pushed down to SQL (via the `session_id` index), so the
-        // transcript is never materialized just to size the review cadence.
-        let role = format!("{:?}", Role::User).to_lowercase();
-        let n = toasty::query!(
-            MessageRecord FILTER .session_id == #session_id AND .role == #role
-        )
-        .count()
-        .exec(&mut conn)
-        .await?;
-        Ok(n as usize)
+        self.messages.count_user_turns(session_id).await
     }
 
     async fn save(&self, session_id: &str, message: &Message) -> anyhow::Result<()> {
-        // Concurrent across sessions (the gateway runs a turn per chat), so retry
-        // on an MVCC commit conflict.
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let session = SessionRecord::get_by_id(&mut conn, session_id).await?;
-            let role = format!("{:?}", message.role).to_lowercase();
-            toasty::create!(in session.messages() {
-                id: uuid::Uuid::now_v7().to_string(),
-                role: role,
-                content: message.content.clone(),
-                timestamp: message.timestamp,
-                tool_note: message.tool_note.clone(),
-            })
-            .exec(&mut conn)
-            .await?;
-            Ok(())
-        })
-        .await
+        self.messages.append(session_id, message).await
     }
 
     async fn delete_recent(&self, session_id: &str, count: usize) -> anyhow::Result<usize> {
-        if count == 0 {
-            return Ok(0);
-        }
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            // Newest-first by id, like every other message read here: UUIDv7 is
-            // millisecond-ordered while `timestamp` is whole seconds, so a fast
-            // turn's pair would otherwise be indistinguishable.
-            let rows = toasty::query!(
-                MessageRecord FILTER .session_id == #session_id ORDER BY .id DESC LIMIT #count
-            )
-            .exec(&mut conn)
-            .await?;
-            let removed = rows.len();
-            for row in rows {
-                row.delete().exec(&mut conn).await?;
-            }
-            Ok(removed)
-        })
-        .await
+        self.messages.delete_recent(session_id, count).await
     }
 
     async fn append_to_last_user(&self, session_id: &str, extra: &str) -> anyhow::Result<bool> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let role = format!("{:?}", Role::User).to_lowercase();
-            let mut rows = toasty::query!(
-                MessageRecord FILTER .session_id == #session_id AND .role == #role
-                    ORDER BY .id DESC LIMIT 1usize
-            )
-            .exec(&mut conn)
-            .await?;
-            let Some(mut row) = rows.pop() else {
-                return Ok(false);
-            };
-            let merged = format!("{}\n{extra}", row.content);
-            row.update().content(merged).exec(&mut conn).await?;
-            Ok(true)
-        })
-        .await
+        self.messages.append_to_last_user(session_id, extra).await
     }
 }
 
@@ -1469,10 +1458,7 @@ fn parse_role(s: &str) -> Role {
     }
 }
 
-async fn session_from_record(
-    conn: &mut toasty::Connection,
-    record: SessionRecord,
-) -> anyhow::Result<Session> {
+fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session {
     let id = record.id.clone();
     let workspace = record.workspace.clone();
     let created_at = record.created_at;
@@ -1480,18 +1466,7 @@ async fn session_from_record(
     let status = record.status.clone();
     let model = record.model.clone();
     let effort = record.effort.clone();
-    let rows = record.messages().exec(conn).await?;
-    let mut messages: Vec<Message> = rows
-        .into_iter()
-        .map(|r| Message {
-            role: parse_role(&r.role),
-            content: r.content,
-            timestamp: r.timestamp,
-            tool_note: r.tool_note,
-        })
-        .collect();
-    messages.sort_by_key(|m| m.timestamp);
-    Ok(Session {
+    Session {
         id,
         workspace,
         messages,
@@ -1500,7 +1475,7 @@ async fn session_from_record(
         status,
         model,
         effort,
-    })
+    }
 }
 
 fn skill_from_record(record: SkillRecord) -> Skill {
@@ -1549,10 +1524,16 @@ mod tests {
     use super::*;
     use komo_core::domain::reminder::ReminderStatus;
 
+    /// A komo home of this test's own, wiped first.
+    ///
+    /// The whole directory, not just the db file: a home now holds transcripts
+    /// beside `state.db`, and two tests sharing a directory would read each
+    /// other's conversations.
     fn sqlite_url(name: &str) -> String {
-        let path = std::env::temp_dir().join(name);
-        crate::persistence::reset_test_db(&path);
-        format!("turso:{}", path.display())
+        let home = std::env::temp_dir().join(format!("komo-test-{name}"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        format!("turso:{}", home.join("state.db").display())
     }
 
     /// Every `CREATE …` statement sqlite_master holds for `turn_journal_records`,
@@ -2364,10 +2345,98 @@ mod tests {
     /// column **in place** on connect (additive ALTER, like memory.db's
     /// ensure_columns) — an upgraded gateway must not hard-fail every session
     /// query until the operator remembers the delete-to-reset convention.
+    /// An upgrading komo keeps its conversations: rows in the old table are
+    /// moved into the log on connect, and the rows go away only once the file
+    /// holds them. Re-connecting must not duplicate what it already moved.
+    #[tokio::test]
+    async fn transcripts_in_the_old_table_move_into_the_log_once() {
+        let home = std::env::temp_dir().join("komo-test-msg-migration");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("state.db");
+
+        // Seed a db shaped like one written before transcripts were files.
+        {
+            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "CREATE TABLE \"session_records\" (\"id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE \"message_records\" (\"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \"role\" TEXT NOT NULL, \"content\" TEXT NOT NULL, \"timestamp\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"session_records\" VALUES ('cli:old', 100)",
+                (),
+            )
+            .await
+            .unwrap();
+            // Ids out of insertion order on purpose: the table's order was its
+            // UUIDv7 key, and that order is what the file must inherit.
+            for (id, role, body) in [
+                ("m2", "assistant", "hi there"),
+                ("m1", "user", "hello"),
+                ("m3", "user", "again"),
+            ] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO \"message_records\" VALUES ('{id}', 'cli:old', '{role}', '{body}', 100)"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+
+        let url = format!("turso:{}", path.display());
+        let db = Db::connect(&url).await.unwrap();
+        let moved: Vec<String> = MessageRepository::list_by_session(&db, "cli:old")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(moved, ["hello", "hi there", "again"], "in key order");
+        assert_eq!(
+            MessageRepository::count_user_turns(&db, "cli:old")
+                .await
+                .unwrap(),
+            2
+        );
+        drop(db);
+
+        // Connecting again finds an empty table and leaves the file alone.
+        let db = Db::connect(&url).await.unwrap();
+        assert_eq!(
+            MessageRepository::list_by_session(&db, "cli:old")
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "a second connect must not duplicate the transcript"
+        );
+    }
+
     #[tokio::test]
     async fn adds_missing_session_columns_in_place() {
-        let path = std::env::temp_dir().join("komo_db_addcol.db");
-        crate::persistence::reset_test_db(&path);
+        // Its own home: `connect` now moves transcripts out of the table into
+        // `<home>/sessions`, so a shared directory would carry a previous run's
+        // migrated messages into this one.
+        let home = std::env::temp_dir().join("komo-test-db-addcol");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("state.db");
 
         // 1. Seed a turso file with the OLD session_records shape (no
         //    reviewed_through) plus its messages table, then drop the handle.

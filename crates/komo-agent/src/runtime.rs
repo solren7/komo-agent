@@ -895,10 +895,16 @@ mod tests {
         }
     }
 
+    /// A komo home of this test's own, wiped first.
+    ///
+    /// The whole directory, not just the db file: a home now holds transcripts
+    /// beside `state.db`, and two tests sharing a directory would read each
+    /// other's conversations.
     fn sqlite_url(name: &str) -> String {
-        let path = std::env::temp_dir().join(name);
-        komo_infra::persistence::reset_test_db(&path);
-        format!("turso:{}", path.display())
+        let home = std::env::temp_dir().join(format!("komo-test-{name}"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        format!("turso:{}", home.join("state.db").display())
     }
 
     /// A tool-call step with no narration — the shape most tests care about.
