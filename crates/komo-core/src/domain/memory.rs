@@ -1494,6 +1494,56 @@ mod tests {
 
     /// The preview ordering has to put what is closest to promotion on top, or
     /// `komo dream` stops being a useful triage queue.
+    /// Golden case: being retrieved a lot must never make a memory *true*.
+    ///
+    /// This is the self-confirming loop the truth/utility split exists to break.
+    /// Promotion once read the recall counters, so a wrong memory that happened
+    /// to be relevant to a recurring question would keep being injected, keep
+    /// scoring, and promote itself on the strength of nothing but its own
+    /// retrieval. The thing retrieved is not the thing tested.
+    ///
+    /// Ranking is checked below; this checks the *gate*, which is what actually
+    /// decides promotion.
+    #[test]
+    fn retrieval_alone_never_makes_a_memory_supported() {
+        let now = 1_800_000_000;
+
+        // Recalled relentlessly, corroborated by nobody.
+        let mut popular = candidate(500, 10, now);
+        popular.last_used_at = Some(now);
+        assert!(
+            !popular.is_supported(),
+            "500 recalls and no evidence must not clear the promotion bar"
+        );
+
+        // One independent occasion is still not enough — the bar is two.
+        let mut once = candidate(0, 10, now);
+        once.record_evidence("session-a", EvidenceRelation::Supports, "said it once", now);
+        assert!(!once.is_supported(), "one occasion is not corroboration");
+
+        // A second, independent occasion clears it.
+        let mut twice = once.clone();
+        twice.record_evidence(
+            "session-b",
+            EvidenceRelation::Supports,
+            "said it again",
+            now,
+        );
+        assert!(
+            twice.is_supported(),
+            "two independent occasions corroborate"
+        );
+
+        // ...but the same session saying it twice is one occasion, however
+        // talkative it is. Otherwise one conversation corroborates itself.
+        let mut echo = once.clone();
+        echo.record_evidence("session-a", EvidenceRelation::Supports, "and again", now);
+        assert!(
+            !echo.is_supported(),
+            "one session cannot be two independent occasions"
+        );
+    }
+
     #[test]
     fn dream_score_ranks_supported_candidates_above_merely_recalled_ones() {
         let now = 10_000 * 86_400;
