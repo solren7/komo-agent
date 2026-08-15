@@ -5,8 +5,16 @@ use super::{
     policy, resume, service, skill, upgrade, wechat, wiki, workday,
 };
 
+/// The version every surface reports: the crate version plus the commit it was
+/// built from (see `build.rs`).
+///
+/// One string, because the whole use of it is comparing two processes — a CLI
+/// that printed the crate version while the gateway printed something else
+/// would be worse than useless.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KOMO_BUILD"));
+
 #[derive(Parser)]
-#[command(name = "komo", version, about = "Personal agent framework")]
+#[command(name = "komo", version = VERSION, about = "Personal agent framework")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -730,7 +738,7 @@ pub async fn run() -> anyhow::Result<()> {
             stdout,
         }) => logs::run(lines, follow, stdout),
         Some(Commands::Version) => {
-            println!("komo {}", env!("CARGO_PKG_VERSION"));
+            println!("komo {VERSION}");
             Ok(())
         }
     }

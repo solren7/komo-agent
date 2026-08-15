@@ -1,4 +1,7 @@
 mod app;
+
+/// The version string every surface reports — see [`app::VERSION`].
+pub use app::VERSION;
 mod approver;
 mod channel;
 mod doctor;

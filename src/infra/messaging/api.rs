@@ -514,7 +514,7 @@ struct ChatMessage {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+    Json(json!({ "status": "ok", "version": crate::cli::VERSION }))
 }
 
 async fn list_models() -> impl IntoResponse {
@@ -1014,7 +1014,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
     let sessions = state.actions.session_summaries().await?.len();
     Ok(Json(json!({
         "ok": true,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::cli::VERSION,
         "channels": state.channels.as_ref(),
         "home_chat": state.home,
         "provider": state.provider.as_ref(),
