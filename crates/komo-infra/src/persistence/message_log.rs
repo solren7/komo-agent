@@ -38,8 +38,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use komo_core::domain::message::Message;
-use komo_core::domain::message::Role;
+use komo_core::domain::message::{Message, Role, ToolEntry};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -50,17 +49,48 @@ use tracing::warn;
 /// guessing at it — the same rule the turn journal follows.
 const LINE_VERSION: u32 = 1;
 
-/// One line of a transcript file.
+/// Marks a line that records a tool call rather than something that was said.
 ///
-/// The message's own fields are flattened in, so a line reads as the message it
-/// is plus a version. Unknown fields are ignored by serde, which is what lets a
-/// newer komo's file still load in an older one.
+/// Absent on a message line — which is also every line written before tool
+/// activity was recorded here at all, so the older files read unchanged.
+const KIND_TOOL: &str = "tool";
+
+/// The part of a line that is common to both kinds, read first to decide how to
+/// read the rest.
+#[derive(Deserialize)]
+struct LineHeader {
+    #[serde(default = "default_version")]
+    v: u32,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// A message line: the message's own fields, flattened in, plus a version.
+/// Unknown fields are ignored by serde, which is what lets a newer komo's file
+/// still load in an older one.
 #[derive(Serialize, Deserialize)]
-struct Line {
+struct MessageLine {
     #[serde(default = "default_version")]
     v: u32,
     #[serde(flatten)]
     message: Message,
+}
+
+/// A tool line. Carries `kind` so a reader can tell it from a message without
+/// guessing at which fields are present.
+#[derive(Serialize, Deserialize)]
+struct ToolLine {
+    #[serde(default = "default_version")]
+    v: u32,
+    kind: String,
+    #[serde(flatten)]
+    entry: ToolEntry,
+}
+
+/// What one line turned out to be.
+enum Entry {
+    Said(Message),
+    Ran(ToolEntry),
 }
 
 fn default_version() -> u32 {
@@ -116,8 +146,8 @@ impl MessageLog {
         locks.entry(session_id.to_string()).or_default().clone()
     }
 
-    /// Every message in a session, in the order they were appended.
-    pub async fn list(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
+    /// Every line of a session's file, in order — what was said and what ran.
+    async fn entries(&self, session_id: &str) -> anyhow::Result<Vec<Entry>> {
         let path = self.path_for(session_id);
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,
@@ -132,6 +162,45 @@ impl MessageLog {
             }
         };
         Ok(parse_lines(&text, &path))
+    }
+
+    /// Every message in a session, in the order they were appended.
+    ///
+    /// Tool lines are skipped: they are a record of the work, not part of what
+    /// was said, and this is what feeds the model's history.
+    pub async fn list(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
+        Ok(self
+            .entries(session_id)
+            .await?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Said(message) => Some(message),
+                Entry::Ran(_) => None,
+            })
+            .collect())
+    }
+
+    /// The tool calls a session recorded, in order.
+    pub async fn tools(&self, session_id: &str) -> anyhow::Result<Vec<ToolEntry>> {
+        Ok(self
+            .entries(session_id)
+            .await?
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Ran(tool) => Some(tool),
+                Entry::Said(_) => None,
+            })
+            .collect())
+    }
+
+    /// Append one tool record.
+    pub async fn append_tool(&self, session_id: &str, entry: &ToolEntry) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&ToolLine {
+            v: LINE_VERSION,
+            kind: KIND_TOOL.to_string(),
+            entry: entry.clone(),
+        })?;
+        self.append_line(session_id, &line).await
     }
 
     /// The most recent `limit` messages, still in chronological order.
@@ -157,12 +226,15 @@ impl MessageLog {
 
     /// Append one message.
     pub async fn append(&self, session_id: &str, message: &Message) -> anyhow::Result<()> {
-        let path = self.path_for(session_id);
-        let line = serde_json::to_string(&Line {
+        let line = serde_json::to_string(&MessageLine {
             v: LINE_VERSION,
             message: message.clone(),
         })?;
+        self.append_line(session_id, &line).await
+    }
 
+    async fn append_line(&self, session_id: &str, line: &str) -> anyhow::Result<()> {
+        let path = self.path_for(session_id);
         let lock = self.lock_for(session_id).await;
         let _held = lock.lock().await;
         let mut file = tokio::fs::OpenOptions::new()
@@ -199,10 +271,27 @@ impl MessageLog {
         let lock = self.lock_for(session_id).await;
         let _held = lock.lock().await;
 
-        let mut messages = self.list(session_id).await?;
-        let removed = count.min(messages.len());
-        messages.truncate(messages.len() - removed);
-        self.rewrite(session_id, &messages).await?;
+        let mut entries = self.entries(session_id).await?;
+        // Walk back to the `count`-th message from the end and cut there. The
+        // tool lines after it go too: they are the work of the turn being taken
+        // back, and leaving them would attribute it to the turn before.
+        let mut seen = 0usize;
+        let mut cut = 0usize;
+        for (i, entry) in entries.iter().enumerate().rev() {
+            if matches!(entry, Entry::Said(_)) {
+                seen += 1;
+                if seen == count {
+                    cut = i;
+                    break;
+                }
+            }
+        }
+        let removed = seen.min(count);
+        if removed == 0 {
+            return Ok(0);
+        }
+        entries.truncate(cut);
+        self.rewrite(session_id, &entries).await?;
         Ok(removed)
     }
 
@@ -212,13 +301,17 @@ impl MessageLog {
         let lock = self.lock_for(session_id).await;
         let _held = lock.lock().await;
 
-        let mut messages = self.list(session_id).await?;
-        let Some(last) = messages.iter_mut().rev().find(|m| m.role == Role::User) else {
+        let mut entries = self.entries(session_id).await?;
+        let last = entries.iter_mut().rev().find_map(|entry| match entry {
+            Entry::Said(message) if message.role == Role::User => Some(message),
+            _ => None,
+        });
+        let Some(last) = last else {
             return Ok(false);
         };
         last.content.push('\n');
         last.content.push_str(extra);
-        self.rewrite(session_id, &messages).await?;
+        self.rewrite(session_id, &entries).await?;
         Ok(true)
     }
 
@@ -260,14 +353,21 @@ impl MessageLog {
     /// old transcript or the new one — the two operations that use this
     /// (cancel-rollback and the mid-turn interjection) rewrite a file another
     /// turn may be about to read.
-    async fn rewrite(&self, session_id: &str, messages: &[Message]) -> anyhow::Result<()> {
+    async fn rewrite(&self, session_id: &str, entries: &[Entry]) -> anyhow::Result<()> {
         let path = self.path_for(session_id);
         let mut body = String::new();
-        for message in messages {
-            body.push_str(&serde_json::to_string(&Line {
-                v: LINE_VERSION,
-                message: message.clone(),
-            })?);
+        for entry in entries {
+            body.push_str(&match entry {
+                Entry::Said(message) => serde_json::to_string(&MessageLine {
+                    v: LINE_VERSION,
+                    message: message.clone(),
+                })?,
+                Entry::Ran(tool) => serde_json::to_string(&ToolLine {
+                    v: LINE_VERSION,
+                    kind: KIND_TOOL.to_string(),
+                    entry: tool.clone(),
+                })?,
+            });
             body.push('\n');
         }
         let temp = path.with_extension("jsonl.tmp");
@@ -287,23 +387,36 @@ impl MessageLog {
 /// written by a komo whose format this one does not know. Neither is repairable
 /// and neither should cost the rest of the transcript — but a dropped message is
 /// a real loss, so it is never silent.
-fn parse_lines(text: &str, path: &Path) -> Vec<Message> {
-    let mut messages = Vec::new();
+fn parse_lines(text: &str, path: &Path) -> Vec<Entry> {
+    let mut entries = Vec::new();
     let mut skipped = 0usize;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<Line>(line) {
-            Ok(parsed) if parsed.v <= LINE_VERSION => messages.push(parsed.message),
-            Ok(parsed) => {
-                warn!(
-                    path = %path.display(),
-                    version = parsed.v,
-                    "transcript line written by a newer komo; skipped"
-                );
-                skipped += 1;
-            }
+        // The header decides which shape to read; a line whose header will not
+        // parse cannot be read as either.
+        let Ok(header) = serde_json::from_str::<LineHeader>(line) else {
+            warn!(path = %path.display(), "unreadable transcript line; skipped");
+            skipped += 1;
+            continue;
+        };
+        if header.v > LINE_VERSION {
+            warn!(
+                path = %path.display(),
+                version = header.v,
+                "transcript line written by a newer komo; skipped"
+            );
+            skipped += 1;
+            continue;
+        }
+        let parsed = if header.kind.as_deref() == Some(KIND_TOOL) {
+            serde_json::from_str::<ToolLine>(line).map(|l| Entry::Ran(l.entry))
+        } else {
+            serde_json::from_str::<MessageLine>(line).map(|l| Entry::Said(l.message))
+        };
+        match parsed {
+            Ok(entry) => entries.push(entry),
             Err(error) => {
                 warn!(path = %path.display(), %error, "unreadable transcript line; skipped");
                 skipped += 1;
@@ -317,7 +430,7 @@ fn parse_lines(text: &str, path: &Path) -> Vec<Message> {
             "transcript loaded with lines missing"
         );
     }
-    messages
+    entries
 }
 
 #[cfg(test)]
@@ -446,6 +559,115 @@ mod tests {
             log.list("api:s-archived").await.unwrap()[0].content,
             "old talk"
         );
+    }
+
+    fn tool(name: &str) -> ToolEntry {
+        ToolEntry {
+            name: name.to_string(),
+            args: "{}".to_string(),
+            result: "done".to_string(),
+            ok: true,
+            elapsed_ms: 5,
+            timestamp: 0,
+        }
+    }
+
+    /// The whole point of recording tools here: the file holds the work, and
+    /// the model's history does not change by one byte because of it.
+    #[tokio::test]
+    async fn tool_records_share_the_file_but_not_the_history() {
+        let (log, _home) = log("tools");
+        log.append("api:s", &Message::user("count the files"))
+            .await
+            .unwrap();
+        log.append_tool("api:s", &tool("shell")).await.unwrap();
+        log.append_tool("api:s", &tool("read")).await.unwrap();
+        log.append("api:s", &assistant("15")).await.unwrap();
+
+        let said: Vec<String> = log
+            .list("api:s")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(said, ["count the files", "15"], "tools are not messages");
+
+        let ran: Vec<String> = log
+            .tools("api:s")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(ran, ["shell", "read"], "and the work is still on file");
+
+        // The user-turn count the review cadence rides on must not see them.
+        assert_eq!(log.count_user_turns("api:s").await.unwrap(), 1);
+    }
+
+    /// A window of N messages is N *messages*, however many tool lines sit
+    /// between them — otherwise a tool-heavy turn would silently shrink the
+    /// history the model is given.
+    #[tokio::test]
+    async fn the_window_counts_messages_not_lines() {
+        let (log, _home) = log("window-tools");
+        for text in ["a", "b", "c"] {
+            log.append("api:s", &assistant(text)).await.unwrap();
+            log.append_tool("api:s", &tool("shell")).await.unwrap();
+        }
+        let got: Vec<String> = log
+            .window("api:s", 2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(got, ["b", "c"]);
+    }
+
+    /// Taking a turn back takes its tool calls with it: they are that turn's
+    /// work, and leaving them would attribute it to the turn before.
+    #[tokio::test]
+    async fn rolling_back_a_turn_drops_the_tools_it_ran() {
+        let (log, _home) = log("rollback-tools");
+        log.append("api:s", &Message::user("first")).await.unwrap();
+        log.append_tool("api:s", &tool("early")).await.unwrap();
+        log.append("api:s", &Message::user("cancelled"))
+            .await
+            .unwrap();
+        log.append_tool("api:s", &tool("late")).await.unwrap();
+
+        assert_eq!(log.delete_recent("api:s", 1).await.unwrap(), 1);
+        let said: Vec<String> = log
+            .list("api:s")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(said, ["first"]);
+        let ran: Vec<String> = log
+            .tools("api:s")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(ran, ["early"], "the cancelled turn's tool call went too");
+    }
+
+    /// An interjection edits the last user message and leaves the tool lines
+    /// around it exactly where they were.
+    #[tokio::test]
+    async fn an_interjection_leaves_tool_records_in_place() {
+        let (log, _home) = log("interject-tools");
+        log.append("api:s", &Message::user("go")).await.unwrap();
+        log.append_tool("api:s", &tool("shell")).await.unwrap();
+
+        assert!(log.append_to_last_user("api:s", "and hurry").await.unwrap());
+        assert_eq!(log.list("api:s").await.unwrap()[0].content, "go\nand hurry");
+        assert_eq!(log.tools("api:s").await.unwrap().len(), 1);
     }
 
     /// A process killed mid-append leaves a truncated last line. The rest of the

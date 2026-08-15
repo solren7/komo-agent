@@ -1,6 +1,10 @@
 use async_trait::async_trait;
 
-use super::{message::Message, session::Session, skill::Skill};
+use super::{
+    message::{Message, ToolEntry},
+    session::Session,
+    skill::Skill,
+};
 
 /// A session's identity + review watermark without its transcript — the cheap
 /// projection the review sweep scans to decide which sessions have new activity,
@@ -125,6 +129,20 @@ pub trait MessageRepository: Send + Sync {
     /// replay. Safe for the same reason as [`delete_recent`](Self::delete_recent)
     /// — one turn per session, so nothing else is appending.
     async fn append_to_last_user(&self, session_id: &str, extra: &str) -> anyhow::Result<bool>;
+
+    /// Record one tool call in the transcript.
+    ///
+    /// Never read back into the model's history — see [`ToolEntry`]. It makes
+    /// the transcript a complete account of the conversation *including the
+    /// work*, which is what an operator reading the file, or a client rendering
+    /// it, actually needs. Best-effort at the call site, like the ledger:
+    /// failing to record what a tool did must not fail the tool.
+    ///
+    /// Default no-op, so a store that keeps only what was said is still a valid
+    /// transcript store.
+    async fn record_tool(&self, _session_id: &str, _entry: &ToolEntry) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]

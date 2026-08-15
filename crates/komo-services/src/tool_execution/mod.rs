@@ -38,7 +38,9 @@ use komo_core::domain::catalog::{CatalogSnapshot, ToolCatalog};
 use komo_core::domain::events::TurnEvent;
 use komo_core::domain::hooks::{HookDecision, ToolHook};
 use komo_core::domain::llm::{ToolCallReq, ToolOutcome};
+use komo_core::domain::message::ToolEntry;
 use komo_core::domain::policy::{Access, Category, Policy};
+use komo_core::domain::repository::MessageRepository;
 use komo_core::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
 use komo_core::domain::tool::{Tool, ToolError};
 
@@ -195,6 +197,10 @@ pub struct ToolExecutionCore {
     /// Tool hooks, run around every call in registration order (first `Deny`
     /// wins). Registered during wiring; a pinned executor carries the same set.
     hooks: Vec<Arc<dyn ToolHook>>,
+    /// Where a tool call is recorded in the session's transcript, so the file
+    /// holds the work and not only what was said. `None` (tests, aux executors)
+    /// ⇒ nothing is recorded, which is what the transcript looked like before.
+    transcript: Option<Arc<dyn MessageRepository>>,
 }
 
 impl ToolExecutor {
@@ -213,6 +219,7 @@ impl ToolExecutor {
                 approver: Arc::new(DenyAllApprover),
                 output_store: None,
                 hooks: Vec::new(),
+                transcript: None,
             }),
         }
     }
@@ -239,6 +246,7 @@ impl ToolExecutor {
                 approver: self.core.approver.clone(),
                 output_store: self.core.output_store.clone(),
                 hooks: self.core.hooks.clone(),
+                transcript: self.core.transcript.clone(),
             }),
         }
     }
@@ -279,6 +287,16 @@ impl ToolExecutor {
         let core = Arc::get_mut(&mut self.core)
             .expect("set the output store during wiring, before the executor is shared");
         core.output_store = Some(store);
+        self
+    }
+
+    /// Install the transcript a tool call is recorded in. Absent ⇒ calls are
+    /// not recorded there, which is every aux executor: their sessions are
+    /// synthetic and a file per one-shot turn is litter.
+    pub fn with_transcript(mut self, transcript: Arc<dyn MessageRepository>) -> Self {
+        let core = Arc::get_mut(&mut self.core)
+            .expect("set the transcript during wiring, before the executor is shared");
+        core.transcript = Some(transcript);
         self
     }
 
@@ -754,6 +772,32 @@ impl ToolExecutionCore {
             };
             if let Err(error) = run.repo.append_step(&step).await {
                 warn!(%error, tool = name, "failed to record run step (non-fatal)");
+            }
+
+            // The same call, in the session's own file. Written from the step's
+            // values rather than the raw ones so the transcript inherits the
+            // ledger's redaction and cap — a file an operator opens must not be
+            // the one place a secret survives. Best-effort, like the step: the
+            // record of the work must never cost the work.
+            if let Some(transcript) = &self.transcript {
+                let entry = ToolEntry {
+                    name: name.to_string(),
+                    args: step.args.clone(),
+                    result: if step.ok {
+                        step.result.clone()
+                    } else {
+                        step.error.clone()
+                    },
+                    ok: step.ok,
+                    elapsed_ms,
+                    timestamp: ended_at,
+                };
+                if let Err(error) = transcript
+                    .record_tool(&context.session.session_id, &entry)
+                    .await
+                {
+                    warn!(%error, tool = name, "failed to record the tool call in the transcript (non-fatal)");
+                }
             }
         }
 

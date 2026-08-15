@@ -304,6 +304,14 @@ pub async fn build(
         )
         .with_approver(approver)
         .with_output_store(output_store.clone());
+        // Only the main runtime records its tool calls in a transcript: every
+        // other scope runs on a synthetic session (delegate, cron, briefing),
+        // where a file per one-shot turn is litter rather than history. Set
+        // here, not on the returned executor — registering a tool shares the
+        // core, and the setters take `Arc::get_mut`.
+        if scope == Scope::MAIN {
+            tools = tools.with_transcript(db.clone());
+        }
         for tool in registry.tools_for(scope) {
             tools.register(tool.clone());
         }
@@ -399,6 +407,9 @@ pub async fn build(
         model_config.model.clone(),
     ));
 
+    // Only the main runtime records its tool calls in a transcript. Every other
+    // scope runs on a synthetic session (delegate, cron, briefing), and a
+    // transcript file per one-shot turn is litter, not history.
     let tools = executor_for(Scope::MAIN, approver.clone(), Some(delegate));
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance

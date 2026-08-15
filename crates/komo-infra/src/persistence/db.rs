@@ -13,7 +13,7 @@ use crate::persistence::{
 use komo_core::domain::{
     briefing::BriefingMarkRepository,
     home::HomeRepository,
-    message::{Message, Role},
+    message::{Message, Role, ToolEntry},
     pairing::{
         APPROVE_LOCKOUT_SECS, APPROVE_MAX_FAILURES, ApproveOutcome, PAIRING_CODE_TTL_SECS,
         PairingRepository, PairingRequest, PairingStatus, parse_pairing_status, verify_code,
@@ -798,6 +798,10 @@ impl MessageRepository for Db {
 
     async fn append_to_last_user(&self, session_id: &str, extra: &str) -> anyhow::Result<bool> {
         self.messages.append_to_last_user(session_id, extra).await
+    }
+
+    async fn record_tool(&self, session_id: &str, entry: &ToolEntry) -> anyhow::Result<()> {
+        self.messages.append_tool(session_id, entry).await
     }
 }
 
