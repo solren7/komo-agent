@@ -540,59 +540,81 @@ mod tests {
     /// columns existed must gain them **in place** on connect — additive ALTER, no
     /// data loss — rather than force a destructive reset. Memories are durable
     /// personal data; "delete the file" is not an available migration.
-    /// A db that still carries a column this komo no longer models must stay
-    /// writable.
+    /// Every schema komo has ever shipped must still accept a write.
     ///
-    /// `recall_query_hashes` was added 2026-07-03 and dropped from the model on
-    /// 2026-08-12. Dropping it from the model does not drop it from anyone's
-    /// file — every store created or upgraded in between still has the column,
-    /// still `NOT NULL`, and an insert that never mentions it fails the
-    /// constraint. Which is a memory store that has silently stopped accepting
-    /// memories.
+    /// This is the guard the `recall_query_hashes` outage did not have. Removing
+    /// a field from the model removes the column from *new* files only; every
+    /// store already on disk keeps it, and a column that is `NOT NULL` without a
+    /// default then fails every insert that no longer mentions it. The store
+    /// reports no schema problem — it just stops accepting memories.
+    ///
+    /// **When you remove a field from `MemoryRecord`, add its column name to
+    /// `RETIRED` in `ensure_columns`.** A snapshot below still creates that
+    /// column, so forgetting makes this test fail instead of making someone's
+    /// memory store fail silently, days later.
+    ///
+    /// Adding a snapshot: paste the `CREATE TABLE` a released komo would have
+    /// written, and never edit an existing one — each is a record of a file
+    /// somebody may still be running.
     #[tokio::test]
-    async fn a_store_carrying_a_retired_column_still_accepts_writes() {
-        let home = std::env::temp_dir().join("komo-test-mem-retired-col");
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::create_dir_all(&home).expect("test home");
-        let path = home.join("memory.db");
+    async fn every_shipped_schema_still_accepts_writes() {
+        // The 15 columns before any of the recall/truth work.
+        const ORIGINAL: &str = "\"id\" TEXT NOT NULL, \"kind\" TEXT NOT NULL, \"content\" TEXT NOT NULL, \
+             \"status\" TEXT NOT NULL, \"confidence\" TEXT NOT NULL, \"importance\" BIGINT NOT NULL, \
+             \"pinned\" BOOLEAN NOT NULL, \"scope_type\" TEXT NOT NULL, \"scope_key\" TEXT NOT NULL, \
+             \"source\" TEXT NOT NULL, \"source_message_id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, \
+             \"updated_at\" BIGINT NOT NULL, \"expires_at\" BIGINT NOT NULL, \"last_used_at\" BIGINT NOT NULL";
 
-        // A store as it looked between those two dates: today's columns plus the
-        // one that was retired.
-        {
-            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-                .build()
+        let snapshots: &[(&str, String)] = &[
+            ("2026-06 original", ORIGINAL.to_string()),
+            (
+                // 2026-07-03: dream promotion weighed query diversity. Retired
+                // 2026-08-12 — this is the shape that stopped accepting writes.
+                "2026-07-03 query diversity",
+                format!(
+                    "{ORIGINAL}, \"recall_count\" BIGINT NOT NULL, \"recall_query_hashes\" TEXT NOT NULL"
+                ),
+            ),
+        ];
+
+        for (name, columns) in snapshots {
+            let home = std::env::temp_dir()
+                .join(format!("komo-test-mem-schema-{}", name.replace(' ', "-")));
+            std::fs::remove_dir_all(&home).ok();
+            std::fs::create_dir_all(&home).expect("test home");
+            let path = home.join("memory.db");
+
+            {
+                let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                    .build()
+                    .await
+                    .unwrap();
+                let conn = db.connect().unwrap();
+                conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+                conn.execute(
+                    &format!("CREATE TABLE \"memory_records\" ({columns}, PRIMARY KEY (\"id\"))"),
+                    (),
+                )
                 .await
                 .unwrap();
-            let conn = db.connect().unwrap();
-            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-            conn.execute(
-                "CREATE TABLE \"memory_records\" (\
-                 \"id\" TEXT NOT NULL, \"kind\" TEXT NOT NULL, \"content\" TEXT NOT NULL, \
-                 \"status\" TEXT NOT NULL, \"confidence\" TEXT NOT NULL, \"importance\" BIGINT NOT NULL, \
-                 \"pinned\" BOOLEAN NOT NULL, \"scope_type\" TEXT NOT NULL, \"scope_key\" TEXT NOT NULL, \
-                 \"source\" TEXT NOT NULL, \"source_message_id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, \
-                 \"updated_at\" BIGINT NOT NULL, \"expires_at\" BIGINT NOT NULL, \"last_used_at\" BIGINT NOT NULL, \
-                 \"recall_query_hashes\" TEXT NOT NULL, \
-                 PRIMARY KEY (\"id\"))",
-                (),
-            )
-            .await
-            .unwrap();
+            }
+            std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+
+            let db = MemoryDb::connect(&format!("turso:{}", path.display()))
+                .await
+                .unwrap_or_else(|e| panic!("`{name}` must still open: {e}"));
+            let mut memory = Memory::new(MemoryKind::Fact, "written after the upgrade");
+            memory.id = "mem-after".to_string();
+            db.save(&memory).await.unwrap_or_else(|e| {
+                panic!(
+                    "`{name}` must still accept a write — add the retired column to RETIRED: {e}"
+                )
+            });
+
+            let rows = db.list().await.unwrap();
+            assert_eq!(rows.len(), 1, "`{name}`");
+            assert_eq!(rows[0].content, "written after the upgrade", "`{name}`");
         }
-        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
-
-        let db = MemoryDb::connect(&format!("turso:{}", path.display()))
-            .await
-            .unwrap();
-        let mut memory = Memory::new(MemoryKind::Fact, "a memory written after the upgrade");
-        memory.id = "mem-after".to_string();
-        db.save(&memory)
-            .await
-            .expect("a retired column must not block a write");
-
-        let rows = db.list().await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].content, "a memory written after the upgrade");
     }
 
     #[tokio::test]
