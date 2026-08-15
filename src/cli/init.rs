@@ -61,6 +61,15 @@ provider = "deepseek"
 # url = "http://127.0.0.1:6334"  # server backend only (QDRANT_API_KEY in .env)
 # collection = "komo_wiki"
 
+# --- python plugins ----------------------------------------------------------
+
+# On by default: the gateway creates ~/.komo/plugins/ at startup and runs an
+# out-of-process python3 host. Every *.py there with an @tool decorator becomes
+# a py__<name> tool (hot-reloaded on save), and run_code lets the agent write
+# programs that call its own tools. Requires python3 on PATH.
+# [plugins.pyhost]
+# enabled = false                # opt out (also silences the python3 warning)
+
 # --- ingress channels (each needs its credential in .env) -------------------
 
 # [channels.telegram]

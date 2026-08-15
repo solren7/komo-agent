@@ -142,12 +142,11 @@ async fn gateway_health(reachable: bool) -> Option<serde_json::Value> {
     None
 }
 
-/// The python plugin host: enabled at all, and — the invisible half — whether
-/// the *running* gateway knows about it. The host is opted into by the plugins
-/// directory existing at boot, so a directory created afterwards changes
-/// nothing until a restart, with no error anywhere: run_code and every py__
-/// tool are simply absent. That is indistinguishable from "not enabled" unless
-/// something compares the filesystem against the live catalog.
+/// The python plugin host — on by default (the gateway creates the plugins
+/// directory at startup), so what needs checking is the *running* gateway's
+/// live state: a config opt-out, an older gateway, or a missing interpreter
+/// all leave run_code and every py__ tool silently absent, indistinguishable
+/// from working unless something asks the live catalog.
 fn plugin_health(config: &ConfigSnapshot, health: Option<&serde_json::Value>) {
     println!("\nplugins:");
     let dir = config.runtime.home.join("plugins");
@@ -159,21 +158,23 @@ fn plugin_health(config: &ConfigSnapshot, health: Option<&serde_json::Value>) {
         .and_then(|p| p.get("tools"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    match (dir.is_dir(), run_code) {
-        (false, _) => println!(
-            "  {OFF} not enabled — `mkdir {}` and restart to get run_code + python plugins",
-            dir.display()
-        ),
-        (true, Some(true)) => {
+    match run_code {
+        Some(true) => {
             println!("  {OK} host wired, run_code + {mounted} python tool(s) mounted")
         }
-        (true, Some(false)) => println!(
-            "  {BAD} {} exists but the running gateway predates it — `komo gateway restart`",
-            dir.display()
+        // The gateway answered and run_code is not in its catalog: opted out,
+        // predates default-on, or python3 is missing (the gateway log says
+        // which).
+        Some(false) => println!(
+            "  {BAD} python host not wired — [plugins.pyhost] disabled, python3 missing, \
+             or a pre-default-on gateway; `komo logs` says which, `komo gateway restart` \
+             picks up changes"
         ),
-        // No live report: an older gateway, or none running at all.
-        (true, None) => println!(
-            "  ! {} exists; live state unknown (gateway not answering or older than this CLI)",
+        None if dir.is_dir() => {
+            println!("  ! live state unknown (gateway not answering or older than this CLI)")
+        }
+        None => println!(
+            "  {OFF} {} absent — created on the next gateway start",
             dir.display()
         ),
     }

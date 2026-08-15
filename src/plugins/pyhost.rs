@@ -61,13 +61,32 @@ impl Plugin for PyHostPlugin {
 
     async fn setup_tools(&self, reg: &mut ToolRegistry, cx: &ToolCx<'_>) -> anyhow::Result<()> {
         let plugins_dir = cx.config.runtime.home.join("plugins");
-        if !plugins_dir.is_dir() {
-            // No directory means no plugins can exist. Creating one the user
-            // did not ask for, and paying an interpreter to watch it, is worse
-            // than waiting for the deliberate act of making it.
-            tracing::debug!(
+        // Created rather than waited for. The directory used to be the opt-in,
+        // on the theory that an interpreter watching a directory nobody asked
+        // for is waste — but run_code rides the same host, and code mode is
+        // part of the default toolset, so the host earns its keep with zero
+        // plugin files. The old gate also failed silently: two deployments ran
+        // without run_code for days because nobody knew a mkdir was the switch.
+        // Opting out is explicit now: `[plugins.pyhost] enabled = false`.
+        if let Err(error) = std::fs::create_dir_all(&plugins_dir) {
+            tracing::warn!(
+                %error,
                 dir = %plugins_dir.display(),
-                "no plugin directory; the python plugin host is not started"
+                "could not create the plugin directory; the python plugin host is not started"
+            );
+            return Ok(());
+        }
+        // One probe before committing to a supervisor: without an interpreter
+        // the restart loop would warn every minute forever on a machine that
+        // is simply never going to have one. Absence is a clean, one-line skip.
+        if std::process::Command::new(PYTHON)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            tracing::warn!(
+                "`{PYTHON}` not found; the python plugin host is not started \
+                 (install python3, or set [plugins.pyhost] enabled = false to silence this)"
             );
             return Ok(());
         }
