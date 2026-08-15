@@ -34,6 +34,9 @@ impl GatewayOperatorAdapter {
             }
             OperatorQuery::Run { id } => OperatorQueryResult::Run(self.client.run(&id).await?),
             OperatorQuery::Sessions => OperatorQueryResult::Sessions(self.client.sessions().await?),
+            OperatorQuery::MemorySearch { query, limit } => {
+                OperatorQueryResult::MemorySearch(self.client.memory_search(&query, limit).await?)
+            }
             OperatorQuery::Memories => OperatorQueryResult::Memories(self.client.memories().await?),
             OperatorQuery::Pairings => OperatorQueryResult::Pairings(self.client.pairings().await?),
             OperatorQuery::DreamPreview => {

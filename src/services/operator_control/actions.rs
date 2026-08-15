@@ -250,6 +250,15 @@ impl OperatorActions {
         repair_memory_scopes(self.memories.as_ref()).await
     }
 
+    /// Ranked memory search — the operator's view of the same hybrid query
+    /// recall and the model's `memory search` run.
+    pub async fn memory_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Memory>> {
+        let Some(service) = &self.memory_query else {
+            anyhow::bail!("memory search is served by the gateway's query service");
+        };
+        search_memories(service, self.memories.as_ref(), query, limit).await
+    }
+
     /// Embed every memory still missing a current vector.
     pub async fn memory_backfill(&self) -> anyhow::Result<usize> {
         let Some(query) = &self.memory_query else {
@@ -422,6 +431,39 @@ pub async fn apply_memory_transition(
 /// durable personal data, so it is the operator's call, not a silent migration.
 /// Idempotent — a second run finds nothing left to move. Only `api` scopes are
 /// touched; a real chat channel's scope is a privacy boundary and stays put.
+/// Ranked memory search over the whole library, one implementation for both
+/// operator paths (gateway and direct).
+///
+/// Reuses recall's own query building and ranking (`select_recall`) rather than
+/// a private matcher, which is what retired the CLI's old substring scan: a
+/// substring cannot cross languages and cannot even find "智能设备" in a memory
+/// that says 智能插座. One deliberate difference from recall — the scope
+/// context is built from the scopes the library actually holds, so nothing is
+/// hidden: this is an operator surface, like the `Memories` listing above it.
+pub async fn search_memories(
+    service: &komo_services::memory_query::MemoryQueryService,
+    memories: &dyn MemoryRepository,
+    text: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Memory>> {
+    let all = memories.list().await?;
+    let mut allowed_scopes: Vec<komo_core::domain::memory::MemoryScope> = Vec::new();
+    for memory in &all {
+        if !allowed_scopes.contains(&memory.scope) {
+            allowed_scopes.push(memory.scope.clone());
+        }
+    }
+    let ctx = komo_core::domain::memory::MemoryContext { allowed_scopes };
+    let query = service.build_query(text).await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    Ok(
+        komo_core::domain::memory::select_recall(&all, &ctx, &query, limit, now)
+            .into_iter()
+            .map(|scored| scored.memory)
+            .collect(),
+    )
+}
+
 pub async fn repair_memory_scopes(memories: &dyn MemoryRepository) -> anyhow::Result<usize> {
     let mut repaired = 0usize;
     for mut memory in memories.list().await? {

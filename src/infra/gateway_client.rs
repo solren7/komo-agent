@@ -585,6 +585,20 @@ impl GatewayClient {
         Ok((promoted, archived))
     }
 
+    /// Ranked memory search server-side, where the embedder lives.
+    pub async fn memory_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<komo_core::domain::memory::Memory>> {
+        self.post_field(
+            "/api/memories/search",
+            json!({ "query": query, "limit": limit }),
+            "memories",
+        )
+        .await
+    }
+
     /// Embed every memory still missing a current vector, server-side; returns
     /// how many gained one. Slow by nature — a never-embedded library calls the
     /// model once per batch — so it rides the long timeout, like wiki indexing.

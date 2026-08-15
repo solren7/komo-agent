@@ -155,6 +155,17 @@ impl DirectOperatorAdapter {
             OperatorQuery::Sessions => OperatorQueryResult::Sessions(actions::session_summaries(
                 SessionRepository::list(self.db().await?.as_ref()).await?,
             )),
+            OperatorQuery::MemorySearch { query, limit } => {
+                // No gateway, so no embedder: the same scoring runs on terms
+                // alone. Still bigram/word matching with recall's ranking —
+                // strictly better than the substring scan it replaced — but
+                // cross-language hits need the gateway's semantic arm.
+                let db = self.memory().await?;
+                let service = komo_services::memory_query::MemoryQueryService::new(db.clone() as _);
+                OperatorQueryResult::MemorySearch(
+                    actions::search_memories(&service, db.as_ref(), &query, limit).await?,
+                )
+            }
             OperatorQuery::Memories => {
                 OperatorQueryResult::Memories(self.memory().await?.list().await?)
             }

@@ -332,6 +332,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/dream/apply", post(dream_apply))
         .route("/api/memories/repair-scopes", post(memory_repair_scopes))
         .route("/api/memories/backfill", post(memory_backfill))
+        .route("/api/memories/search", post(memory_search))
         .route("/api/wiki/search", post(wiki_search))
         .route("/api/wiki/status", get(wiki_status))
         .route("/api/wiki/index", post(wiki_index))
@@ -1406,6 +1407,25 @@ async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError
         "archived": summary.memories_archived,
     }))
     .into_response())
+}
+
+/// Ranked memory search (backs `komo memory search`): the same hybrid query
+/// recall runs, with the gateway's embedder.
+#[derive(serde::Deserialize)]
+struct MemorySearchBody {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+fn default_search_limit() -> usize {
+    20
+}
+async fn memory_search(
+    State(state): State<AppState>,
+    Json(body): Json<MemorySearchBody>,
+) -> Result<Response, ApiError> {
+    let memories = state.actions.memory_search(&body.query, body.limit).await?;
+    Ok(Json(json!({ "memories": memories })).into_response())
 }
 
 /// Embed every memory still missing a current vector (backs

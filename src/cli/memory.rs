@@ -50,12 +50,22 @@ pub async fn list(control: &OperatorControl, status: Option<String>) -> anyhow::
 
 /// Substring search across all scopes (operator view — no scope enforcement).
 pub async fn search(control: &OperatorControl, query: &str) -> anyhow::Result<()> {
-    let needle = query.to_lowercase();
-    let hits: Vec<Memory> = load_all(control)
+    // The same hybrid query recall runs (lexical terms ∪ semantic vectors), not
+    // a substring scan: an operator searching 智能设备 must find the memory
+    // that says 智能插座, and a Chinese query must find an English memory.
+    let hits = match control
+        .query(OperatorQuery::MemorySearch {
+            query: query.to_string(),
+            limit: 20,
+        })
         .await?
-        .into_iter()
-        .filter(|m| m.content.to_lowercase().contains(&needle))
-        .collect();
+    {
+        OperatorQueryResult::MemorySearch(hits) => hits,
+        _ => unreachable!("MemorySearch answers with MemorySearch"),
+    };
+    if !control.via_gateway() {
+        println!("(gateway not running — lexical match only, no semantic arm)");
+    }
     if hits.is_empty() {
         println!("(no matches)");
         return Ok(());

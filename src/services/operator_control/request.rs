@@ -37,6 +37,10 @@ pub enum OperatorQuery {
     Sessions,
     /// The whole memory library (operator view — no scope enforcement).
     Memories,
+    /// Ranked memory search over the same hybrid query recall uses. Routed like
+    /// every other operator read so a running gateway lends its embedder;
+    /// without one the same scoring runs lexical-only.
+    MemorySearch { query: String, limit: usize },
     /// Hash-free pairing rows.
     Pairings,
     /// The dreaming dry-run classification.
@@ -66,6 +70,7 @@ pub enum OperatorQueryResult {
     Run(Option<(Run, Vec<RunStep>)>),
     Sessions(Vec<SessionSummary>),
     Memories(Vec<Memory>),
+    MemorySearch(Vec<Memory>),
     Pairings(Vec<PairingView>),
     DreamPreview(DreamReport),
     SkillAudit(Vec<SkillInvocation>),
