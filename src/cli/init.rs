@@ -34,6 +34,33 @@ provider = "deepseek"
 # dream_schedule = "0 3 * * *"   # set to "off" to disable
 # dream_schedule_enabled = false     # kill switch, keeps the cron above
 
+# --- memory ------------------------------------------------------------------
+
+# Embeddings for memory recall. Leaving this unset is not a small loss and it
+# is not reported anywhere: recall keeps working, but only *lexically*, and
+# lexical matching cannot cross languages — CJK bigrams and ASCII words are
+# different strings by construction, so a Chinese question can never reach an
+# English memory. The model must be a multilingual one, and the same one over
+# time (a vector is only compared against its own model's space; changing the
+# model re-embeds the library rather than mixing spaces).
+#
+# After setting this on an existing store, run `komo memory backfill` — recall
+# embeds lazily, one batch per read, so a library written before this was
+# configured would stay half-lexical for a long time.
+# [memory]
+# embedding_model = "qwen3-embedding:4b"   # served by ollama
+# embedding_url = "http://127.0.0.1:11434"
+
+# --- note vault (wiki) -------------------------------------------------------
+
+# Semantic search over a directory of markdown notes. Absent = no wiki tools.
+# Falls back to [memory]'s embedding settings when its own are unset.
+# [wiki]
+# vault = "~/notes"
+# backend = "edge"               # edge = in-process; server = shared Qdrant
+# url = "http://127.0.0.1:6334"  # server backend only (QDRANT_API_KEY in .env)
+# collection = "komo_wiki"
+
 # --- ingress channels (each needs its credential in .env) -------------------
 
 # [channels.telegram]
