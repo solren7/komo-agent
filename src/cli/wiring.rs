@@ -390,6 +390,7 @@ pub async fn build(
         review: None,
         journal: None,
         turn_hooks: registry.turn_hooks_for(Scope::SUBAGENT),
+        step_hooks: registry.step_hooks_for(Scope::SUBAGENT),
     });
     let delegate = Arc::new(DelegateTool::new(
         subagent_runtime,
@@ -479,6 +480,7 @@ pub async fn build(
         // aux runtimes below journal nothing — their turns re-dispatch whole.
         journal: Some(db.clone()),
         turn_hooks: registry.turn_hooks_for(Scope::MAIN),
+        step_hooks: registry.step_hooks_for(Scope::MAIN),
     };
 
     // ── Cron agent runtime (general cron, agent mode) ────────────────────────
@@ -533,6 +535,7 @@ pub async fn build(
         review: None,
         journal: None,
         turn_hooks: registry.turn_hooks_for(Scope::CRON),
+        step_hooks: registry.step_hooks_for(Scope::CRON),
     });
 
     // ── Briefing runtime (roadmap §2) ────────────────────────────────────────
@@ -578,6 +581,7 @@ pub async fn build(
         review: None,
         journal: None,
         turn_hooks: registry.turn_hooks_for(Scope::BRIEFING),
+        step_hooks: registry.step_hooks_for(Scope::BRIEFING),
     });
 
     Ok(Wiring {

@@ -2,7 +2,7 @@ use crate::review_coordinator::{ReviewCoordinator, ReviewTrigger};
 use komo_core::domain::{
     cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
     events::{ToolEventSink, TurnEvent},
-    hooks::TurnHook,
+    hooks::{StepDecision, StepHook, TurnHook},
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
     message::{Message, Role},
     repository::{MessageRepository, SessionRepository},
@@ -76,6 +76,10 @@ pub struct AgentRuntime {
     /// awaited serially — a hook is a fast observer, never a worker. Empty for
     /// every runtime without plugins contributing one.
     pub turn_hooks: Vec<Arc<dyn TurnHook>>,
+    /// Between-round hooks (see `domain::hooks`). They inject context the model
+    /// is about to need, or stop a turn that has gone somewhere it should not.
+    /// Empty for every runtime with no plugin contributing one.
+    pub step_hooks: Vec<Arc<dyn StepHook>>,
 }
 
 /// Binds one turn's journal writes to its ledger run: assigns `seq`, and disarms
@@ -607,11 +611,45 @@ impl AgentRuntime {
                         .as_ref()
                         .map(|source| source.take())
                         .unwrap_or_default();
+                    let mut said = said;
+                    if !said.is_empty() {
+                        info!(count = said.len(), "user interjected mid-turn");
+                        interjections.extend(said.iter().cloned());
+                    }
+
+                    // Between-round hooks. Their text rides the same channel as
+                    // a user's interjection — appended to the message carrying
+                    // this round's results — so it grows the request at the end
+                    // and leaves the cached prefix alone. A `Stop` ends the turn
+                    // the way the round budget's does: with an answer.
+                    //
+                    // Deliberately *not* folded into `interjections`: that list
+                    // becomes part of the stored user message, and what a hook
+                    // said is not something the user said. The ledger's step
+                    // record is where it belongs.
+                    let mut stopped_by_hook = None;
+                    for hook in &self.step_hooks {
+                        match hook.pre_step(&session.id, rounds).await {
+                            StepDecision::Continue => {}
+                            StepDecision::Inject(text) if text.trim().is_empty() => {}
+                            StepDecision::Inject(text) => {
+                                info!(hook = hook.name(), round = rounds, "hook injected context");
+                                said.push(text);
+                            }
+                            StepDecision::Stop(reason) => {
+                                info!(hook = hook.name(), round = rounds, "hook stopped the turn");
+                                stopped_by_hook = Some(reason);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(reason) = stopped_by_hook {
+                        break non_empty(reason);
+                    }
+
                     let interjected = if said.is_empty() {
                         None
                     } else {
-                        info!(count = said.len(), "user interjected mid-turn");
-                        interjections.extend(said.iter().cloned());
                         Some(said.join("\n"))
                     };
 
@@ -928,6 +966,7 @@ mod tests {
             review: None,
             journal: None,
             turn_hooks: Vec::new(),
+            step_hooks: Vec::new(),
         };
         (rt, received, interjected)
     }
@@ -1342,6 +1381,7 @@ mod tests {
             review: None,
             journal: None,
             turn_hooks: Vec::new(),
+            step_hooks: Vec::new(),
         };
 
         let result = rt.handle_input("cli:sf", "hi".into()).await;
@@ -1389,6 +1429,218 @@ mod tests {
         assert_eq!(runs[0].tokens_in, 1_200);
         assert_eq!(runs[0].tokens_out, 340);
         assert_eq!(runs[0].tokens_cached, 900);
+    }
+
+    // ── Between-round hooks (domain::hooks::StepHook) ────────────────────────
+
+    struct ScriptedStepHook {
+        label: &'static str,
+        decision: StepDecision,
+        rounds: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl StepHook for ScriptedStepHook {
+        fn name(&self) -> &'static str {
+            self.label
+        }
+        async fn pre_step(&self, _session_id: &str, round: usize) -> StepDecision {
+            self.rounds.lock().unwrap().push(round);
+            self.decision.clone()
+        }
+    }
+
+    fn step_hook(
+        label: &'static str,
+        decision: StepDecision,
+    ) -> (Arc<ScriptedStepHook>, Arc<Mutex<Vec<usize>>>) {
+        let rounds = Arc::new(Mutex::new(Vec::new()));
+        let hook = Arc::new(ScriptedStepHook {
+            label,
+            decision,
+            rounds: rounds.clone(),
+        });
+        (hook, rounds)
+    }
+
+    /// Injected text reaches the model on the round it was produced for, by the
+    /// same channel a user's mid-turn message uses — which is what makes it
+    /// append-only, and so free of any cost to the provider's cached prefix.
+    #[tokio::test]
+    async fn a_step_hook_injects_context_into_the_next_round() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_step_inject.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _received, interjected) = scripted_runtime_seeing_interjections(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("time", "{}")]),
+                Step::Final("noted".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
+        let (hook, rounds) = step_hook("reminder", StepDecision::Inject("budget is tight".into()));
+        let rt = AgentRuntime {
+            step_hooks: vec![hook],
+            ..rt
+        };
+
+        let reply = rt.handle_input("cli:step", "go".into()).await.unwrap();
+        assert_eq!(reply, "noted");
+        assert_eq!(
+            interjected.lock().unwrap().clone(),
+            vec!["budget is tight"],
+            "the hook's text must reach the model mid-turn"
+        );
+        // Called once, before the round that fed the first results back — never
+        // before the opening round, whose context is assembled elsewhere.
+        assert_eq!(rounds.lock().unwrap().clone(), vec![1]);
+    }
+
+    /// What a hook said is not something the user said: it reaches the model,
+    /// and it stays out of the stored user message.
+    #[tokio::test]
+    async fn injected_context_does_not_become_part_of_the_user_message() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_step_transcript.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("time", "{}")]),
+                Step::Final("done".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
+        let (hook, _) = step_hook("reminder", StepDecision::Inject("a hook said this".into()));
+        let rt = AgentRuntime {
+            step_hooks: vec![hook],
+            ..rt
+        };
+        rt.handle_input("cli:steptx", "go".into()).await.unwrap();
+
+        let messages = MessageRepository::list_by_session(&*db, "cli:steptx")
+            .await
+            .unwrap();
+        assert_eq!(
+            messages[0].content, "go",
+            "the user said only what they said"
+        );
+        assert!(!messages[0].content.contains("a hook said this"));
+    }
+
+    /// A `Stop` ends the turn with an answer, the way the round budget does —
+    /// not with an error, and without driving another round.
+    #[tokio::test]
+    async fn a_step_hook_can_stop_the_turn_with_an_answer() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_step_stop.db"))
+                .await
+                .unwrap(),
+        );
+        // The script has a second round the loop must never reach: reaching it
+        // would panic ("script exhausted" is the other way round — here the
+        // extra step simply proves it was not consumed).
+        let (rt, received) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("time", "{}")]),
+                Step::Final("should not be reached".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
+        let (hook, _) = step_hook("guard", StepDecision::Stop("stopping here".into()));
+        let rt = AgentRuntime {
+            step_hooks: vec![hook],
+            ..rt
+        };
+
+        let reply = rt.handle_input("cli:stepstop", "go".into()).await.unwrap();
+        assert_eq!(reply, "stopping here");
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "the stopped round must never reach the model"
+        );
+
+        // The turn is a normal, completed run — a hook stopping a turn is a
+        // decision, not a failure.
+        let run = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(run.status, RunStatus::Done);
+    }
+
+    /// Order matters: every hook's text is delivered, and the first `Stop`
+    /// short-circuits the ones after it.
+    #[tokio::test]
+    async fn hooks_run_in_order_and_the_first_stop_wins() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_step_order.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _received, interjected) = scripted_runtime_seeing_interjections(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("time", "{}")]),
+                Step::Final("unreached".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
+        let (first, _) = step_hook("first", StepDecision::Inject("one".into()));
+        let (second, _) = step_hook("second", StepDecision::Stop("halt".into()));
+        let (third, third_rounds) = step_hook("third", StepDecision::Inject("three".into()));
+        let rt = AgentRuntime {
+            step_hooks: vec![first, second, third],
+            ..rt
+        };
+
+        let reply = rt.handle_input("cli:steporder", "go".into()).await.unwrap();
+        assert_eq!(reply, "halt");
+        assert!(
+            third_rounds.lock().unwrap().is_empty(),
+            "a hook after the stop must not run"
+        );
+        assert!(
+            interjected.lock().unwrap().is_empty(),
+            "a stopped round delivers nothing to the model"
+        );
+    }
+
+    /// An empty injection is a no-op, not an empty line in front of the model.
+    #[tokio::test]
+    async fn an_empty_injection_changes_nothing() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_step_empty.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _received, interjected) = scripted_runtime_seeing_interjections(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("time", "{}")]),
+                Step::Final("fine".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
+        let (hook, _) = step_hook("quiet", StepDecision::Inject("   ".into()));
+        let rt = AgentRuntime {
+            step_hooks: vec![hook],
+            ..rt
+        };
+
+        assert_eq!(
+            rt.handle_input("cli:stepempty", "go".into()).await.unwrap(),
+            "fine"
+        );
+        assert!(interjected.lock().unwrap().is_empty());
     }
 
     /// A turn dispatches against the catalog as it stood when the turn began.
@@ -1707,6 +1959,7 @@ mod tests {
             review: None,
             journal: Some(db.clone()),
             turn_hooks: Vec::new(),
+            step_hooks: Vec::new(),
         };
 
         let reply = rt

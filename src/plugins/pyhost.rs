@@ -13,13 +13,15 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use komo_core::domain::catalog::{Registration, ToolCatalog};
+use komo_core::domain::hooks::{StepDecision, StepHook};
 use komo_core::domain::policy::{Category, Policy};
 use komo_core::domain::tool::Tool;
-use komo_pyhost::{HostEvent, PluginToolDef, PyHost, SharedHost};
+use komo_pyhost::{HostEvent, HostManifest, PluginToolDef, PyHost, SharedHost};
 use komo_tools::plugin::PyTool;
 use komo_tools::run_code::RunCodeTool;
 
@@ -86,6 +88,9 @@ impl Plugin for PyHostPlugin {
         // holds it rather than a host handle, so a restarted host is picked up
         // without re-registering the tool.
         let host = SharedHost::default();
+        // Whether any loaded plugin registered for `pre_step`, kept current by
+        // the supervisor across reloads and restarts.
+        let registered = Arc::new(AtomicBool::new(false));
 
         // Code mode: one tool that runs a program, in place of the model
         // calling three tools in three rounds. Built per executor because a
@@ -98,12 +103,25 @@ impl Plugin for PyHostPlugin {
             }),
         );
 
+        // Between-round hooks, for a plugin that wants to see the turn in
+        // flight. Registered unconditionally but *inert* unless a plugin asked
+        // for the point: the hook checks a flag before it costs an RPC, so a
+        // deployment with no `@hook("pre_step")` pays nothing per round.
+        reg.step_hook(
+            PLUGIN_SCOPE,
+            Arc::new(PluginStepHook {
+                host: host.clone(),
+                registered: registered.clone(),
+            }),
+        );
+
         let catalogs = cx.catalogs.covered_by(PLUGIN_SCOPE);
         let supervisor = Supervisor {
             home: cx.config.runtime.home.clone(),
             plugins_dir,
             catalogs,
             host,
+            pre_step_registered: registered,
         };
         // Supervised in the background: a plugin host that will not start must
         // cost the plugins, never the boot. Its first attempt is made here
@@ -126,6 +144,9 @@ struct Supervisor {
     catalogs: Vec<Arc<ToolCatalog>>,
     /// Published so `run_code` can reach whichever host is current.
     host: SharedHost,
+    /// Set while a loaded plugin has a `pre_step` hook. The between-round hook
+    /// reads it to decide whether a round is worth an RPC at all.
+    pre_step_registered: Arc<AtomicBool>,
 }
 
 impl Supervisor {
@@ -162,7 +183,8 @@ impl Supervisor {
     /// every change, and return when it goes away.
     async fn serve_one_host(&self) -> anyhow::Result<String> {
         let (host, mut events) = PyHost::spawn(PYTHON, &self.home, &self.plugins_dir).await?;
-        let tools = host.manifest().await?;
+        let manifest = host.manifest().await?;
+        self.publish_hooks(&manifest);
         // Published only once the host answered: a handle to a process that
         // cannot speak the protocol is worse than none, because `run_code`
         // would hand programs to it and wait.
@@ -170,17 +192,18 @@ impl Supervisor {
 
         // Held across the loop: dropping these unmounts, which is exactly what
         // should happen when this function returns for any reason.
-        let mut mounted = self.mount(&host, tools);
+        let mut mounted = self.mount(&host, manifest.tools);
 
         while let Some(event) = events.recv().await {
             match event {
-                HostEvent::ManifestChanged(tools) => {
+                HostEvent::ManifestChanged(manifest) => {
+                    self.publish_hooks(&manifest);
                     // Replace wholesale rather than diffing: the host reports
                     // the complete set, and a batch mount is one change to the
                     // model's view — so one prompt-cache invalidation, whether
                     // one tool changed or ten.
                     drop(std::mem::take(&mut mounted));
-                    mounted = self.mount(&host, tools);
+                    mounted = self.mount(&host, manifest.tools);
                 }
                 HostEvent::Exited { status } => return Ok(self.retire(status)),
             }
@@ -192,7 +215,21 @@ impl Supervisor {
     /// instead of handing a program to a dead process.
     fn retire(&self, status: String) -> String {
         self.host.set(None);
+        // A host that is gone has no hooks either — leaving the flag set would
+        // cost an RPC per round to reach nothing.
+        self.pre_step_registered.store(false, Ordering::Relaxed);
         status
+    }
+
+    /// Record whether the loaded plugins registered a `pre_step` hook.
+    fn publish_hooks(&self, manifest: &HostManifest) {
+        let registered = manifest.has_hook(PRE_STEP);
+        if registered != self.pre_step_registered.swap(registered, Ordering::Relaxed) {
+            tracing::info!(
+                registered,
+                "python plugin `pre_step` hook availability changed"
+            );
+        }
     }
 
     /// Mount `tools` into every catalog this supervisor covers.
@@ -220,6 +257,53 @@ impl Supervisor {
                 catalog.mount_all(adapted)
             })
             .collect()
+    }
+}
+
+/// The hook point name, as the SDK spells it.
+const PRE_STEP: &str = "pre_step";
+
+/// Bridges komo's between-round hook to whatever the plugins registered.
+///
+/// Inert unless a plugin asked for the point: a hook runs on every round of
+/// every turn, so "nobody registered one" has to cost nothing rather than an
+/// RPC that returns nothing.
+struct PluginStepHook {
+    host: SharedHost,
+    registered: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl StepHook for PluginStepHook {
+    fn name(&self) -> &'static str {
+        "pyhost"
+    }
+
+    async fn pre_step(&self, session_id: &str, round: usize) -> StepDecision {
+        if !self.registered.load(Ordering::Relaxed) {
+            return StepDecision::Continue;
+        }
+        let Some(host) = self.host.get() else {
+            return StepDecision::Continue;
+        };
+        let payload = serde_json::json!({ "session_id": session_id, "round": round });
+        let outcome = match host.hook(PRE_STEP, payload).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A hook that could not run leaves the turn alone. Failing the
+                // turn over an advisory extension would be the wrong trade: the
+                // conversation is the thing that matters.
+                tracing::warn!(%error, round, "python `pre_step` hook failed; continuing");
+                return StepDecision::Continue;
+            }
+        };
+        if let Some(reply) = outcome.stop {
+            return StepDecision::Stop(reply);
+        }
+        match outcome.inject {
+            Some(text) => StepDecision::Inject(text),
+            None => StepDecision::Continue,
+        }
     }
 }
 

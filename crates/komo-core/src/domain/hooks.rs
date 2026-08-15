@@ -48,6 +48,58 @@ pub trait ToolHook: Send + Sync {
     async fn post_execute(&self, _call: &ToolCallReq, _outcome: &ToolOutcome) {}
 }
 
+/// What a [`StepHook`] decides about the round about to be driven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepDecision {
+    /// Nothing to add. The round proceeds as it would have.
+    Continue,
+    /// Put this text in front of the model for this round.
+    ///
+    /// It rides the same channel a user's mid-turn message does: appended to
+    /// the message that carries the round's tool results. That is what makes it
+    /// cache-safe — the request grows at the end, the cached prefix is
+    /// untouched — and what keeps it honest, since the same path folds it into
+    /// the transcript. Nothing the model was shown goes unrecorded.
+    ///
+    /// Note the shape of what is *not* offered: there is no way to rewrite the
+    /// history or the system prompt. Both would invalidate the provider's
+    /// cached prefix from the first changed token, on every round, and neither
+    /// is something a hook should be able to do silently.
+    Inject(String),
+    /// End the turn now, answering with this text.
+    ///
+    /// For a policy that has decided the turn should not continue — a budget of
+    /// its own, a drift detector. The turn ends the way the round budget's does:
+    /// with an answer, not an error.
+    Stop(String),
+}
+
+/// Runs between the rounds of one turn, before each feed-back of tool results.
+///
+/// The extension point for anything that has to see the turn *in flight*:
+/// inject context the model is about to need, or stop a turn that has gone
+/// somewhere it should not. Hooks run in registration order; the first `Stop`
+/// wins and the first `Inject` is not exclusive — every hook's text is
+/// delivered, in order.
+///
+/// Deliberately not called before the opening round. That round's context is
+/// the system prompt plus the user's message, both assembled once per turn by
+/// machinery that already exists (see the memory enricher); a hook there would
+/// be a second, competing way to do the same thing — and the one place where
+/// injecting text *would* sit in front of the cached prefix rather than after
+/// it.
+#[async_trait]
+pub trait StepHook: Send + Sync {
+    /// Stable name, for logs and diagnostics.
+    fn name(&self) -> &'static str;
+
+    /// Decide what happens before the next round. `round` counts from 1 (the
+    /// opening round, which this is never called for).
+    async fn pre_step(&self, _session_id: &str, _round: usize) -> StepDecision {
+        StepDecision::Continue
+    }
+}
+
 /// Observes turn lifecycle boundaries on the agent loop. Observe-only: turn
 /// control (budget, cancel, spin) stays in the loop itself.
 #[async_trait]

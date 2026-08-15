@@ -43,7 +43,7 @@ use komo_agent::review_coordinator::ReviewCoordinator;
 use komo_agent::runtime::AgentRuntime;
 use komo_config::ConfigSnapshot;
 use komo_core::domain::catalog::ToolCatalog;
-use komo_core::domain::hooks::{ToolHook, TurnHook};
+use komo_core::domain::hooks::{StepHook, ToolHook, TurnHook};
 use komo_core::domain::tool::Tool;
 use komo_infra::persistence::{db::Db, kanban::KanbanDb};
 use komo_infra::skills::FsSkillStore;
@@ -349,6 +349,7 @@ pub struct ToolRegistry {
     factories: Vec<(ToolFactory, Scope)>,
     tool_hooks: Vec<(Arc<dyn ToolHook>, Scope)>,
     turn_hooks: Vec<(Arc<dyn TurnHook>, Scope)>,
+    step_hooks: Vec<(Arc<dyn StepHook>, Scope)>,
     /// Note-vault operator handles, produced by the wiki plugin and consumed
     /// by the host (`komo wiki` over the operator channel).
     pub wiki_ops: Option<WikiOps>,
@@ -383,6 +384,11 @@ impl ToolRegistry {
         self.turn_hooks.push((hook, scope));
     }
 
+    /// Contribute a between-round hook.
+    pub fn step_hook(&mut self, scope: Scope, hook: Arc<dyn StepHook>) {
+        self.step_hooks.push((hook, scope));
+    }
+
     /// The tools visible to `runtime`, in registration order (the executor
     /// name-sorts on registration, so order here carries no cache weight).
     pub fn tools_for(&self, runtime: Scope) -> impl Iterator<Item = &Arc<dyn Tool>> {
@@ -410,6 +416,14 @@ impl ToolRegistry {
 
     pub fn turn_hooks_for(&self, runtime: Scope) -> Vec<Arc<dyn TurnHook>> {
         self.turn_hooks
+            .iter()
+            .filter(|(_, scope)| scope.contains(runtime))
+            .map(|(hook, _)| hook.clone())
+            .collect()
+    }
+
+    pub fn step_hooks_for(&self, runtime: Scope) -> Vec<Arc<dyn StepHook>> {
+        self.step_hooks
             .iter()
             .filter(|(_, scope)| scope.contains(runtime))
             .map(|(hook, _)| hook.clone())

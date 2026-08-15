@@ -22,7 +22,7 @@ import inspect
 import json
 from typing import Any, Callable, Dict, List, Optional
 
-__all__ = ["tool", "registered_tools", "clear"]
+__all__ = ["tool", "hook", "registered_tools", "registered_hooks", "clear"]
 
 # Name → registration. Ordered by insertion, but komo sorts by name before the
 # model ever sees it, so definition order carries no meaning.
@@ -70,6 +70,98 @@ def tool(description: Optional[str] = None, *, name: Optional[str] = None):
     return decorate
 
 
+# Hook name → the functions registered for it, in registration order.
+_HOOKS: "Dict[str, List[Callable[..., Any]]]" = {}
+
+# What a `pre_step` hook may return, beyond `None`/a string.
+PRE_STEP = "pre_step"
+_HOOK_POINTS = (PRE_STEP,)
+
+
+def hook(point: str):
+    """Register a function to run at one of komo's hook points.
+
+    The only point today is `pre_step`, called between the rounds of a turn —
+    after tools have run and before their results go back to the model. Return
+    a string to put text in front of the model for that round, `None` to do
+    nothing, or `stop("...")` to end the turn with an answer:
+
+        from komo_plugin import hook, stop
+
+        @hook("pre_step")
+        def remind(session_id, round):
+            if round >= 5:
+                return "You have taken several rounds; wrap up."
+
+    Injected text reaches the model the way a user's mid-turn message does —
+    appended, never rewriting what came before — so it costs the provider's
+    prompt cache nothing. There is deliberately no way to rewrite the history
+    or the system prompt from here.
+    """
+    if point not in _HOOK_POINTS:
+        raise ValueError(
+            f"unknown hook point `{point}`; known points: {', '.join(_HOOK_POINTS)}"
+        )
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        _HOOKS.setdefault(point, []).append(fn)
+        return fn
+
+    return decorate
+
+
+class Stop(str):
+    """A hook's answer that ends the turn. Build one with `stop(...)`."""
+
+
+def stop(reply: str) -> Stop:
+    """End the turn with `reply` instead of driving another round."""
+    return Stop(reply)
+
+
+def registered_hooks() -> List[str]:
+    """Which hook points have at least one function.
+
+    komo asks so it can skip calling a host that registered none: a hook point
+    nobody uses must cost a running turn nothing at all.
+    """
+    return sorted(point for point, fns in _HOOKS.items() if fns)
+
+
+def run_hook(point: str, payload: Dict[str, Any], warn: Optional[Callable[[str], None]] = None):
+    """Run every function registered at `point` and combine their answers.
+
+    Injections accumulate in registration order; the first `stop` wins and the
+    functions after it do not run — the same shape komo's own hook ladder has.
+
+    A function that raises is skipped, and reported through `warn`, rather than
+    taking the round down with it: a hook runs on every round of every turn, so
+    a broken one must cost its own effect and nothing more. A function that
+    returns the wrong *type* is the same kind of mistake and is treated the
+    same way.
+    """
+    injected: List[str] = []
+    for fn in _HOOKS.get(point, []):
+        name = getattr(fn, "__name__", point)
+        try:
+            answer = fn(**payload)
+            if answer is None:
+                continue
+            if isinstance(answer, Stop):
+                return {"stop": str(answer)}
+            if not isinstance(answer, str):
+                raise TypeError(
+                    f"returned {type(answer).__name__}; return a string, None, "
+                    f"or stop(...)"
+                )
+            if answer.strip():
+                injected.append(answer)
+        except Exception as error:  # noqa: BLE001 - reported, never fatal
+            if warn is not None:
+                warn(f"hook `{name}` failed and was skipped: {error}")
+    return {"inject": "\n".join(injected)} if injected else {}
+
+
 def registered_tools() -> List[Dict[str, Any]]:
     """The manifest komo is told about: name, description, and JSON schema."""
     return [
@@ -85,6 +177,7 @@ def registered_tools() -> List[Dict[str, Any]]:
 def clear() -> None:
     """Forget every registration — the host calls this before a reload."""
     _REGISTRY.clear()
+    _HOOKS.clear()
 
 
 def call(name: str, args: Dict[str, Any]) -> str:
