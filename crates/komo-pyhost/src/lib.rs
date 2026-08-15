@@ -1097,6 +1097,31 @@ except ToolError as error:
         host.shutdown().await;
     }
 
+    /// A positional call says what to do about it. komo dispatches by argument
+    /// name, so there is no order to bind a positional to — and the first
+    /// programs written against `tools` called them positionally, spending a
+    /// whole round on a host traceback to learn it.
+    #[tokio::test]
+    async fn a_positional_tool_call_is_refused_by_name() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("codemode-positional");
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+
+        let error = host
+            .run_code("return tools.read(\"/etc/hosts\")", |_n, _a| {
+                std::future::ready(Ok(String::new()))
+            })
+            .await
+            .expect_err("a positional call cannot be dispatched");
+        let rendered = format!("{error}");
+        assert!(rendered.contains("keyword arguments only"), "{rendered}");
+        assert!(rendered.contains("tools.read()"), "{rendered}");
+
+        host.shutdown().await;
+    }
+
     /// A program that raises answers with its traceback rather than killing the
     /// host: the traceback is what the model rewrites from.
     #[tokio::test]
@@ -1116,6 +1141,12 @@ except ToolError as error:
         let rendered = format!("{error}");
         assert!(rendered.contains("ZeroDivisionError"), "{rendered}");
         assert!(!error.retryable(), "the program already failed");
+        // The host's own dispatch frames are three of the four lines in a
+        // typical failure and name a file the program's author never wrote.
+        assert!(
+            !rendered.contains("host.py"),
+            "the traceback should start at the program's own frame: {rendered}"
+        );
 
         // Still usable afterwards.
         let ok = host

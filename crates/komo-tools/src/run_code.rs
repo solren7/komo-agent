@@ -284,7 +284,14 @@ pub fn sdk_note(catalog: &CatalogSnapshot) -> Option<String> {
         "Inside `run_code`, these are callable as Python functions with keyword \
          arguments. Each is the same gated tool you can call directly, and each \
          returns the tool's output as a **str** (parse it yourself if you need \
-         structure); a failure raises `ToolError`.\n{}",
+         structure); a failure raises `ToolError`.\n{}\n\
+         That str is the same text you would be shown — laid out for reading, \
+         not for parsing. `read` returns a header line and then `N│text` \
+         gutters; `grep` returns `Found N matches` and indented `Line N:` \
+         entries. Computing on either means stripping the layout first, so when \
+         a program needs the bytes themselves, ask a shell for them \
+         (`tools.shell(command=\"cat f\")`) rather than un-formatting a display \
+         page.",
         lines.join("\n")
     ))
 }
@@ -377,6 +384,19 @@ mod tests {
         assert!(note.contains("ToolError"), "{note}");
     }
 
+    /// Saying "str" was not enough: the first programs written against this note
+    /// parsed `read`'s display page as data and computed line counts off the
+    /// header and the gutter. The note has to say the text is laid out for
+    /// reading, and where to go for the bytes.
+    #[test]
+    fn the_note_warns_that_output_is_display_text() {
+        let catalog = ToolCatalog::new();
+        catalog.register(Arc::new(Fake("read", schema(&["path"], &[]))));
+        let note = sdk_note(&catalog.snapshot()).unwrap();
+        assert!(note.contains("N│text"), "{note}");
+        assert!(note.contains("tools.shell"), "{note}");
+    }
+
     /// Byte stability is the whole reason this is worth generating rather than
     /// hand-writing: the same tool set must render identically every turn, or
     /// the prompt prefix changes for nothing.
@@ -402,9 +422,10 @@ mod tests {
         catalog.register(Arc::new(Fake("ask_user", schema(&["question"], &[]))));
 
         let note = sdk_note(&catalog.snapshot()).unwrap();
-        // Only the listed signatures matter: the heading names `run_code`
-        // itself, which is the thing being described.
-        let listed: Vec<&str> = note.lines().filter(|l| l.contains("tools.")).collect();
+        // Only the listed signatures matter — the indented lines. The prose
+        // around them names `run_code` itself (the thing being described) and
+        // `tools.shell` (where to go for unformatted bytes).
+        let listed: Vec<&str> = note.lines().filter(|l| l.starts_with("  tools.")).collect();
         assert_eq!(listed, vec!["  tools.read(path)"]);
     }
 

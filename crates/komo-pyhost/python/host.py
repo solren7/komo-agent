@@ -125,7 +125,16 @@ class Tools:
         self._run_id = run_id
 
     def __getattr__(self, name):
-        def call(**kwargs):
+        def call(*args, **kwargs):
+            if args:
+                # komo dispatches by argument *name*; there is no authored
+                # parameter order to bind a positional to, and guessing one
+                # would bind the wrong value silently. Say so instead — the
+                # signature the caller was shown already names every argument.
+                raise TypeError(
+                    f"tools.{name}() takes keyword arguments only — name each "
+                    f"argument, as in the signature you were given"
+                )
             result = ask_komo(
                 "tool/call",
                 {"run": self._run_id, "name": name, "args": kwargs},
@@ -222,6 +231,11 @@ def watch(plugins: Plugins):
             log("warn", f"plugin reload failed:\n{traceback.format_exc()}")
 
 
+# Filename a `run_code` program compiles under. Used to tell the program's own
+# frames apart from this file's when a traceback is built.
+PROGRAM_FILENAME = "<run_code>"
+
+
 def run_program(source, run_id):
     """Execute one `run_code` program and report what it printed and returned.
 
@@ -241,7 +255,7 @@ def run_program(source, run_id):
     real_stdout = sys.stdout
     sys.stdout = printed
     try:
-        exec(compile(program, "<run_code>", "exec"), namespace)  # noqa: S102
+        exec(compile(program, PROGRAM_FILENAME, "exec"), namespace)  # noqa: S102
         result = namespace["__komo_program__"](Tools(run_id))
     finally:
         sys.stdout = real_stdout
@@ -298,6 +312,22 @@ def handle(request, plugins: Plugins):
     raise ValueError(f"unknown method `{method}`")
 
 
+def program_traceback():
+    """The current exception's traceback, starting at the program's own code.
+
+    Everything above the `<run_code>` frame is this file dispatching — frames
+    the program's author cannot act on, and three of the four lines in a typical
+    failure. Dropping them leaves the line that raised and the error itself.
+    A failure with no program frame at all (a syntax error, which never gets
+    that far) formats to the exception alone, which already carries the offending
+    source line.
+    """
+    kind, error, tb = sys.exc_info()
+    while tb is not None and tb.tb_frame.f_code.co_filename != PROGRAM_FILENAME:
+        tb = tb.tb_next
+    return "".join(traceback.format_exception(kind, error, tb))
+
+
 def serve(request, plugins: Plugins):
     """Handle one request and answer it. Every failure answers rather than dies.
 
@@ -314,7 +344,7 @@ def serve(request, plugins: Plugins):
         if request.get("method") == "run_code":
             # A program's traceback is the thing the model rewrites from, so it
             # travels rather than just the exception's own line.
-            detail = traceback.format_exc()
+            detail = program_traceback()
         if request_id is not None:
             send({"id": request_id, "error": {"message": detail}})
         else:
