@@ -11,7 +11,8 @@ use toasty_driver_turso::Turso;
 
 use crate::persistence::{DEFAULT_POOL_SIZE, prepare_turso_path, with_write_retry};
 use komo_core::domain::cron::{
-    CronAction, CronJob, CronJobRepository, parse_cron_job_status, parse_cron_run_status,
+    CronAction, CronJob, CronJobRepository, parse_catch_up, parse_cron_job_status,
+    parse_cron_run_status,
 };
 use komo_core::domain::policy::RuleSpec;
 
@@ -36,6 +37,8 @@ struct CronJobRecord {
     prompt: String,
     skills: String,
     status: String,
+    /// "late" | "skip" — what to do with a missed slot. Additive column.
+    catch_up: String,
     next_run_at: i64,
     last_run_at: i64,
     last_status: String,
@@ -69,6 +72,7 @@ impl CronDb {
                 ("skills", "\"skills\" text NOT NULL DEFAULT ''"),
                 ("grants", "\"grants\" text NOT NULL DEFAULT ''"),
                 ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
+                ("catch_up", "\"catch_up\" text NOT NULL DEFAULT 'late'"),
                 ("last_output", "\"last_output\" text NOT NULL DEFAULT ''"),
                 (
                     "last_run_session",
@@ -170,6 +174,7 @@ impl CronJobRepository for CronDb {
                 prompt: cols.prompt.clone(),
                 skills: cols.skills.clone(),
                 status: job.status.as_str().to_string(),
+                catch_up: job.catch_up.as_str().to_string(),
                 next_run_at: job.next_run_at,
                 last_run_at: job.last_run_at.unwrap_or(0),
                 last_status: job
@@ -333,6 +338,7 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
         schedule: record.schedule,
         action,
         status: parse_cron_job_status(&record.status),
+        catch_up: parse_catch_up(&record.catch_up),
         next_run_at: record.next_run_at,
         last_run_at: nonzero(record.last_run_at),
         last_status: parse_cron_run_status(&record.last_status),

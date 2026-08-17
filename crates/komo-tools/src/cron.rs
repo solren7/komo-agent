@@ -377,6 +377,7 @@ impl Tool for CronTool {
                         schedule,
                         action,
                         grants,
+                        catch_up: Default::default(),
                     },
                     now,
                 )

@@ -467,7 +467,10 @@ call the same functions, which is what keeps validation from forking.
   Sweeps: `ReviewSweep` (via the shared `ReviewCoordinator`, which
   also serves the post-turn trigger — watermark + in-flight guard prevent
   duplicate reviews), `ReminderSweep`, `CronJobSweep` (claim-before-run: a
-  crash never re-fires a slot), `TaskSweep`, `BriefingSweep` (opt-in; aux-model
+  crash never re-fires a slot; a slot missed by more than the job's **own
+  interval** is abandoned rather than fired at the wrong hour — `is_due` has no
+  upper bound on lateness, and the host is a laptop. `--skip-missed` opts a job
+  out of running late at all), `TaskSweep`, `BriefingSweep` (opt-in; aux-model
   runtime with read-only tools + deny-all unattended approver; degrades to
   tool-less `complete` on error; stamps a per-day watermark
   (`BriefingMarkRepository`, state.db settings) so a gateway restarted across

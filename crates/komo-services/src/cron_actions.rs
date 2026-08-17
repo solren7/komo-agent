@@ -280,6 +280,7 @@ mod tests {
         let job = add_cron_job(
             &jobs,
             CronJobSpec {
+                catch_up: Default::default(),
                 name: "reboot-nas".into(),
                 schedule: "@at 2030-01-02 08:30".into(),
                 action: CronAction::Command {
@@ -301,6 +302,7 @@ mod tests {
         let err = add_cron_job(
             &jobs,
             CronJobSpec {
+                catch_up: Default::default(),
                 name: "too-late".into(),
                 schedule: "@at 2020-01-01 08:00".into(),
                 action: CronAction::Command {

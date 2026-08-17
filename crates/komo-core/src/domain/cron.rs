@@ -40,6 +40,48 @@ pub enum CronJobStatus {
     Done,
 }
 
+/// What a job wants done with a slot that was missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchUp {
+    /// Run it late, once, if it is not *too* late — the default, and what komo
+    /// has always done (minus the bound).
+    #[default]
+    Late,
+    /// Never run late. For work that is only correct at its hour: turning the
+    /// lights off at 23:00 is not a thing to do at 09:00 the next morning.
+    Skip,
+}
+
+impl CatchUp {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Late => "late",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+pub fn parse_catch_up(s: &str) -> CatchUp {
+    match s.trim() {
+        "skip" => CatchUp::Skip,
+        // Anything else — including rows written before the column — is the
+        // long-standing behaviour.
+        _ => CatchUp::Late,
+    }
+}
+
+/// The answer to "this job is due; should it run?"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUpVerdict {
+    /// Due now, on schedule.
+    OnTime,
+    /// A missed slot worth running anyway.
+    Late { late_by: i64 },
+    /// A missed slot to abandon: skip to the next one.
+    TooLate { late_by: i64 },
+}
+
 impl CronJobStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -146,6 +188,10 @@ pub struct CronJob {
     /// Lifecycle state — only `Active` jobs fire. `Paused`/`Done` rows stay
     /// listed and inspectable.
     pub status: CronJobStatus,
+    /// What to do with a slot the gateway slept through. See
+    /// [`CronJob::catch_up_verdict`].
+    #[serde(default)]
+    pub catch_up: CatchUp,
     /// Next scheduled fire (unix seconds). The sweep runs a job once its
     /// `next_run_at` is due, then advances it — set to "now" to trigger an
     /// off-schedule run on the next sweep tick. For a `Done` one-shot this
@@ -187,6 +233,7 @@ impl CronJob {
             schedule: schedule.to_string(),
             action,
             status: CronJobStatus::Active,
+            catch_up: CatchUp::default(),
             next_run_at,
             last_run_at: None,
             last_status: None,
@@ -222,6 +269,39 @@ impl CronJob {
     /// Due = active and the scheduled fire time has arrived.
     pub fn is_due(&self, now: i64) -> bool {
         self.status == CronJobStatus::Active && self.next_run_at <= now
+    }
+
+    /// What to do with a slot the gateway slept through.
+    ///
+    /// A due job is not necessarily a job worth running *now*. The host is a
+    /// laptop: closing the lid over a weekend leaves Friday's 07:00 job due,
+    /// and firing it on Monday afternoon is not "catching up", it is doing the
+    /// wrong thing at the wrong time. `is_due` alone cannot tell those apart —
+    /// it has no upper bound on lateness at all.
+    pub fn catch_up_verdict(&self, now: i64) -> CatchUpVerdict {
+        let late_by = now.saturating_sub(self.next_run_at);
+        if late_by <= 0 {
+            return CatchUpVerdict::OnTime;
+        }
+        if self.catch_up == CatchUp::Skip {
+            return CatchUpVerdict::TooLate { late_by };
+        }
+        // A one-shot has no interval to measure against, and no later slot to
+        // wait for: running it late is the only way it runs at all.
+        if self.is_once() {
+            return CatchUpVerdict::Late { late_by };
+        }
+        // Bound lateness by the job's *own* period rather than a fixed grace:
+        // 30 minutes late is nothing to a weekly job and absurd for one that
+        // runs every five. An unreadable schedule keeps the old behaviour
+        // (run it) — refusing to run because the expression puzzled us would be
+        // a worse failure than running late.
+        match next_occurrence_local(&self.schedule, self.next_run_at) {
+            Ok(following) if late_by >= (following - self.next_run_at).max(1) => {
+                CatchUpVerdict::TooLate { late_by }
+            }
+            _ => CatchUpVerdict::Late { late_by },
+        }
     }
 
     /// One-shot job: fires once, then completes (`Done`) instead of
@@ -287,6 +367,8 @@ pub struct CronJobSpec {
     /// validated by the shared create action — see `cron_actions`.
     #[serde(default)]
     pub grants: Vec<RuleSpec>,
+    #[serde(default)]
+    pub catch_up: CatchUp,
 }
 
 #[async_trait]
@@ -299,6 +381,84 @@ pub trait CronJobRepository: Send + Sync {
     async fn update(&self, job: &CronJob) -> anyhow::Result<()>;
     /// Remove a job by name; `false` = no such job.
     async fn delete(&self, name: &str) -> anyhow::Result<bool>;
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use super::*;
+
+    fn job(schedule: &str, next_run_at: i64, catch_up: CatchUp) -> CronJob {
+        let mut j = CronJob::new(
+            "j",
+            schedule,
+            CronAction::Command {
+                command: "/bin/true".into(),
+                args: Vec::new(),
+                workdir: None,
+                timeout_secs: 1,
+            },
+            next_run_at,
+        );
+        j.catch_up = catch_up;
+        j
+    }
+
+    /// The bound is the job's own period, not a fixed grace: half an hour late
+    /// is nothing to a daily job and absurd for one that runs every five
+    /// minutes. A fixed window would have to be wrong for one of them.
+    #[test]
+    fn lateness_is_bounded_by_the_jobs_own_interval() {
+        // 2026-01-01 08:00 local-ish; the exact epoch does not matter, only the
+        // distances from it.
+        let due = 1_767_225_600;
+        let hour = 3_600;
+
+        let daily = job("0 8 * * *", due, CatchUp::Late);
+        assert_eq!(daily.catch_up_verdict(due), CatchUpVerdict::OnTime);
+        assert!(matches!(
+            daily.catch_up_verdict(due + 3 * hour),
+            CatchUpVerdict::Late { .. }
+        ));
+        // Slept through more than a whole day: the next slot is closer than the
+        // one that was missed, so run that instead.
+        assert!(matches!(
+            daily.catch_up_verdict(due + 30 * hour),
+            CatchUpVerdict::TooLate { .. }
+        ));
+
+        // Same 30 minutes, opposite answer, because the period differs.
+        let every_five = job("*/5 * * * *", due, CatchUp::Late);
+        assert!(matches!(
+            every_five.catch_up_verdict(due + 1800),
+            CatchUpVerdict::TooLate { .. }
+        ));
+    }
+
+    /// Some work is only correct at its hour — turning the lights off at 23:00
+    /// is not something to do at 09:00 the next morning, however "recent" the
+    /// miss looks against a daily period.
+    #[test]
+    fn skip_never_runs_late_however_small_the_miss() {
+        let due = 1_767_225_600;
+        let lights = job("0 23 * * *", due, CatchUp::Skip);
+        assert_eq!(lights.catch_up_verdict(due), CatchUpVerdict::OnTime);
+        assert!(matches!(
+            lights.catch_up_verdict(due + 60),
+            CatchUpVerdict::TooLate { .. }
+        ));
+    }
+
+    /// A one-shot has no later slot to wait for: running it late is the only
+    /// way it runs at all.
+    #[test]
+    fn a_one_shot_runs_however_late_it_is() {
+        let due = 1_767_225_600;
+        let once = job("@at 2026-01-01 08:00", due, CatchUp::Late);
+        assert!(matches!(
+            once.catch_up_verdict(due + 30 * 86_400),
+            CatchUpVerdict::Late { .. }
+        ));
+    }
 }
 
 #[cfg(test)]

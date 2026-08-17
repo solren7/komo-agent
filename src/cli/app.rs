@@ -255,6 +255,10 @@ enum CronAction {
         /// Wall-clock budget in seconds (default 900; process killed past it)
         #[arg(long)]
         timeout_secs: Option<u64>,
+        /// Never run a slot the gateway slept through. Default: run it late,
+        /// once, if it is late by less than the job's own interval.
+        #[arg(long)]
+        skip_missed: bool,
     },
     /// Add an agent job: the gateway runs a prompt through an unattended,
     /// tool-capable agent turn on schedule and delivers the reply. Side effects
@@ -277,6 +281,9 @@ enum CronAction {
         /// only, and removed with it.
         #[arg(long = "grant")]
         grants: Vec<String>,
+        /// Never run a slot the gateway slept through (see `cron add`).
+        #[arg(long)]
+        skip_missed: bool,
     },
     /// Remove a scheduled job by name
     Remove { name: String },
@@ -556,6 +563,7 @@ pub async fn run() -> anyhow::Result<()> {
                 args,
                 workdir,
                 timeout_secs,
+                skip_missed,
             } => {
                 inspect::cron_add(
                     &operator(&config).await?,
@@ -571,6 +579,7 @@ pub async fn run() -> anyhow::Result<()> {
                         // A command job runs the program directly with no
                         // approver in the loop — nothing to grant.
                         grants: Vec::new(),
+                        catch_up: catch_up_of(skip_missed),
                     },
                 )
                 .await
@@ -581,6 +590,7 @@ pub async fn run() -> anyhow::Result<()> {
                 prompt,
                 skills,
                 grants,
+                skip_missed,
             } => {
                 let grants = grants
                     .iter()
@@ -593,6 +603,7 @@ pub async fn run() -> anyhow::Result<()> {
                         schedule,
                         action: crate::domain::cron::CronAction::Agent { prompt, skills },
                         grants,
+                        catch_up: catch_up_of(skip_missed),
                     },
                 )
                 .await
@@ -835,5 +846,15 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+}
+
+/// `--skip-missed` as a [`CatchUp`]. A flag rather than a value because there
+/// are two behaviours, and "skip" is the one that needs asking for.
+fn catch_up_of(skip_missed: bool) -> crate::domain::cron::CatchUp {
+    if skip_missed {
+        crate::domain::cron::CatchUp::Skip
+    } else {
+        crate::domain::cron::CatchUp::Late
     }
 }

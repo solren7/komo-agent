@@ -26,8 +26,8 @@ use komo_core::domain::{
     briefing::BriefingMarkRepository,
     context::{SessionContext, SessionOrigin},
     cron::{
-        CronAction, CronJob, CronJobRepository, CronJobStatus, CronRunStatus, next_occurrence_in,
-        next_occurrence_local,
+        CatchUpVerdict, CronAction, CronJob, CronJobRepository, CronJobStatus, CronRunStatus,
+        next_occurrence_in, next_occurrence_local,
     },
     gateway::MessageHandler,
     llm::LlmClient,
@@ -377,6 +377,27 @@ impl Maintenance for CronJobSweep {
 
         let mut delivery_failures = 0usize;
         for mut job in due {
+            // A slot the gateway slept through is claimed either way — the point
+            // is to stop re-firing it — but only *run* when running late is
+            // still the right thing to do. `is_due` has no upper bound on
+            // lateness; a laptop closed over a weekend leaves Friday's 07:00 job
+            // due, and firing it Monday afternoon is not catching up.
+            let abandoned = match job.catch_up_verdict(now) {
+                CatchUpVerdict::TooLate { late_by } => {
+                    warn!(
+                        job = %job.name,
+                        late_by_s = late_by,
+                        catch_up = job.catch_up.as_str(),
+                        "cron slot missed by too much; skipping to the next one"
+                    );
+                    true
+                }
+                CatchUpVerdict::Late { late_by } => {
+                    info!(job = %job.name, late_by_s = late_by, "running a missed cron slot late");
+                    false
+                }
+                CatchUpVerdict::OnTime => false,
+            };
             // Claim the slot before executing (see the type docs). A broken
             // expression (bypassed add-time validation) pauses the job with
             // the reason recorded, rather than erroring every tick.
@@ -403,7 +424,7 @@ impl Maintenance for CronJobSweep {
                 warn!(%error, job = %job.name, "failed to claim cron job; skipping this run");
                 continue;
             }
-            if broken_schedule {
+            if broken_schedule || abandoned {
                 continue;
             }
 
