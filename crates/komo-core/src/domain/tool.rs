@@ -151,6 +151,38 @@ impl std::fmt::Display for TransientError {
 
 impl std::error::Error for TransientError {}
 
+/// Marks a failure as one where the call may still have taken effect.
+///
+/// Carried through `anyhow` the same way [`TransientError`] is, so the fact
+/// survives being flattened into an error chain: by the time a call reaches the
+/// run ledger the [`ToolError`] variant is long gone, and "failed" and "may have
+/// landed" need different answers from whoever reads it later.
+#[derive(Debug)]
+pub struct UncertainOutcome {
+    pub message: String,
+}
+
+impl UncertainOutcome {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Whether this error (or anything it wraps) is an uncertain outcome.
+    pub fn marks(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+impl std::fmt::Display for UncertainOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UncertainOutcome {}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;

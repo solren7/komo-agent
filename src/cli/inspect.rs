@@ -365,7 +365,14 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
     }
     println!("\nsteps:");
     for s in steps {
-        let mark = if s.ok { "ok " } else { "ERR" };
+        // "??" rather than "ERR": the call never confirmed its result, so
+        // whether it landed is unknown — which is exactly what an operator
+        // asking "did that go through?" needs told apart from a failure.
+        let mark = match (s.ok, s.uncertain) {
+            (true, _) => "ok ",
+            (false, true) => "?? ",
+            (false, false) => "ERR",
+        };
         // Steps recorded before `elapsed_ms` existed default to 0 — say nothing
         // rather than claim every one of them took no time.
         let took = if s.elapsed_ms > 0 {
@@ -377,6 +384,8 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
         println!("      args   {}", oneline(&s.args, 120));
         if s.ok {
             println!("      result {}", oneline(&s.result, 120));
+        } else if s.uncertain {
+            println!("      unknown {}", oneline(&s.error, 120));
         } else {
             println!("      error  {}", oneline(&s.error, 120));
         }

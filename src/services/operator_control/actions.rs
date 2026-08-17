@@ -673,6 +673,7 @@ mod tests {
             result: "done".to_string(),
             error: String::new(),
             ok: true,
+            uncertain: false,
             started_at: at,
             ended_at: at,
             elapsed_ms: 1,

@@ -279,7 +279,10 @@ call the same functions, which is what keeps validation from forking.
   know whether it landed" has to reach the *model*, or it re-issues the call
   itself and applies the effect twice. A wall-clock abort on a non-idempotent
   tool is the same case. `Uncertain` is never retried structurally (the retry
-  arm matches `Failed` alone) → bound the LLM-facing result via
+  arm matches `Failed` alone), and rides to the ledger as `RunStep.uncertain`
+  via an `UncertainOutcome` marker in the error chain (the variant is gone by
+  then) — `komo run inspect` prints `??` for it, because "did that go
+  through?" has three answers, not two → bound the LLM-facing result via
   `services/tool_output_store.rs` (full text on disk, head+tail preview) →
   record `RunStep`. Policy is instance-owned `ToolExecutionConfig`;
   `Tool::max_duration()` overrides the per-call timeout (approval-gated tools

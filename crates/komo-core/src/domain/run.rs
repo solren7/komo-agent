@@ -154,6 +154,16 @@ pub struct RunStep {
     /// Tool error. Empty unless `!ok`.
     pub error: String,
     pub ok: bool,
+    /// The call did not confirm its result — a wall-clock abort, or an
+    /// ambiguous transport failure on a tool that is not idempotent. `!ok` and
+    /// `uncertain` together mean **it may still have taken effect**, which is a
+    /// different answer to "did that go through?" than a plain failure.
+    ///
+    /// `default`: rows written before the column, and an older gateway's
+    /// `/api/runs/{id}` answering a newer CLI, both read as `false` — which is
+    /// what they meant.
+    #[serde(default)]
+    pub uncertain: bool,
     pub started_at: i64,
     pub ended_at: i64,
     /// Measured duration off a monotonic clock. `started_at`/`ended_at` are
@@ -413,6 +423,7 @@ mod tests {
             result: if ok { "done".into() } else { String::new() },
             error: if ok { String::new() } else { "boom".into() },
             ok,
+            uncertain: false,
             started_at: 100 + seq,
             ended_at: 101 + seq,
             elapsed_ms: 10 + seq,

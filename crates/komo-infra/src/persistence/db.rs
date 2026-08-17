@@ -206,6 +206,11 @@ struct RunStepRecord {
     result: String,
     error: String,
     ok: bool,
+
+    /// `!ok` but the call may still have taken effect (`domain::run::RunStep`).
+    /// Additive column.
+    uncertain: bool,
+
     started_at: i64,
     ended_at: i64,
 
@@ -362,6 +367,7 @@ impl Db {
             ensure_columns(p, "run_records", RUN_COLUMNS).await?;
             const STEP_COLUMNS: &[(&str, &str)] = &[
                 ("elapsed_ms", "\"elapsed_ms\" integer NOT NULL DEFAULT 0"),
+                ("uncertain", "\"uncertain\" boolean NOT NULL DEFAULT false"),
                 ("structured", "\"structured\" text NOT NULL DEFAULT ''"),
                 ("output_paths", "\"output_paths\" text NOT NULL DEFAULT ''"),
             ];
@@ -1223,6 +1229,7 @@ impl RunRepository for Db {
                 result: step.result.clone(),
                 error: step.error.clone(),
                 ok: step.ok,
+                uncertain: step.uncertain,
                 started_at: step.started_at,
                 ended_at: step.ended_at,
                 elapsed_ms: step.elapsed_ms,
@@ -1541,6 +1548,7 @@ fn step_from_record(record: RunStepRecord) -> RunStep {
         result: record.result,
         error: record.error,
         ok: record.ok,
+        uncertain: record.uncertain,
         started_at: record.started_at,
         ended_at: record.ended_at,
         elapsed_ms: record.elapsed_ms,
@@ -1889,6 +1897,7 @@ mod tests {
             result: if ok { "ok".into() } else { String::new() },
             error: if ok { String::new() } else { "boom".into() },
             ok,
+            uncertain: false,
             started_at: 100 + seq,
             ended_at: 101 + seq,
             elapsed_ms: 250 + seq,
@@ -1979,6 +1988,7 @@ mod tests {
                     result: "ok".into(),
                     error: String::new(),
                     ok: true,
+                    uncertain: false,
                     started_at: t,
                     ended_at: t + 1,
                     elapsed_ms: 12,

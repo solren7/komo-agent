@@ -719,10 +719,12 @@ impl ToolExecutionCore {
                 // ledger marks the step failed. What changes is what the model
                 // is told: the reply below composes into "tool `x` failed: did
                 // not confirm …", which asks for a check rather than a retry.
-                Err(ToolError::Uncertain(e)) => Err(anyhow::anyhow!(
-                    "did not confirm its result ({e:#}). It may or may not have taken effect — \
-                     check the target's state before calling it again; repeating it blindly can \
-                     apply the same change twice."
+                Err(ToolError::Uncertain(e)) => Err(anyhow::Error::new(
+                    komo_core::domain::tool::UncertainOutcome::new(format!(
+                        "did not confirm its result ({e:#}). It may or may not have taken \
+                             effect — check the target's state before calling it again; repeating \
+                             it blindly can apply the same change twice."
+                    )),
                 )),
             }
         };
@@ -757,6 +759,14 @@ impl ToolExecutionCore {
                 truncate(&format!("{e:#}"), STEP_FIELD_CAP),
             ),
         };
+        // Not `ok`, but not the same as failed either: the call may have landed
+        // and only its answer was lost. An operator asking "did that go
+        // through?" a week later needs the two told apart, and by here the
+        // `ToolError` variant is gone — the marker rides in the error chain.
+        let uncertain = result
+            .as_ref()
+            .err()
+            .is_some_and(komo_core::domain::tool::UncertainOutcome::marks);
 
         // Size the model's view. Over the cap, the full output is written out and
         // the model gets a head+tail preview naming that file — so this has to
@@ -781,6 +791,7 @@ impl ToolExecutionCore {
                 result: result_s,
                 error: error_s,
                 ok,
+                uncertain,
                 started_at,
                 ended_at,
                 elapsed_ms,
@@ -1357,6 +1368,50 @@ mod tests {
         assert!(steps[0].ok);
         assert!(steps[0].result.contains("echoed: hi"));
         assert!(steps[0].error.is_empty());
+    }
+
+    /// "Did that go through?" is the question an operator asks a week later,
+    /// and a run the model was told was uncertain must not read as a plain
+    /// failure in the ledger — by then the `ToolError` variant is long gone, so
+    /// the marker has to survive the trip through `anyhow`.
+    #[tokio::test]
+    async fn an_uncertain_call_is_recorded_as_uncertain_not_merely_failed() {
+        struct FlakyWriter;
+        #[async_trait]
+        impl Tool for FlakyWriter {
+            fn name(&self) -> &'static str {
+                "flaky_write"
+            }
+            fn description(&self) -> &'static str {
+                "mutates something, ambiguously"
+            }
+            async fn call(&self, _i: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+                Err(ToolError::Failed(anyhow::anyhow!(
+                    "upstream returned HTTP 503: service unavailable"
+                )))
+            }
+        }
+
+        let repo = RecordingRuns::new();
+        let executor = executor(vec![Arc::new(FlakyWriter)], ToolExecutionConfig::default());
+        let out = one(
+            &executor,
+            call("flaky_write", "{}"),
+            &ledgered(repo.clone()),
+        )
+        .await;
+        assert!(
+            out.content.contains("may or may not have taken effect"),
+            "got: {}",
+            out.content
+        );
+
+        let steps = repo.steps.lock().unwrap();
+        assert!(!steps[0].ok);
+        assert!(
+            steps[0].uncertain,
+            "the ledger must keep failed and may-have-landed apart"
+        );
     }
 
     #[tokio::test]
