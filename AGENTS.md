@@ -274,7 +274,12 @@ call the same functions, which is what keeps validation from forking.
 - `services/tool_execution/` — `ToolExecutor::execute_round`: per call, claim
   ledger seq → redact args → run with panic catch + `tool` span →
   transient-retry (connection errors retry anything; ambiguous only
-  `Tool::idempotent()`) → bound the LLM-facing result via
+  `Tool::idempotent()`) → **settle**: an ambiguous failure the classifier
+  declined to retry becomes `ToolError::Uncertain`, not `Failed` — "we don't
+  know whether it landed" has to reach the *model*, or it re-issues the call
+  itself and applies the effect twice. A wall-clock abort on a non-idempotent
+  tool is the same case. `Uncertain` is never retried structurally (the retry
+  arm matches `Failed` alone) → bound the LLM-facing result via
   `services/tool_output_store.rs` (full text on disk, head+tail preview) →
   record `RunStep`. Policy is instance-owned `ToolExecutionConfig`;
   `Tool::max_duration()` overrides the per-call timeout (approval-gated tools

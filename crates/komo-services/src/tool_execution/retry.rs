@@ -1,6 +1,6 @@
 //! Transient-error retry classification (roadmap §7).
 
-use komo_core::domain::tool::RetryHint;
+use komo_core::domain::tool::{RetryHint, ToolError};
 
 /// Total attempts for a tool whose failure is judged retryable (1 initial +
 /// retries). Kept a constant, not config: transient-error retry is an internal
@@ -89,6 +89,23 @@ pub(crate) fn should_retry(err: &anyhow::Error, idempotent: bool) -> bool {
     }
 }
 
+/// The terminal shape of a call that is not going to be retried.
+///
+/// [`Retry::Ambiguous`] on a tool that is not idempotent is precisely "we do
+/// not know whether it landed". The retry layer already refuses to act on that
+/// — this is what carries the same knowledge out to the caller, and from there
+/// to the model, instead of flattening it into an ordinary failure.
+pub(crate) fn settle<T>(result: Result<T, ToolError>, idempotent: bool) -> Result<T, ToolError> {
+    match result {
+        Err(ToolError::Failed(e))
+            if !idempotent && matches!(classify_error(&e), Retry::Ambiguous) =>
+        {
+            Err(ToolError::Uncertain(e))
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +132,50 @@ mod tests {
             classify_error(&anyhow::anyhow!("invalid arguments: bad json")),
             Retry::No
         );
+    }
+
+    /// The retry layer already refuses to re-run an ambiguous failure on a
+    /// non-idempotent tool. Settling turns that same judgement into something
+    /// the caller — and through it the model — can act on, instead of a plain
+    /// failure that invites the very retry the classifier just declined.
+    #[test]
+    fn an_ambiguous_failure_settles_as_uncertain_only_when_a_retry_would_be_unsafe() {
+        let ambiguous = || {
+            Err::<(), _>(ToolError::Failed(anyhow::anyhow!(
+                "Home Assistant returned HTTP 503: down"
+            )))
+        };
+
+        // Non-idempotent: the effect may have landed, so say so.
+        assert!(matches!(
+            settle(ambiguous(), false),
+            Err(ToolError::Uncertain(_))
+        ));
+        // Idempotent: applying it twice is harmless, so it stays an ordinary
+        // failure the model may simply retry.
+        assert!(matches!(
+            settle(ambiguous(), true),
+            Err(ToolError::Failed(_))
+        ));
+
+        // A connection-level failure never reached the server — nothing is
+        // uncertain about it, whatever the tool.
+        let never_sent = || {
+            Err::<(), _>(ToolError::Failed(anyhow::anyhow!(
+                "error sending request: connection refused"
+            )))
+        };
+        assert!(matches!(
+            settle(never_sent(), false),
+            Err(ToolError::Failed(_))
+        ));
+
+        // Terminal errors and non-failures pass through untouched.
+        assert!(matches!(
+            settle(Err::<(), _>(ToolError::Denied("no".into())), false),
+            Err(ToolError::Denied(_))
+        ));
+        assert!(settle(Ok::<_, ToolError>(()), false).is_ok());
     }
 
     #[test]

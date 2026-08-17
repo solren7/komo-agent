@@ -53,7 +53,7 @@ const EVENT_SUMMARY_CAP: usize = STEP_FIELD_CAP;
 
 use context::{JOB_GRANTS, SESSION};
 use result::cap_tool_result;
-use retry::{TOOL_RETRY_BACKOFF_MS, TOOL_RETRY_MAX_ATTEMPTS, should_retry};
+use retry::{TOOL_RETRY_BACKOFF_MS, TOOL_RETRY_MAX_ATTEMPTS, settle, should_retry};
 
 /// Soft per-turn tool-call budget default (backstop). The runtime's
 /// `max_turns` bounds *round-trips*, but a single round can request many tools
@@ -631,10 +631,20 @@ impl ToolExecutionCore {
                         Ok(r) => r,
                         Err(_) => {
                             abort.abort();
-                            break Err(ToolError::Failed(anyhow::anyhow!(
-                                "tool `{name}` exceeded its {}s execution limit and was aborted",
+                            let elapsed = anyhow::anyhow!(
+                                "did not report back within its {}s execution limit and was aborted",
                                 d.as_secs()
-                            )));
+                            );
+                            // Aborting stops us waiting; it does not undo
+                            // whatever the tool had already done. For an
+                            // idempotent tool that distinction costs nothing —
+                            // for any other, saying "failed" would invite the
+                            // model to apply the effect a second time.
+                            break Err(if tool.idempotent() {
+                                ToolError::Failed(elapsed)
+                            } else {
+                                ToolError::Uncertain(elapsed)
+                            });
                         }
                     },
                     None => join.await,
@@ -678,7 +688,13 @@ impl ToolExecutionCore {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         attempt += 1;
                     }
-                    _ => break attempt_result,
+                    // Not retrying is not the same as knowing nothing happened.
+                    // An ambiguous error on a non-idempotent tool is exactly the
+                    // case the retry classifier declined to touch — and until
+                    // now the model was told "failed" and re-issued the call
+                    // itself, which is the double-apply the classifier existed
+                    // to prevent.
+                    _ => break settle(attempt_result, tool.idempotent()),
                 }
             };
 
@@ -699,6 +715,15 @@ impl ToolExecutionCore {
                 )),
                 Err(ToolError::Denied(m)) => Ok(m),
                 Err(ToolError::Failed(e)) => Err(e),
+                // Still an `Err` — the call did not confirm success, so the
+                // ledger marks the step failed. What changes is what the model
+                // is told: the reply below composes into "tool `x` failed: did
+                // not confirm …", which asks for a check rather than a retry.
+                Err(ToolError::Uncertain(e)) => Err(anyhow::anyhow!(
+                    "did not confirm its result ({e:#}). It may or may not have taken effect — \
+                     check the target's state before calling it again; repeating it blindly can \
+                     apply the same change twice."
+                )),
             }
         };
 
@@ -1795,8 +1820,62 @@ mod tests {
         );
         let out = one(&executor, call("hang", "{}"), &unledgered()).await;
         assert!(
-            out.content.contains("exceeded its 1s execution limit"),
+            out.content.contains("did not report back within its 1s"),
             "got: {}",
+            out.content
+        );
+        // `HangingTool` takes the default `idempotent() == false`, so aborting
+        // the wait says nothing about whether the work landed. The model has to
+        // be told that, or it will simply call the tool again.
+        assert!(
+            out.content.contains("may or may not have taken effect"),
+            "an aborted non-idempotent call must not read as a plain failure, got: {}",
+            out.content
+        );
+    }
+
+    /// The same abort on a tool that can be safely repeated stays an ordinary
+    /// failure — there is nothing to check first.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_idempotent_tool_is_just_a_failure() {
+        struct HangingReader;
+        #[async_trait]
+        impl Tool for HangingReader {
+            fn name(&self) -> &'static str {
+                "hang_ro"
+            }
+            fn description(&self) -> &'static str {
+                "never returns, changes nothing"
+            }
+            fn idempotent(&self) -> bool {
+                true
+            }
+            async fn call(
+                &self,
+                _input: Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(ToolOutput::text("unreachable"))
+            }
+        }
+
+        let executor = executor(
+            vec![Arc::new(HangingReader)],
+            ToolExecutionConfig {
+                max_call_duration: Some(Duration::from_secs(1)),
+                ..Default::default()
+            },
+        );
+        let out = one(&executor, call("hang_ro", "{}"), &unledgered()).await;
+        assert!(
+            out.content.contains("did not report back within its 1s"),
+            "got: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("may or may not have taken effect"),
+            "a read-only tool has nothing to check, got: {}",
             out.content
         );
     }
@@ -1865,8 +1944,8 @@ mod tests {
         );
         let out = one(&executor, call("patient_hang", "{}"), &unledgered()).await;
         assert!(
-            out.content.contains("exceeded its 5s execution limit"),
-            "got: {}",
+            out.content.contains("did not report back within its 5s"),
+            "the tool's own ceiling is what bounds it, got: {}",
             out.content
         );
     }

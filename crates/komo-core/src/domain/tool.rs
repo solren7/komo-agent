@@ -57,6 +57,18 @@ pub enum ToolError {
     Denied(String),
     /// A genuine execution failure — retried if transient (see [`RetryHint`]).
     Failed(anyhow::Error),
+    /// The call never reported back, so whether it took effect is **unknown**.
+    ///
+    /// A wall-clock timeout, or an ambiguous transport error on a tool that is
+    /// not idempotent: the request may well have arrived and been applied, and
+    /// only the answer was lost. Distinct from [`Failed`](Self::Failed) because
+    /// the two call for opposite next moves — a failure invites a retry, an
+    /// unknown outcome requires checking the target's state first.
+    ///
+    /// Never retried automatically, and structurally so: the retry arm matches
+    /// `Failed` alone. That used to be arranged by wording the message to dodge
+    /// a substring classifier, which is a rule one careless edit can undo.
+    Uncertain(anyhow::Error),
 }
 
 impl std::fmt::Display for ToolError {
@@ -65,6 +77,7 @@ impl std::fmt::Display for ToolError {
             ToolError::InvalidInput(m) => write!(f, "invalid tool input: {m}"),
             ToolError::Denied(m) => write!(f, "{m}"),
             ToolError::Failed(e) => write!(f, "{e:#}"),
+            ToolError::Uncertain(e) => write!(f, "{e:#}"),
         }
     }
 }
