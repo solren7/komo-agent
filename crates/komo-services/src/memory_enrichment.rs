@@ -21,6 +21,7 @@ use komo_core::domain::memory::{
     Memory, MemoryContext, MemoryRepository, ScoredMemory, select_pinned, select_recall,
 };
 use komo_core::domain::message::{Message, Role};
+use komo_core::domain::run::RecalledMemories;
 use komo_core::domain::session::Session;
 
 use crate::memory_query::MemoryQueryService;
@@ -41,6 +42,13 @@ use crate::memory_query::MemoryQueryService;
 pub struct MemoryInjection {
     pub pinned: Option<String>,
     pub recall: Option<String>,
+    /// Which memories these blocks are made of, by id and tier.
+    ///
+    /// The rendered text answers "what did the model see"; this answers "which
+    /// stored memories was that", which is the only way to work back from an
+    /// answer to the memory that shaped it. `recall_count` already says a
+    /// memory keeps being useful — it cannot say *where*.
+    pub used: RecalledMemories,
 }
 
 #[cfg(test)]
@@ -196,6 +204,7 @@ impl MemoryEnricher {
         // retiring a candidate nobody ever needed.
         let ids: Vec<String> = hits.iter().map(|h| h.memory.id.clone()).collect();
         if !ids.is_empty() {
+            let ids = ids.clone();
             let repo = self.memories.clone();
             tokio::spawn(async move {
                 let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -215,6 +224,12 @@ impl MemoryEnricher {
         Some(MemoryInjection {
             pinned: pinned_block,
             recall: recall_block,
+            used: RecalledMemories {
+                pinned: pinned.iter().map(|m| m.id.clone()).collect(),
+                // The same set `mark_used` counts: what actually reached the
+                // prompt, after the aux screen, not what merely matched.
+                recall: ids,
+            },
         })
     }
 

@@ -436,6 +436,13 @@ call the same functions, which is what keeps validation from forking.
   running it inside the call would let a timeout abort it with the store already
   emptied. Its outcome is read back with `status`.
 - `domain/run.rs` — run ledger: one `Run` per turn, one `RunStep` per call.
+  `Run.memories` records **which stored memories reached that turn's prompt**
+  (pinned and recall kept apart), carried out of prompt assembly on
+  `TurnDriver::memories()` the same way `usage()` carries tokens. It answers
+  the question `recall_count` cannot: not "is this memory useful" but "which
+  memory produced *this* answer" — and, read the other way, which turns a
+  memory you just corrected had already shaped. Ids only; the store stays the
+  authority on content.
   `elapsed_ms` is the duration field (`started_at`/`ended_at` are whole
   seconds); 0 / empty `structured` read as *unknown/absent*, never
   instant/empty-object. Args redacted per-tool (`Tool::redact_args`); results

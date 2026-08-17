@@ -15,6 +15,7 @@ use komo_core::domain::{
     catalog::ToolCatalog,
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolCallReq, ToolOutcome, TurnDriver},
     message::{Message, Role},
+    run::RecalledMemories,
     session::Session,
     turn_journal::{JOURNAL_VERSION, JournalEntry, JournalKind, TurnJournal},
 };
@@ -352,7 +353,10 @@ impl ProviderLlm {
     /// they don't rewrite anything: the cut snaps to a content-derived anchor
     /// ([`window_history`]), and recall is appended at the tail rather than
     /// folded into the prefix (below).
-    async fn assemble(&self, session: &Session) -> anyhow::Result<(String, String, Vec<Turn>)> {
+    async fn assemble(
+        &self,
+        session: &Session,
+    ) -> anyhow::Result<(String, String, Vec<Turn>, RecalledMemories)> {
         // The current prompt is the most recent user message; everything before
         // it forms the conversation history sent to the model.
         let last_user_idx = session
@@ -393,6 +397,7 @@ impl ProviderLlm {
         // raw words. Enrichment failure is absorbed inside the enricher
         // (memory is background context — it must never fail a reply).
         let mut prompt = prompt;
+        let mut memories = RecalledMemories::default();
         if let Some(enricher) = &self.enricher
             && let Some(injection) = enricher
                 .enrich(&session.id, &prompt, &session.messages[..last_user_idx])
@@ -405,9 +410,10 @@ impl ProviderLlm {
             if let Some(recall) = injection.recall {
                 prompt = format!("{recall}\n\n{prompt}");
             }
+            memories = injection.used;
         }
 
-        Ok((preamble, prompt, history))
+        Ok((preamble, prompt, history, memories))
     }
 
     /// Resolve this turn's model settings: the assembled preamble, then the
@@ -502,7 +508,7 @@ impl LlmClient for ProviderLlm {
         // (reviewer / recall screening / briefing fallback), and it advertises no
         // tools at all — nothing here would dispatch a call the model made, so it
         // must not be able to ask for one. One completion is the whole answer.
-        let (preamble, prompt, history) = self.assemble(session).await?;
+        let (preamble, prompt, history, _) = self.assemble(session).await?;
         let turn = self.model_for(preamble, session);
         let mut history = history;
         history.push(Turn::user(prompt));
@@ -531,7 +537,7 @@ impl LlmClient for ProviderLlm {
         deltas: Option<Arc<dyn DeltaSink>>,
         journal: Option<Arc<dyn TurnJournal>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
-        let (preamble, prompt, history) = self.assemble(session).await?;
+        let (preamble, prompt, history, memories) = self.assemble(session).await?;
         let turn_loop = TurnLoop {
             client: self.client.clone(),
             turn: self.model_for(preamble, session),
@@ -544,6 +550,7 @@ impl LlmClient for ProviderLlm {
             provider_name: self.provider.name(),
             timeout: self.timeout,
             usage: TokenUsage::default(),
+            memories,
             degraded: false,
             deltas,
             rounds: 0,
@@ -574,6 +581,10 @@ impl LlmClient for ProviderLlm {
             provider_name: self.provider.name(),
             timeout: self.timeout,
             usage: TokenUsage::default(),
+            // A resumed turn rebuilds its prompt from the journal rather than
+            // assembling one, so there is no fresh enrichment to report; the
+            // interrupted run's row already holds what was injected.
+            memories: RecalledMemories::default(),
             degraded: false,
             deltas,
             rounds: 0,
@@ -768,6 +779,10 @@ struct TurnLoop {
     /// Tokens spent so far this turn, summed over rounds; read by the runtime for
     /// the ledger once the turn ends.
     usage: TokenUsage,
+    /// The memories prompt assembly injected, carried to the ledger at turn end
+    /// (see `TurnDriver::memories`). Set once when the turn starts and never
+    /// touched again — a resumed turn assembles nothing, so it reports none.
+    memories: RecalledMemories,
     /// Whether this turn already spent its one context-overflow degrade (see
     /// [`TurnLoop::degrade_for_overflow`]). Once used, a second overflow
     /// fails the turn: the first degrade is a real reclaim, so if the request
@@ -1094,6 +1109,9 @@ impl TurnDriver for TurnLoop {
 
     fn usage(&self) -> TokenUsage {
         self.usage
+    }
+    fn memories(&self) -> RecalledMemories {
+        self.memories.clone()
     }
 }
 

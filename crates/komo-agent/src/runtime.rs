@@ -6,6 +6,7 @@ use komo_core::domain::{
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
     message::{Message, Role},
     repository::{MessageRepository, SessionRepository},
+    run::RecalledMemories,
     run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
     session::Session,
     turn_journal::{JournalEntry, JournalKind, TurnJournal, TurnJournalRepository},
@@ -230,12 +231,14 @@ impl AgentRuntime {
         // What the turn's model round-trips cost. Only a completed turn reports
         // it: a failure surfaces before the driver can be asked, and 0 already
         // reads as unknown in the ledger.
-        if let Ok((_, usage)) = &outcome {
+        if let Ok((_, usage, memories)) = &outcome {
             run.tokens_in = usage.input;
             run.tokens_out = usage.output;
             run.tokens_cached = usage.cached_input;
+            // Which memories shaped the answer, recorded beside what it cost.
+            run.memories = memories.clone();
         }
-        let outcome = outcome.map(|(reply, _)| reply);
+        let outcome = outcome.map(|(reply, _, _)| reply);
         match &outcome {
             Ok(reply) => {
                 run.status = RunStatus::Done;
@@ -294,7 +297,7 @@ impl AgentRuntime {
         session_id: &str,
         kind: TurnKind,
         run: RunContext,
-    ) -> anyhow::Result<(String, TokenUsage)> {
+    ) -> anyhow::Result<(String, TokenUsage, RecalledMemories)> {
         // Load only the recent window for the agent loop — the LLM windows the
         // history to the same bound anyway, so a long-lived chat session no
         // longer deserializes its whole transcript every turn. The reviewer
@@ -345,6 +348,7 @@ impl AgentRuntime {
         let TurnOutcome {
             reply,
             usage,
+            memories,
             interjections,
         } = match self.run_agent_loop(&session, run, resume_entries).await {
             Ok(outcome) => outcome,
@@ -461,7 +465,7 @@ impl AgentRuntime {
             });
         }
 
-        Ok((reply, usage))
+        Ok((reply, usage, memories))
     }
 
     /// Await `work`, unless the turn is cancelled first.
@@ -684,6 +688,7 @@ impl AgentRuntime {
         Ok(TurnOutcome {
             reply,
             usage: driver.usage(),
+            memories: driver.memories(),
             interjections,
         })
     }
@@ -725,6 +730,10 @@ enum TurnKind {
 struct TurnOutcome {
     reply: String,
     usage: TokenUsage,
+    /// The memories prompt assembly injected, on its way to the ledger — the
+    /// same trip `usage` makes, for the same reason: both are facts about the
+    /// turn that only the layer below knows.
+    memories: RecalledMemories,
     /// User messages that arrived mid-turn and were folded into it. The loop
     /// already showed them to the model; the caller still has to get them into
     /// the transcript, or the next turn has no idea they were ever said.

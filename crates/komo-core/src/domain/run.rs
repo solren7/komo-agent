@@ -113,6 +113,10 @@ pub struct Run {
     /// are fresh turns, not continuations).
     #[serde(default)]
     pub resumed_from: Option<String>,
+    /// The memories that reached this turn's prompt. Empty for a turn with no
+    /// enricher, and for rows written before the column.
+    #[serde(default)]
+    pub memories: RecalledMemories,
 }
 
 impl Run {
@@ -133,7 +137,36 @@ impl Run {
             tokens_out: 0,
             tokens_cached: 0,
             resumed_from: None,
+            memories: RecalledMemories::default(),
         }
+    }
+}
+
+/// Which stored memories shaped a turn, by id and tier.
+///
+/// `recall_count` on the memory says a memory keeps being useful; this says
+/// *where* it was used. The two answer different questions, and only this one
+/// lets an operator work back from an answer they disagree with to the memory
+/// that produced it — or forward from a memory they just corrected to the turns
+/// it had already influenced.
+///
+/// Ids, not text: the memory store is the authority on content, and copying it
+/// here would let the ledger drift from what the memory now says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecalledMemories {
+    /// Injected unconditionally (L1). Recorded per run because the pinned set
+    /// changes over time, so "which were pinned *then*" is not derivable later.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    /// Retrieved for this turn's question (L3) — the query-driven half, and the
+    /// one that differs turn to turn.
+    #[serde(default)]
+    pub recall: Vec<String>,
+}
+
+impl RecalledMemories {
+    pub fn is_empty(&self) -> bool {
+        self.pinned.is_empty() && self.recall.is_empty()
     }
 }
 

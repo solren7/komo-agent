@@ -348,6 +348,19 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
             run.tokens_in, run.tokens_out
         );
     }
+    if !run.memories.is_empty() {
+        // Which stored memories this answer was built with. Ids, because they
+        // are what `komo memory` takes — reading the text here would show what
+        // the memory says *now*, not what the turn was given.
+        let mut parts = Vec::new();
+        if !run.memories.pinned.is_empty() {
+            parts.push(format!("pinned {}", run.memories.pinned.join(" ")));
+        }
+        if !run.memories.recall.is_empty() {
+            parts.push(format!("recall {}", run.memories.recall.join(" ")));
+        }
+        println!("memory  {}", parts.join("  ·  "));
+    }
     println!("input   {}", oneline(&run.input, 200));
     if !run.error.is_empty() {
         println!("error   {}", run.error);

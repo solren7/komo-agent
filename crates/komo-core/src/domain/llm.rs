@@ -142,6 +142,13 @@ pub trait TurnDriver: Send {
     fn usage(&self) -> TokenUsage {
         TokenUsage::default()
     }
+    /// The memories this turn's prompt was assembled with. Read by the runtime
+    /// at turn end for the ledger, exactly like [`usage`](Self::usage) — the
+    /// enricher runs deep inside prompt assembly, and this is the seam that
+    /// already carries per-turn facts back out.
+    fn memories(&self) -> crate::domain::run::RecalledMemories {
+        crate::domain::run::RecalledMemories::default()
+    }
 }
 
 /// Abstraction over a large-language-model backend.

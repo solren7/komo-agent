@@ -183,6 +183,10 @@ struct RunRecord {
     /// Cache-served part of `tokens_in`. Additive column; 0 = unknown.
     tokens_cached: i64,
 
+    /// The memories that reached this run's prompt, as `RecalledMemories` JSON
+    /// (`""` = none, which is also what a pre-column row reads as). Additive.
+    memories: String,
+
     /// Run id this run continued from (journal resume). Additive column;
     /// empty = none, same convention as `structured`.
     resumed_from: String,
@@ -363,6 +367,7 @@ impl Db {
                     "\"tokens_cached\" integer NOT NULL DEFAULT 0",
                 ),
                 ("resumed_from", "\"resumed_from\" text NOT NULL DEFAULT ''"),
+                ("memories", "\"memories\" text NOT NULL DEFAULT ''"),
             ];
             ensure_columns(p, "run_records", RUN_COLUMNS).await?;
             const STEP_COLUMNS: &[(&str, &str)] = &[
@@ -1207,6 +1212,11 @@ impl RunRepository for Db {
                 tokens_out: run.tokens_out,
                 tokens_cached: run.tokens_cached,
                 resumed_from: run.resumed_from.clone().unwrap_or_default(),
+                memories: if run.memories.is_empty() {
+                    String::new()
+                } else {
+                    serde_json::to_string(&run.memories).unwrap_or_default()
+                },
             })
             .exec(&mut conn)
             .await?;
@@ -1536,6 +1546,9 @@ fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
         tokens_out: record.tokens_out,
         tokens_cached: record.tokens_cached,
         resumed_from: (!record.resumed_from.is_empty()).then_some(record.resumed_from),
+        // A malformed cell reads as "none recorded": the ledger is an audit
+        // record, and one bad row must not fail the read of a whole run.
+        memories: serde_json::from_str(&record.memories).unwrap_or_default(),
     })
 }
 
@@ -1865,6 +1878,39 @@ mod tests {
         );
     }
 
+    /// The link from an answer back to the memories that shaped it. Stored as
+    /// ids so the ledger cannot drift from what a memory now says, and kept
+    /// even when the memory is later edited or archived — the turn was still
+    /// built with it.
+    #[tokio::test]
+    async fn a_runs_memories_roundtrip() {
+        use komo_core::domain::run::{RecalledMemories, Run};
+        let db = Db::connect(&sqlite_url("komo_run_memories_test.db"))
+            .await
+            .unwrap();
+        let mut run = Run::start("api:s", "why did you say that");
+        run.memories = RecalledMemories {
+            pinned: vec!["mem-pinned".into()],
+            recall: vec!["mem-a".into(), "mem-b".into()],
+        };
+        RunRepository::start(&db, &run).await.unwrap();
+        let back = RunRepository::get(&db, &run.id).await.unwrap().unwrap();
+        assert_eq!(back.memories.pinned, ["mem-pinned"]);
+        assert_eq!(back.memories.recall, ["mem-a", "mem-b"]);
+
+        // A turn that used none records none.
+        let plain = Run::start("api:s", "hi");
+        RunRepository::start(&db, &plain).await.unwrap();
+        assert!(
+            RunRepository::get(&db, &plain.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .memories
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn run_resumed_from_roundtrips() {
         use komo_core::domain::run::Run;
@@ -1974,6 +2020,7 @@ mod tests {
             tokens_out: 0,
             tokens_cached: 0,
             resumed_from: None,
+            memories: Default::default(),
         };
         for (id, t) in [("run-a", 100), ("run-b", 200), ("run-c", 300)] {
             let run = make(id, t);
