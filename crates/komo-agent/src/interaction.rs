@@ -214,10 +214,30 @@ impl ApprovalState {
     /// one was actually waiting (so the dispatcher can tell the user there was
     /// nothing to approve).
     pub fn resolve(&self, session: &str, decision: Answer) -> bool {
-        match self.pending.lock().unwrap().remove(session) {
-            Some((tx, _info)) => tx.send(decision).is_ok(),
-            None => false,
-        }
+        self.resolve_scoped(session, decision).is_some()
+    }
+
+    /// Resolve, and report the scope the answer actually carried.
+    ///
+    /// A dangerous action is **never** approved beyond the one call it was
+    /// asked about, whatever the user typed. "Session" and "always" widen an
+    /// approval to *later* calls the user has not seen, and for an irreversible
+    /// action the next one is a second deletion, not a repeat of the first. The
+    /// narrowing happens here, at the single point every channel's answer flows
+    /// through, rather than at each grant-recording site — one of those is easy
+    /// to add and forget.
+    pub fn resolve_scoped(&self, session: &str, decision: Answer) -> Option<Answer> {
+        let (tx, info) = self.pending.lock().unwrap().remove(session)?;
+        let narrowed = if info.risk == "dangerous" {
+            match decision {
+                Answer::Session | Answer::Always => Answer::Once,
+                other => other,
+            }
+        } else {
+            decision
+        };
+        tx.send(narrowed.clone()).ok()?;
+        Some(narrowed)
     }
 
     /// The structured description of the approval pending for `session`, if any.
@@ -603,15 +623,22 @@ impl GatewayDispatcher {
     async fn dispatch(self: &Arc<Self>, session_id: &str, text: String, sink: Arc<dyn ReplySink>) {
         match classify(&text) {
             Command::Approve(answer) => {
-                let scope = answer.clone();
-                let acked = self.approvals.resolve(session_id, answer);
-                let reply = match (acked, scope) {
-                    (true, Answer::Session) => "✅ 已批准（本会话内同类操作将自动放行）",
-                    (true, Answer::Always) => {
+                let asked = answer.clone();
+                let granted = self.approvals.resolve_scoped(session_id, answer);
+                let reply = match (&granted, asked) {
+                    (Some(Answer::Session), _) => "✅ 已批准（本会话内同类操作将自动放行）",
+                    (Some(Answer::Always), _) => {
                         "✅ 已批准，并已记住（同类操作以后不再询问，可用 `komo policy saved list` 查看）"
                     }
-                    (true, _) => "✅ 已批准",
-                    (false, _) => "当前没有待审批的操作。",
+                    // The answer was widened but the action is irreversible, so
+                    // it was narrowed back. Say so — silently granting less than
+                    // was asked for is how a user ends up believing a later
+                    // deletion was pre-approved.
+                    (Some(Answer::Once), Answer::Session | Answer::Always) => {
+                        "✅ 已批准（仅此一次：危险操作不会记住，下次仍会询问）"
+                    }
+                    (Some(_), _) => "✅ 已批准",
+                    (None, _) => "当前没有待审批的操作。",
                 };
                 let _ = sink.send(reply).await;
             }
@@ -1381,6 +1408,62 @@ mod tests {
             .await
             .expect("timed out waiting for a turn to start")
             .expect("handler channel closed")
+    }
+
+    /// "Approve for the session" widens an approval to calls the user has not
+    /// seen yet. For an irreversible action the next such call is a *second*
+    /// deletion, not a repeat of the one that was shown — so the widening is
+    /// refused and the user is told, rather than silently granted less than
+    /// they asked for.
+    #[tokio::test]
+    async fn a_dangerous_action_is_never_approved_beyond_the_call_it_was_asked_about() {
+        let state = ApprovalState::new();
+        let dangerous = PendingApproval {
+            summary: "rm -rf /data".to_string(),
+            detail: None,
+            risk: "dangerous".to_string(),
+        };
+        let rx = state.register("s1", dangerous);
+        assert_eq!(
+            state.resolve_scoped("s1", Answer::Session),
+            Some(Answer::Once),
+            "a session-wide grant must narrow to this one call"
+        );
+        assert_eq!(
+            rx.await.unwrap(),
+            Answer::Once,
+            "the waiter sees the narrowing"
+        );
+
+        // `always` would have written a persisted rule; it narrows the same way.
+        let rx = state.register(
+            "s2",
+            PendingApproval {
+                summary: "drop the table".to_string(),
+                detail: None,
+                risk: "dangerous".to_string(),
+            },
+        );
+        assert_eq!(
+            state.resolve_scoped("s2", Answer::Always),
+            Some(Answer::Once)
+        );
+        assert_eq!(rx.await.unwrap(), Answer::Once);
+
+        // A normal action is untouched — that is what the scopes are for.
+        let rx = state.register(
+            "s3",
+            PendingApproval {
+                summary: "write a file".to_string(),
+                detail: None,
+                risk: "normal".to_string(),
+            },
+        );
+        assert_eq!(
+            state.resolve_scoped("s3", Answer::Session),
+            Some(Answer::Session)
+        );
+        assert_eq!(rx.await.unwrap(), Answer::Session);
     }
 
     /// Chat platforms deliver at-least-once: Telegram redelivers a whole batch

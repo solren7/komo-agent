@@ -317,8 +317,12 @@ call the same functions, which is what keeps validation from forking.
 - `domain/policy.rs` + `komo-agent`'s `policy_approver` — permission policy. Ladder,
   strongest first: **tool hardline floor > config deny > saved grant > config
   allow / `default_normal` > ask**. Saved grants (`permissions.json`, written
-  only by `PolicyApprover`) never cover `Risk::Dangerous` and are never read
-  unattended. Unattended contexts (cron/briefing/sweeps) grant only through
+  only by `PolicyApprover`) are never read unattended. **A `Risk::Dangerous`
+  action is approved for the one call it was asked about and no further** —
+  `/approve session` and `/approve always` narrow to `Once`, in
+  `ApprovalState::resolve_scoped` for chat and in `cli/approver.rs` for the
+  TTY, and the user is told. Widening an irreversible action pre-approves a
+  *later* deletion nobody has seen. Unattended contexts (cron/briefing/sweeps) grant only through
   `unattended = true` allow rules **or the running job's own `grants`**
   (`CronJob.grants`, approved in the same prompt that created the job; carried
   into the turn by `with_job_grants`, scoped to that turn, revoked with the job).

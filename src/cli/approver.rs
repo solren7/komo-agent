@@ -107,6 +107,17 @@ impl Approver for CliApprover {
         .await
         .unwrap_or(Answer::Deny(None));
 
+        // Same rule the chat path applies in `ApprovalState::resolve_scoped`: a
+        // dangerous action is approved for this call only. Widening it would
+        // pre-approve a *later* irreversible action the operator never saw.
+        let answer = match (request.risk, answer) {
+            (Risk::Dangerous, Answer::Session | Answer::Always) => {
+                println!("（危险操作仅批准本次；下次仍会询问）");
+                Answer::Once
+            }
+            (_, other) => other,
+        };
+
         match answer {
             Answer::Once => Decision::Allow,
             Answer::Session => {
