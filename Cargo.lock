@@ -3441,8 +3441,8 @@ dependencies = [
  "syntect",
  "thiserror 2.0.20",
  "time",
- "toasty 0.10.0",
- "toasty-driver-turso 0.10.0",
+ "toasty",
+ "toasty-driver-turso",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "toml",
@@ -3532,8 +3532,8 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
- "toasty 0.9.0",
- "toasty-driver-turso 0.9.0",
+ "toasty",
+ "toasty-driver-turso",
  "tokio",
  "toml",
  "tracing",
@@ -7148,31 +7148,6 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "toasty"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2abf272caf351f58e03758745b6185576fcfe7a513b007683c2f8eec698eed2"
-dependencies = [
- "async-trait",
- "bit-set 0.11.1",
- "by_address",
- "deadpool",
- "hashbrown 0.17.1",
- "index_vec",
- "indexmap 2.14.0",
- "inventory",
- "toasty-core 0.9.0",
- "toasty-driver-sqlite 0.9.0",
- "toasty-driver-turso 0.9.0",
- "toasty-macros 0.9.0",
- "tokio",
- "tokio-stream",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "toasty"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c526dee282a42d5a2e61b189b8767181586a74a3d6494ef9076fc8d8a1daa7b9"
@@ -7185,28 +7160,12 @@ dependencies = [
  "index_vec",
  "indexmap 2.14.0",
  "inventory",
- "toasty-core 0.10.0",
+ "toasty-core",
  "toasty-driver-mysql",
- "toasty-driver-sqlite 0.10.0",
- "toasty-driver-turso 0.10.0",
- "toasty-macros 0.10.0",
+ "toasty-driver-sqlite",
+ "toasty-driver-turso",
+ "toasty-macros",
  "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "toasty-core"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1650657e3784097859a1c31cf91b48e337f85684757e0c6ad44e887f0e009f"
-dependencies = [
- "async-trait",
- "bit-set 0.11.1",
- "hashbrown 0.17.1",
- "heck",
- "indexmap 2.14.0",
  "tokio-stream",
  "tracing",
  "uuid",
@@ -7243,27 +7202,10 @@ dependencies = [
  "sqlx-core",
  "sqlx-mysql",
  "time",
- "toasty-core 0.10.0",
- "toasty-sql 0.10.0",
+ "toasty-core",
+ "toasty-sql",
  "tokio",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "toasty-driver-sqlite"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce0b90d030bd83e135b96259d630482efe6b1fa937670c75d825ae2992d6ea91"
-dependencies = [
- "async-trait",
- "percent-encoding",
- "rusqlite",
- "serde",
- "toasty-core 0.9.0",
- "toasty-sql 0.9.0",
- "tracing",
- "url",
  "uuid",
 ]
 
@@ -7276,27 +7218,9 @@ dependencies = [
  "async-trait",
  "rusqlite",
  "serde",
- "toasty-core 0.10.0",
- "toasty-sql 0.10.0",
+ "toasty-core",
+ "toasty-sql",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "toasty-driver-turso"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cc0682b65eeab9b7d6e0bac3f309591df5b9b6df32f868a3a6ee5ca3636e24"
-dependencies = [
- "async-trait",
- "percent-encoding",
- "serde",
- "toasty-core 0.9.0",
- "toasty-sql 0.9.0",
- "tokio",
- "tracing",
- "turso",
- "url",
  "uuid",
 ]
 
@@ -7308,27 +7232,12 @@ checksum = "ec35095292c40a0b42f7886055bd8e3f4a161a257a422328d7617255a9ced220"
 dependencies = [
  "async-trait",
  "serde",
- "toasty-core 0.10.0",
- "toasty-sql 0.10.0",
+ "toasty-core",
+ "toasty-sql",
  "tokio",
  "tracing",
  "turso",
  "uuid",
-]
-
-[[package]]
-name = "toasty-macros"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16966e54a422be54959b0ad12bdbdcffc101c77aeca7d49fefff33142c709a29"
-dependencies = [
- "hashbrown 0.17.1",
- "heck",
- "pluralizer",
- "proc-macro2",
- "quote",
- "syn 3.0.3",
- "toasty-core 0.9.0",
 ]
 
 [[package]]
@@ -7343,18 +7252,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
- "toasty-core 0.10.0",
-]
-
-[[package]]
-name = "toasty-sql"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b19948205b682d1750a8cf331b0b7fa666baffe2a3a2c0a05d5e94103c0fcc08"
-dependencies = [
- "serde",
- "serde_json",
- "toasty-core 0.9.0",
+ "toasty-core",
 ]
 
 [[package]]
@@ -7365,7 +7263,7 @@ checksum = "7b44b08035efcf8e087c6377ae18942066b1f8e976cd3821571e45463ecf3d6f"
 dependencies = [
  "serde",
  "serde_json",
- "toasty-core 0.10.0",
+ "toasty-core",
 ]
 
 [[package]]

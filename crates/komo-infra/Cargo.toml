@@ -26,8 +26,8 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 tokio = { version = "1.53.1", features = ["full"] }
 # Persistence: toasty over Turso (see the Turso/toasty invariants in AGENTS.md).
-toasty = { version = "0.9.0", features = ["sqlite", "turso"] }
-toasty-driver-turso = "0.9.0"
+toasty = { version = "0.10.0", features = ["sqlite", "turso"] }
+toasty-driver-turso = "0.10.0"
 turso = "0.7.2"
 # Decodes the Codex OAuth access-token JWT payload (no signature verification).
 base64 = "0.23.0"
