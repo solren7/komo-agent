@@ -26,8 +26,15 @@
 //!
 //! **One writer.** komo runs one turn per session (the gateway dispatcher
 //! enforces it), so a transcript has a single writer by construction. The
-//! per-session lock here makes that true *within* the process as well, which is
-//! what lets the read-modify-write operations below share a file with appends.
+//! per-session lock here makes that true *within* the process as well.
+//!
+//! **Nothing is ever rewritten.** Two things used to go back and change what
+//! was already written — a cancelled turn deleted its user message, and a
+//! mid-turn interjection edited one. On a file both meant reading the whole
+//! transcript, cutting it, and writing it out again. They are now facts
+//! appended at the end ([`KIND_CANCELLED`], [`KIND_SAID_MORE`]) and resolved on
+//! the way out by [`fold`], which is also the single place that keeps a
+//! reader's view alternating user/assistant.
 //!
 //! **A partial line is dropped, never patched.** A process killed mid-append can
 //! leave a truncated final line. Reads skip any line that does not parse and say
@@ -54,6 +61,17 @@ const LINE_VERSION: u32 = 1;
 /// Absent on a message line — which is also every line written before tool
 /// activity was recorded here at all, so the older files read unchanged.
 const KIND_TOOL: &str = "tool";
+
+/// Marks a line that records what became of a turn rather than something that
+/// was said.
+///
+/// These two exist so the log never has to go back and change what it already
+/// wrote. A cancel used to delete the user's message and an interjection used
+/// to edit it; on a file that meant reading the whole transcript, cutting it,
+/// and writing it out again. Both are now facts appended at the end, and
+/// [`fold`] is the single place that decides what they mean.
+const KIND_CANCELLED: &str = "cancelled";
+const KIND_SAID_MORE: &str = "said_more";
 
 /// The part of a line that is common to both kinds, read first to decide how to
 /// read the rest.
@@ -87,22 +105,50 @@ struct ToolLine {
     entry: ToolEntry,
 }
 
+/// A turn that was cancelled before it did anything worth remembering.
+#[derive(Serialize, Deserialize)]
+struct CancelledLine {
+    #[serde(default = "default_version")]
+    v: u32,
+    kind: String,
+    timestamp: i64,
+}
+
+/// Something the user said while a turn was already running.
+#[derive(Serialize, Deserialize)]
+struct SaidMoreLine {
+    #[serde(default = "default_version")]
+    v: u32,
+    kind: String,
+    content: String,
+    timestamp: i64,
+}
+
 /// What one line turned out to be.
 enum Entry {
     Said(Message),
     Ran(ToolEntry),
+    /// The turn that the preceding user message belongs to was cancelled before
+    /// it did anything. Resolved by [`fold`].
+    Cancelled,
+    /// The user added this while that turn was in flight. Resolved by [`fold`].
+    SaidMore(String),
 }
 
 fn default_version() -> u32 {
     LINE_VERSION
 }
 
+fn now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
 /// Append-only transcript storage, one file per session.
 pub struct MessageLog {
     dir: PathBuf,
-    /// One lock per session file. Appends and the read-modify-write operations
-    /// share it, so a rewrite can never land between another writer's read and
-    /// its write.
+    /// One lock per session file, so two appends to the same transcript cannot
+    /// interleave. Nothing reads-then-writes any more, so that is all it has to
+    /// guard.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -164,18 +210,26 @@ impl MessageLog {
         Ok(parse_lines(&text, &path))
     }
 
+    /// The lines as a reader should see them — [`fold`] applied.
+    ///
+    /// Every read path goes through here; `entries` is the raw log and stays
+    /// private, so no caller can accidentally see a cancelled turn.
+    async fn projected(&self, session_id: &str) -> anyhow::Result<Vec<Entry>> {
+        Ok(fold(self.entries(session_id).await?))
+    }
+
     /// Every message in a session, in the order they were appended.
     ///
     /// Tool lines are skipped: they are a record of the work, not part of what
     /// was said, and this is what feeds the model's history.
     pub async fn list(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
         Ok(self
-            .entries(session_id)
+            .projected(session_id)
             .await?
             .into_iter()
             .filter_map(|entry| match entry {
                 Entry::Said(message) => Some(message),
-                Entry::Ran(_) => None,
+                _ => None,
             })
             .collect())
     }
@@ -183,12 +237,12 @@ impl MessageLog {
     /// The tool calls a session recorded, in order.
     pub async fn tools(&self, session_id: &str) -> anyhow::Result<Vec<ToolEntry>> {
         Ok(self
-            .entries(session_id)
+            .projected(session_id)
             .await?
             .into_iter()
             .filter_map(|entry| match entry {
                 Entry::Ran(tool) => Some(tool),
-                Entry::Said(_) => None,
+                _ => None,
             })
             .collect())
     }
@@ -262,57 +316,33 @@ impl MessageLog {
         Ok(())
     }
 
-    /// Drop the `count` most recently appended messages, returning how many were
-    /// actually removed.
-    pub async fn delete_recent(&self, session_id: &str, count: usize) -> anyhow::Result<usize> {
-        if count == 0 {
-            return Ok(0);
-        }
-        let lock = self.lock_for(session_id).await;
-        let _held = lock.lock().await;
-
-        let mut entries = self.entries(session_id).await?;
-        // Walk back to the `count`-th message from the end and cut there. The
-        // tool lines after it go too: they are the work of the turn being taken
-        // back, and leaving them would attribute it to the turn before.
-        let mut seen = 0usize;
-        let mut cut = 0usize;
-        for (i, entry) in entries.iter().enumerate().rev() {
-            if matches!(entry, Entry::Said(_)) {
-                seen += 1;
-                if seen == count {
-                    cut = i;
-                    break;
-                }
-            }
-        }
-        let removed = seen.min(count);
-        if removed == 0 {
-            return Ok(0);
-        }
-        entries.truncate(cut);
-        self.rewrite(session_id, &entries).await?;
-        Ok(removed)
+    /// Record that the turn in flight was cancelled before it did anything.
+    ///
+    /// Appends the fact; [`fold`] is what makes the transcript read as if the
+    /// turn never happened. The line stays in the file, so an operator reading
+    /// it can still see that the user asked and then stopped — the projection
+    /// hides it, the log does not lose it.
+    pub async fn record_cancelled_turn(&self, session_id: &str) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&CancelledLine {
+            v: LINE_VERSION,
+            kind: KIND_CANCELLED.to_string(),
+            timestamp: now(),
+        })?;
+        self.append_line(session_id, &line).await
     }
 
-    /// Append `extra` on its own line to the most recent user message, reporting
-    /// whether there was one.
-    pub async fn append_to_last_user(&self, session_id: &str, extra: &str) -> anyhow::Result<bool> {
-        let lock = self.lock_for(session_id).await;
-        let _held = lock.lock().await;
-
-        let mut entries = self.entries(session_id).await?;
-        let last = entries.iter_mut().rev().find_map(|entry| match entry {
-            Entry::Said(message) if message.role == Role::User => Some(message),
-            _ => None,
-        });
-        let Some(last) = last else {
-            return Ok(false);
-        };
-        last.content.push('\n');
-        last.content.push_str(extra);
-        self.rewrite(session_id, &entries).await?;
-        Ok(true)
+    /// Record something the user said while a turn was already running.
+    ///
+    /// Appended as its own line rather than edited into the user message it
+    /// belongs to; [`fold`] merges the two on the way out.
+    pub async fn record_interjection(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        let line = serde_json::to_string(&SaidMoreLine {
+            v: LINE_VERSION,
+            kind: KIND_SAID_MORE.to_string(),
+            content: text.to_string(),
+            timestamp: now(),
+        })?;
+        self.append_line(session_id, &line).await
     }
 
     /// Move a transcript to another session id, as `/new` does when it archives
@@ -346,38 +376,51 @@ impl MessageLog {
             Err(error) => Err(anyhow::anyhow!("could not remove the transcript: {error}")),
         }
     }
+}
 
-    /// Replace a transcript wholesale, atomically.
-    ///
-    /// Written to a sibling temp file and renamed, so a crash leaves either the
-    /// old transcript or the new one — the two operations that use this
-    /// (cancel-rollback and the mid-turn interjection) rewrite a file another
-    /// turn may be about to read.
-    async fn rewrite(&self, session_id: &str, entries: &[Entry]) -> anyhow::Result<()> {
-        let path = self.path_for(session_id);
-        let mut body = String::new();
-        for entry in entries {
-            body.push_str(&match entry {
-                Entry::Said(message) => serde_json::to_string(&MessageLine {
-                    v: LINE_VERSION,
-                    message: message.clone(),
-                })?,
-                Entry::Ran(tool) => serde_json::to_string(&ToolLine {
-                    v: LINE_VERSION,
-                    kind: KIND_TOOL.to_string(),
-                    entry: tool.clone(),
-                })?,
-            });
-            body.push('\n');
+/// Turn the lines that were written into the transcript a reader should see.
+///
+/// The log records what happened; this decides what it means. That split is
+/// what lets the file stay append-only — the alternative is going back to edit
+/// what was already written, which on a file means rewriting all of it.
+///
+/// It also puts one invariant in one place. What a reader gets must alternate
+/// user and assistant: several providers reject two consecutive user messages
+/// on replay. Keeping that true at every *write* site took a delete here, an
+/// edit there, and a placeholder somewhere else — and a rule maintained in
+/// four places is a rule with a hole in it. Here it is a property of one
+/// function, which is also why it can be tested without a database.
+fn fold(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::new();
+    for entry in entries {
+        match entry {
+            // Rewind to just before that turn's user message. The tool lines
+            // after it go too: they are the work of the turn being taken back,
+            // and leaving them would attribute it to the turn before.
+            Entry::Cancelled => {
+                if let Some(at) = out
+                    .iter()
+                    .rposition(|e| matches!(e, Entry::Said(m) if m.role == Role::User))
+                {
+                    out.truncate(at);
+                }
+            }
+            // Merge into that turn's user message rather than standing as a
+            // second one. Both halves really are one user's input for one turn.
+            Entry::SaidMore(text) => {
+                if let Some(Entry::Said(message)) = out
+                    .iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, Entry::Said(m) if m.role == Role::User))
+                {
+                    message.content.push('\n');
+                    message.content.push_str(&text);
+                }
+            }
+            said_or_ran => out.push(said_or_ran),
         }
-        let temp = path.with_extension("jsonl.tmp");
-        tokio::fs::write(&temp, body)
-            .await
-            .map_err(|e| anyhow::anyhow!("could not stage the transcript rewrite: {e}"))?;
-        tokio::fs::rename(&temp, &path)
-            .await
-            .map_err(|e| anyhow::anyhow!("could not replace the transcript: {e}"))
     }
+    out
 }
 
 /// Parse a transcript, skipping anything that does not read as a message.
@@ -410,10 +453,23 @@ fn parse_lines(text: &str, path: &Path) -> Vec<Entry> {
             skipped += 1;
             continue;
         }
-        let parsed = if header.kind.as_deref() == Some(KIND_TOOL) {
-            serde_json::from_str::<ToolLine>(line).map(|l| Entry::Ran(l.entry))
-        } else {
-            serde_json::from_str::<MessageLine>(line).map(|l| Entry::Said(l.message))
+        let parsed = match header.kind.as_deref() {
+            Some(KIND_TOOL) => serde_json::from_str::<ToolLine>(line).map(|l| Entry::Ran(l.entry)),
+            Some(KIND_CANCELLED) => {
+                serde_json::from_str::<CancelledLine>(line).map(|_| Entry::Cancelled)
+            }
+            Some(KIND_SAID_MORE) => {
+                serde_json::from_str::<SaidMoreLine>(line).map(|l| Entry::SaidMore(l.content))
+            }
+            // A kind this build does not know is a line from a newer komo whose
+            // `v` did not change. Skipping is the same rule as an unknown
+            // version — never guess at a shape.
+            Some(other) => {
+                warn!(path = %path.display(), kind = other, "unknown transcript line kind; skipped");
+                skipped += 1;
+                continue;
+            }
+            None => serde_json::from_str::<MessageLine>(line).map(|l| Entry::Said(l.message)),
         };
         match parsed {
             Ok(entry) => entries.push(entry),
@@ -507,12 +563,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_recent_messages_takes_them_off_the_end() {
-        let (log, _home) = log("delete");
-        for text in ["a", "b", "c"] {
-            log.append("api:s", &assistant(text)).await.unwrap();
-        }
-        assert_eq!(log.delete_recent("api:s", 2).await.unwrap(), 2);
+    async fn a_cancelled_turn_leaves_the_transcript_as_if_it_never_happened() {
+        let (log, _home) = log("cancel");
+        log.append("api:s", &Message::user("first")).await.unwrap();
+        log.append("api:s", &assistant("answered")).await.unwrap();
+        log.append("api:s", &Message::user("oops")).await.unwrap();
+
+        log.record_cancelled_turn("api:s").await.unwrap();
+
         let left: Vec<String> = log
             .list("api:s")
             .await
@@ -520,10 +578,41 @@ mod tests {
             .into_iter()
             .map(|m| m.content)
             .collect();
-        assert_eq!(left, ["a"]);
+        assert_eq!(left, ["first", "answered"]);
+        // What a reader sees never ends on a user message with no reply — that
+        // is the shape providers reject on replay.
+        assert_eq!(log.count_user_turns("api:s").await.unwrap(), 1);
 
-        // Asking for more than there are removes what there is.
-        assert_eq!(log.delete_recent("api:s", 9).await.unwrap(), 1);
+        // The line is still in the file: the projection hides the turn, the log
+        // does not lose it.
+        let raw = tokio::fs::read_to_string(log.path_for("api:s"))
+            .await
+            .unwrap();
+        assert!(
+            raw.contains("\"oops\""),
+            "the log still records what was said"
+        );
+        assert!(raw.contains(KIND_CANCELLED));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_takes_its_own_tool_work_with_it() {
+        let (log, _home) = log("cancel_tools");
+        log.append("api:s", &Message::user("go")).await.unwrap();
+        log.append_tool("api:s", &tool("shell")).await.unwrap();
+        log.record_cancelled_turn("api:s").await.unwrap();
+
+        assert!(log.list("api:s").await.unwrap().is_empty());
+        assert!(
+            log.tools("api:s").await.unwrap().is_empty(),
+            "tool lines after the cancelled user message belong to that turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_with_nothing_to_cancel_is_a_no_op() {
+        let (log, _home) = log("cancel_empty");
+        log.record_cancelled_turn("api:s").await.unwrap();
         assert!(log.list("api:s").await.unwrap().is_empty());
     }
 
@@ -535,17 +624,23 @@ mod tests {
             .unwrap();
         log.append("api:s", &assistant("working")).await.unwrap();
 
-        assert!(
-            log.append_to_last_user("api:s", "wait, also this")
-                .await
-                .unwrap()
-        );
+        log.record_interjection("api:s", "wait, also this")
+            .await
+            .unwrap();
+
         let messages = log.list("api:s").await.unwrap();
         assert_eq!(messages[0].content, "do the thing\nwait, also this");
         assert_eq!(messages.len(), 2, "the assistant message is untouched");
+        assert_eq!(
+            messages[1].role,
+            Role::Assistant,
+            "an interjection never becomes a second user message"
+        );
 
-        // Nothing to append to is reported, not invented.
-        assert!(!log.append_to_last_user("api:other", "x").await.unwrap());
+        // Nothing to merge into is not an error — the fact is recorded either
+        // way, and the projection simply has nowhere to put it.
+        log.record_interjection("api:other", "x").await.unwrap();
+        assert!(log.list("api:other").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -638,7 +733,7 @@ mod tests {
             .unwrap();
         log.append_tool("api:s", &tool("late")).await.unwrap();
 
-        assert_eq!(log.delete_recent("api:s", 1).await.unwrap(), 1);
+        log.record_cancelled_turn("api:s").await.unwrap();
         let said: Vec<String> = log
             .list("api:s")
             .await
@@ -657,15 +752,15 @@ mod tests {
         assert_eq!(ran, ["early"], "the cancelled turn's tool call went too");
     }
 
-    /// An interjection edits the last user message and leaves the tool lines
-    /// around it exactly where they were.
+    /// An interjection merges into the last user message and leaves the tool
+    /// lines around it exactly where they were.
     #[tokio::test]
     async fn an_interjection_leaves_tool_records_in_place() {
         let (log, _home) = log("interject-tools");
         log.append("api:s", &Message::user("go")).await.unwrap();
         log.append_tool("api:s", &tool("shell")).await.unwrap();
 
-        assert!(log.append_to_last_user("api:s", "and hurry").await.unwrap());
+        log.record_interjection("api:s", "and hurry").await.unwrap();
         assert_eq!(log.list("api:s").await.unwrap()[0].content, "go\nand hurry");
         assert_eq!(log.tools("api:s").await.unwrap().len(), 1);
     }

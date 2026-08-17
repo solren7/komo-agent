@@ -359,9 +359,10 @@ impl AgentRuntime {
                 //
                 // A user cancel is not a failure, so it gets its own note: the
                 // transcript should read as "I stopped this", not as an error.
-                // A cancel that landed before the turn did anything rewinds
-                // instead of leaving a tombstone: take the user message back
-                // out and the transcript reads as if the turn never happened.
+                // A cancel that landed before the turn did anything is recorded
+                // as such instead of leaving a tombstone: the transcript then
+                // reads as if the turn never happened, while the log still
+                // knows it did (`fold` in `message_log`).
                 // "Did anything" means a tool ran — the only way a cancelled
                 // turn can have effects worth remembering. Without this, a user
                 // who sends a message and immediately stops it is left with a
@@ -371,12 +372,13 @@ impl AgentRuntime {
                 // (Never on a resume: the trailing user message there belongs
                 // to the interrupted turn, not to this continuation.)
                 if is_fresh && is_cancelled(&error) && probe.steps_count() == 0 {
-                    match self.messages.delete_recent(session_id, 1).await {
-                        Ok(_) => return Err(error),
-                        // Rewind failed — fall through and leave the tombstone,
-                        // which at least keeps the transcript alternating.
+                    match self.messages.cancel_last_turn(session_id).await {
+                        Ok(()) => return Err(error),
+                        // Recording it failed — fall through and leave the
+                        // tombstone, which at least keeps the transcript
+                        // alternating.
                         Err(rewind_err) => {
-                            warn!(%rewind_err, "failed to rewind a pristine cancel (non-fatal)")
+                            warn!(%rewind_err, "failed to record a pristine cancel (non-fatal)")
                         }
                     }
                 }
@@ -408,7 +410,7 @@ impl AgentRuntime {
         // failure here costs the *next* turn context, not this one's answer.
         if !interjections.is_empty() {
             let extra = interjections.join("\n");
-            if let Err(error) = self.messages.append_to_last_user(session_id, &extra).await {
+            if let Err(error) = self.messages.record_interjection(session_id, &extra).await {
                 warn!(%error, "failed to record a mid-turn interjection (non-fatal)");
             }
         }

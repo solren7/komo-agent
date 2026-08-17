@@ -275,15 +275,11 @@ mod tests {
         async fn count_user_turns(&self, _session_id: &str) -> anyhow::Result<usize> {
             Ok(self.user_turns)
         }
-        async fn delete_recent(&self, _session_id: &str, _count: usize) -> anyhow::Result<usize> {
-            Ok(0)
+        async fn cancel_last_turn(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
         }
-        async fn append_to_last_user(
-            &self,
-            _session_id: &str,
-            _extra: &str,
-        ) -> anyhow::Result<bool> {
-            Ok(false)
+        async fn record_interjection(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 

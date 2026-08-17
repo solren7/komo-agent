@@ -74,6 +74,15 @@ that used to count messages in SQL must now go through the log — the review
 sweep and `mark_reviewed`'s clamp are the two that do, and a missed one pins
 every watermark at zero.
 
+**The log records what happened; `fold` decides what it means.** A cancelled
+turn and a mid-turn interjection used to rewrite the file (delete the user
+message / edit it); both are now lines appended at the end, and one pure
+function resolves them on read. That is also where the invariant a reader
+depends on lives — user and assistant must alternate, because several providers
+reject two consecutive user messages on replay. Keeping that true at each write
+site took three separate patches; it is now one function, testable without a
+database. **Add a new read path through `projected`, never `entries`.**
+
 Schema-change rules (toasty's `push_schema` runs only for **new** db files, and
 is not idempotent):
 

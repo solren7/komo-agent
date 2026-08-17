@@ -828,12 +828,12 @@ impl MessageRepository for Db {
         self.messages.append(session_id, message).await
     }
 
-    async fn delete_recent(&self, session_id: &str, count: usize) -> anyhow::Result<usize> {
-        self.messages.delete_recent(session_id, count).await
+    async fn cancel_last_turn(&self, session_id: &str) -> anyhow::Result<()> {
+        self.messages.record_cancelled_turn(session_id).await
     }
 
-    async fn append_to_last_user(&self, session_id: &str, extra: &str) -> anyhow::Result<bool> {
-        self.messages.append_to_last_user(session_id, extra).await
+    async fn record_interjection(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        self.messages.record_interjection(session_id, text).await
     }
 
     async fn record_tool(&self, session_id: &str, entry: &ToolEntry) -> anyhow::Result<()> {
