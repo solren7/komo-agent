@@ -131,6 +131,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         todos,
         channel_reg.wechat_login.clone(),
         db.clone(),
+        db.clone(),
     ));
 
     // ── Plugin phase 3: scheduled sweeps ─────────────────────────────────────

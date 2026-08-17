@@ -13,6 +13,7 @@ use crate::persistence::{
 use komo_core::domain::{
     briefing::BriefingMarkRepository,
     home::HomeRepository,
+    inbox::{InboundOrigin, InboxClaim, InboxRepository},
     message::{Message, Role, ToolEntry},
     pairing::{
         APPROVE_LOCKOUT_SECS, APPROVE_MAX_FAILURES, ApproveOutcome, PAIRING_CODE_TTL_SECS,
@@ -254,6 +255,39 @@ const JOURNAL_TABLE_DDL: &[&str] = &[
     "CREATE INDEX \"index_turn_journal_records_by_run_id\" ON \"turn_journal_records\" (\"run_id\")",
 ];
 
+/// One inbound message the gateway has seen (`domain/inbox.rs`). The key is
+/// `<platform>:<message_id>` rather than the UUIDv7 used everywhere else in
+/// this file: dedupe wants the collision, and the primary key is what makes
+/// "already handled" atomic instead of a check the next delivery can race.
+#[derive(Debug, toasty::Model)]
+struct InboxRecord {
+    #[key]
+    id: String,
+
+    session_id: String,
+    /// The message body, kept so a claimed-but-uncompleted row can be
+    /// re-delivered after a crash. Nothing reads it back yet — see
+    /// `InboxRepository::claim`.
+    text: String,
+    status: String, // "claimed" | "completed"
+    claimed_at: i64,
+    /// 0 until `complete` runs.
+    completed_at: i64,
+}
+
+/// The exact DDL `push_schema` emits for [`InboxRecord`], for the same reason
+/// [`JOURNAL_TABLE_DDL`] exists. Byte-parity is locked by
+/// `inbox_table_ddl_matches_push_schema`.
+const INBOX_TABLE: &str = "inbox_records";
+const INBOX_TABLE_DDL: &[&str] = &[
+    "CREATE TABLE \"inbox_records\" (\"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \
+     \"text\" TEXT NOT NULL, \"status\" TEXT NOT NULL, \"claimed_at\" BIGINT NOT NULL, \
+     \"completed_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+];
+
+const INBOX_STATUS_CLAIMED: &str = "claimed";
+const INBOX_STATUS_COMPLETED: &str = "completed";
+
 /// Setting key for the runtime home channel (`/sethome`).
 const HOME_SETTING_KEY: &str = "home_chat";
 /// Setting key for the briefing watermark (local date last handled).
@@ -333,6 +367,7 @@ impl Db {
             ];
             ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
             ensure_table(p, JOURNAL_TABLE, JOURNAL_TABLE_DDL).await?;
+            ensure_table(p, INBOX_TABLE, INBOX_TABLE_DDL).await?;
         }
 
         // MVCC concurrent-writes on (UUID keys throughout, so no AUTOINCREMENT).
@@ -352,7 +387,8 @@ impl Db {
                 SettingRecord,
                 RunRecord,
                 RunStepRecord,
-                TurnJournalRecord
+                TurnJournalRecord,
+                InboxRecord
             ))
             .max_pool_size(DEFAULT_POOL_SIZE)
             .build(driver)
@@ -1345,6 +1381,74 @@ impl RunRepository for Db {
     }
 }
 
+// ── InboxRepository ──────────────────────────────────────────────────────────
+
+#[async_trait]
+impl InboxRepository for Db {
+    async fn claim(
+        &self,
+        origin: &InboundOrigin,
+        session_id: &str,
+        text: &str,
+    ) -> anyhow::Result<InboxClaim> {
+        let id = origin.key();
+        let lookup = id.as_str();
+        let mut conn = self.inner.connection().await?;
+        let seen = toasty::query!(InboxRecord FILTER .id == #lookup)
+            .exec(&mut conn)
+            .await?;
+        if !seen.is_empty() {
+            return Ok(InboxClaim::Duplicate);
+        }
+        drop(conn);
+        // Each channel consumes its own messages one at a time, so two claims
+        // for the same id never race here. If that ever changes, the primary
+        // key still refuses the second insert — loudly, rather than by letting
+        // both through.
+        let session_id = session_id.to_string();
+        let text = text.to_string();
+        with_write_retry(|| {
+            let id = id.clone();
+            let session_id = session_id.clone();
+            let text = text.clone();
+            async move {
+                let mut conn = self.inner.connection().await?;
+                toasty::create!(InboxRecord {
+                    id,
+                    session_id,
+                    text,
+                    status: INBOX_STATUS_CLAIMED.to_string(),
+                    claimed_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    completed_at: 0,
+                })
+                .exec(&mut conn)
+                .await?;
+                Ok(())
+            }
+        })
+        .await?;
+        Ok(InboxClaim::Fresh)
+    }
+
+    async fn complete(&self, origin: &InboundOrigin) -> anyhow::Result<()> {
+        let id = origin.key();
+        with_write_retry(|| {
+            let id = id.clone();
+            async move {
+                let mut conn = self.inner.connection().await?;
+                toasty::query!(InboxRecord FILTER .id == #id)
+                    .update()
+                    .status(INBOX_STATUS_COMPLETED)
+                    .completed_at(time::OffsetDateTime::now_utc().unix_timestamp())
+                    .exec(&mut conn)
+                    .await?;
+                Ok(())
+            }
+        })
+        .await
+    }
+}
+
 // ── TurnJournalRepository ─────────────────────────────────────────────────────
 
 #[async_trait]
@@ -1543,6 +1647,11 @@ mod tests {
     /// Every `CREATE …` statement sqlite_master holds for `turn_journal_records`,
     /// ordered by object name so the comparison is deterministic.
     async fn journal_schema_sql(path: &std::path::Path) -> Vec<String> {
+        table_schema_sql(path, "turn_journal_records").await
+    }
+
+    /// Every `CREATE …` statement sqlite_master holds for one table.
+    async fn table_schema_sql(path: &std::path::Path, table: &str) -> Vec<String> {
         let raw = turso::Builder::new_local(path.to_string_lossy().as_ref())
             .build()
             .await
@@ -1550,9 +1659,11 @@ mod tests {
         let conn = raw.connect().unwrap();
         let mut rows = conn
             .query(
-                "SELECT sql FROM sqlite_master \
-                 WHERE tbl_name = 'turn_journal_records' AND sql IS NOT NULL \
-                 ORDER BY name",
+                &format!(
+                    "SELECT sql FROM sqlite_master \
+                     WHERE tbl_name = '{table}' AND sql IS NOT NULL \
+                     ORDER BY name"
+                ),
                 (),
             )
             .await
@@ -1564,6 +1675,93 @@ mod tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn inbox_claims_once_and_reports_every_redelivery() {
+        let db = Db::connect(&sqlite_url("komo_inbox_claim.db"))
+            .await
+            .unwrap();
+        let origin = InboundOrigin::new("telegram", "42");
+
+        assert_eq!(
+            db.claim(&origin, "telegram:7", "hi").await.unwrap(),
+            InboxClaim::Fresh
+        );
+        db.complete(&origin).await.unwrap();
+        assert_eq!(
+            db.claim(&origin, "telegram:7", "hi").await.unwrap(),
+            InboxClaim::Duplicate
+        );
+
+        // A claim that never completed still blocks its own redelivery: the row
+        // exists from the moment it is claimed, which is what makes a crash
+        // mid-turn safe.
+        let midturn = InboundOrigin::new("telegram", "43");
+        assert_eq!(
+            db.claim(&midturn, "telegram:7", "second").await.unwrap(),
+            InboxClaim::Fresh
+        );
+        assert_eq!(
+            db.claim(&midturn, "telegram:7", "second").await.unwrap(),
+            InboxClaim::Duplicate
+        );
+
+        // The key is the pair: platforms number their messages independently,
+        // so the same id elsewhere is a different message.
+        assert_eq!(
+            db.claim(&InboundOrigin::new("feishu", "42"), "feishu:9", "hi")
+                .await
+                .unwrap(),
+            InboxClaim::Fresh
+        );
+
+        // Local input has no platform to redeliver it — never a duplicate.
+        for _ in 0..2 {
+            assert_eq!(
+                db.claim(&InboundOrigin::local(), "cli:1", "run")
+                    .await
+                    .unwrap(),
+                InboxClaim::Fresh
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inbox_table_ddl_matches_push_schema() {
+        let fresh = std::env::temp_dir().join("komo_inbox_ddl_fresh.db");
+        crate::persistence::reset_test_db(&fresh);
+        let db = Db::connect(&format!("turso:{}", fresh.display()))
+            .await
+            .unwrap();
+        drop(db);
+        let reference = table_schema_sql(&fresh, INBOX_TABLE).await;
+        assert!(!reference.is_empty(), "push_schema created the table");
+
+        // Simulate a state.db that predates the table: drop it, reconnect, and
+        // `ensure_table` must rebuild it byte-identically.
+        let old = std::env::temp_dir().join("komo_inbox_ddl_old.db");
+        crate::persistence::reset_test_db(&old);
+        let db = Db::connect(&format!("turso:{}", old.display()))
+            .await
+            .unwrap();
+        drop(db);
+        {
+            let raw = turso::Builder::new_local(old.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = raw.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute("DROP TABLE \"inbox_records\"", ())
+                .await
+                .unwrap();
+        }
+        let db = Db::connect(&format!("turso:{}", old.display()))
+            .await
+            .unwrap();
+        drop(db);
+        assert_eq!(table_schema_sql(&old, INBOX_TABLE).await, reference);
     }
 
     #[tokio::test]

@@ -54,7 +54,7 @@ process's own log mid-conversation.
 
 | File | Contents | Durability |
 |---|---|---|
-| `~/.komo/state.db` | session *metadata*, todos, reminders, pairings, settings, run ledger, turn journal | disposable — delete freely |
+| `~/.komo/state.db` | session *metadata*, todos, reminders, pairings, settings, run ledger, turn journal, inbox | disposable — delete freely |
 | `~/.komo/sessions/` | transcripts — one append-only `.jsonl` per session | disposable |
 | `~/.komo/kanban.db` | cross-session tasks | durable |
 | `~/.komo/memory.db` | long-term memories | durable |
@@ -456,7 +456,14 @@ call the same functions, which is what keeps validation from forking.
   (`komo-infra`'s `workday`, cached per-year).
 - `komo-agent`'s `gateway` + `interaction` — gateway hosts channels +
   sweeps. `GatewayDispatcher` owns turns (spawned per turn so `/approve` can
-  arrive mid-turn; one turn per session). Chat commands: `/new` (rotate
+  arrive mid-turn; one turn per session). **`handle` is the only entry a channel
+  may use**: it claims the message in the durable inbox (`domain/inbox.rs`,
+  keyed `<platform>:<message_id>`) and drops redeliveries before anything else
+  runs — chat platforms deliver at-least-once, and the gate has to cover
+  commands too, since a redelivered `/approve` would approve twice. `dispatch`
+  is the un-gated inner routine and stays private. Channels that have no
+  platform message id use `InboundOrigin::local()`, which is never a duplicate.
+  Chat commands: `/new` (rotate
   session, clear todos + approval state), `/approve [session|always]`,
   `/deny`, `/sethome`, `/wechat login`. `ChatApprover` suspends the turn on a
   oneshot (5-min timeout); no session in context ⇒ deny. `HomeNotifier`

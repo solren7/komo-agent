@@ -31,6 +31,7 @@
 use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
 use komo_agent::pairing::PairingGuard;
+use komo_core::domain::inbox::InboundOrigin;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -289,6 +290,11 @@ impl WeChatChannel {
                     return;
                 }
                 let user_id = msg.user_id.clone();
+                // iLink exposes no message id on the parsed message, but the
+                // wire payload carries both fields below, and both come from
+                // the sender rather than from local time — so a redelivery of
+                // the same message reproduces the same pair.
+                let message_key = format!("{}:{}", msg.raw.client_id, msg.raw.create_time_ms);
                 let dispatcher = dispatcher.clone();
                 let guard = guard.clone();
                 let bot = bot.clone();
@@ -313,7 +319,8 @@ impl WeChatChannel {
                         bot: bot.clone(),
                         user_id: user_id.clone(),
                     });
-                    dispatcher.handle(&session_id, text, sink).await;
+                    let origin = InboundOrigin::new("wechat", message_key);
+                    dispatcher.handle(&session_id, origin, text, sink).await;
                 });
             }))
             .await;

@@ -21,6 +21,7 @@
 use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
 use komo_agent::pairing::PairingGuard;
+use komo_core::domain::inbox::InboundOrigin;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -62,6 +63,7 @@ struct Update {
 
 #[derive(Deserialize)]
 struct Message {
+    message_id: i64,
     text: Option<String>,
     from: Option<User>,
     chat: Chat,
@@ -228,6 +230,10 @@ pub struct TelegramChannel {
 
 /// One inbound text message, reduced to what the agent needs.
 struct Inbound {
+    /// Telegram's own id for the message, carried through for the inbox:
+    /// `offset` only acknowledges a *batch*, so a crash between running a turn
+    /// and committing the next offset redelivers everything in it.
+    message_id: i64,
     sender_id: String,
     chat_id: String,
     text: String,
@@ -339,7 +345,11 @@ impl Channel for TelegramChannel {
                 });
                 // Returns promptly: a turn runs on its own task so this loop can
                 // keep polling and deliver the user's `/approve` reply.
-                dispatcher.handle(&session_id, msg.text, sink).await;
+                // `offset` acknowledges a batch, not a message: a crash after
+                // running a turn but before the next poll redelivers the whole
+                // batch. The inbox is what makes that a no-op.
+                let origin = InboundOrigin::new("telegram", msg.message_id.to_string());
+                dispatcher.handle(&session_id, origin, msg.text, sink).await;
             }
         }
         info!("telegram channel stopped");
@@ -381,6 +391,7 @@ fn admit(message: Message, policy: &AdmitPolicy, bot_username: &str) -> Option<I
         return None;
     }
     Some(Inbound {
+        message_id: message.message_id,
         sender_id: from.id.to_string(),
         chat_id: message.chat.id.to_string(),
         text,
@@ -393,6 +404,7 @@ mod tests {
 
     fn message(text: &str, chat_kind: &str, user_id: i64) -> Message {
         Message {
+            message_id: 1,
             text: Some(text.to_string()),
             from: Some(User {
                 id: user_id,

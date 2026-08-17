@@ -36,6 +36,7 @@ use komo_core::domain::{
     cancel::CancelSignal,
     gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
     home::HomeRepository,
+    inbox::{InboundOrigin, InboxClaim, InboxRepository},
     pairing::{ApproveOutcome, PairingRepository, PairingStatus},
     repository::SessionRepository,
     todo::SessionTodoRepository,
@@ -505,6 +506,8 @@ pub struct GatewayDispatcher {
     wechat_login: Option<Arc<dyn WeChatLogin>>,
     /// Backs the `/pair` chat commands (same store the `komo pair` CLI uses).
     pairings: Arc<dyn PairingRepository>,
+    /// Durable dedupe for redelivered platform messages (`domain/inbox.rs`).
+    inbox: Arc<dyn InboxRepository>,
     /// Per-session turn state. A session key is present iff a turn is in flight;
     /// its queue holds up to [`QUEUE_CAP`] messages that arrived mid-turn, drained
     /// FIFO as each turn finishes (so a quick follow-up is answered, not dropped).
@@ -533,6 +536,7 @@ impl GatewayDispatcher {
         todos: Arc<dyn SessionTodoRepository>,
         wechat_login: Option<Arc<dyn WeChatLogin>>,
         pairings: Arc<dyn PairingRepository>,
+        inbox: Arc<dyn InboxRepository>,
     ) -> Self {
         Self {
             handler,
@@ -543,6 +547,7 @@ impl GatewayDispatcher {
             todos,
             wechat_login,
             pairings,
+            inbox,
             inflight: Mutex::new(HashMap::new()),
         }
     }
@@ -557,12 +562,45 @@ impl GatewayDispatcher {
 
     /// Handle one inbound message. Returns promptly: a plain message spawns its
     /// turn and returns, so the caller's receive loop is never blocked.
+    ///
+    /// This is the only entry a channel should use: it drops redeliveries
+    /// before they reach [`dispatch`](Self::dispatch). Chat platforms deliver
+    /// at-least-once, and the gate has to sit in front of *commands* too — a
+    /// redelivered `/approve` would approve a second time, which is worse than
+    /// a repeated question.
     pub async fn handle(
         self: &Arc<Self>,
         session_id: &str,
+        origin: InboundOrigin,
         text: String,
         sink: Arc<dyn ReplySink>,
     ) {
+        match self.inbox.claim(&origin, session_id, &text).await {
+            Ok(InboxClaim::Duplicate) => {
+                info!(
+                    platform = %origin.platform,
+                    message_id = %origin.message_id,
+                    "dropped a redelivered message"
+                );
+                return;
+            }
+            Ok(InboxClaim::Fresh) => {}
+            Err(error) => {
+                // Losing the dedupe record is not a reason to lose the user's
+                // message: answering twice is recoverable, silence is not.
+                warn!(%error, "inbox claim failed; handling the message anyway");
+            }
+        }
+        self.dispatch(session_id, text, sink).await;
+        if let Err(error) = self.inbox.complete(&origin).await {
+            // The row stays `claimed`. Harmless today (the key already blocks a
+            // redelivery); it becomes the signal for crash re-delivery later.
+            warn!(%error, "inbox complete failed (non-fatal)");
+        }
+    }
+
+    /// Route one already-deduped message.
+    async fn dispatch(self: &Arc<Self>, session_id: &str, text: String, sink: Arc<dyn ReplySink>) {
         match classify(&text) {
             Command::Approve(answer) => {
                 let scope = answer.clone();
@@ -1211,6 +1249,14 @@ mod tests {
         handler: Arc<GateHandler>,
         clarify: Arc<ClarifyState>,
     ) -> Arc<GatewayDispatcher> {
+        dispatcher_with_parts(handler, clarify, Arc::new(AlwaysFreshInbox))
+    }
+
+    fn dispatcher_with_parts(
+        handler: Arc<GateHandler>,
+        clarify: Arc<ClarifyState>,
+        inbox: Arc<dyn InboxRepository>,
+    ) -> Arc<GatewayDispatcher> {
         Arc::new(GatewayDispatcher::new(
             handler,
             Arc::new(ApprovalState::new()),
@@ -1220,7 +1266,54 @@ mod tests {
             Arc::new(UnusedTodos),
             None,
             Arc::new(UnusedPairings),
+            inbox,
         ))
+    }
+
+    /// Dedupe has its own test below; every other test wants each message
+    /// through.
+    struct AlwaysFreshInbox;
+
+    #[async_trait]
+    impl InboxRepository for AlwaysFreshInbox {
+        async fn claim(
+            &self,
+            _origin: &InboundOrigin,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<InboxClaim> {
+            Ok(InboxClaim::Fresh)
+        }
+
+        async fn complete(&self, _origin: &InboundOrigin) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The real repository's behaviour without a database.
+    #[derive(Default)]
+    struct DedupingInbox {
+        seen: Mutex<HashSet<String>>,
+    }
+
+    #[async_trait]
+    impl InboxRepository for DedupingInbox {
+        async fn claim(
+            &self,
+            origin: &InboundOrigin,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<InboxClaim> {
+            if self.seen.lock().unwrap().insert(origin.key()) {
+                Ok(InboxClaim::Fresh)
+            } else {
+                Ok(InboxClaim::Duplicate)
+            }
+        }
+
+        async fn complete(&self, _origin: &InboundOrigin) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     // A plain message answers a pending clarify question instead of starting a
@@ -1240,7 +1333,9 @@ mod tests {
 
         // A turn is suspended on a question.
         let rx = clarify.register("s1", "什么颜色？");
-        dispatcher.handle("s1", "蓝色的".into(), sink.clone()).await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "蓝色的".into(), sink.clone())
+            .await;
         assert_eq!(rx.await.unwrap(), "蓝色的", "message became the answer");
         assert!(
             entered_rx.try_recv().is_err(),
@@ -1248,7 +1343,9 @@ mod tests {
         );
 
         // With nothing pending, the next message dispatches a turn as usual.
-        dispatcher.handle("s1", "next".into(), sink.clone()).await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "next".into(), sink.clone())
+            .await;
         assert_eq!(next_entered(&mut entered_rx).await, "next");
         permits.add_permits(1);
     }
@@ -1268,7 +1365,9 @@ mod tests {
         let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
 
         let _rx = clarify.register("s1", "问题？");
-        dispatcher.handle("s1", "/deny".into(), sink.clone()).await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "/deny".into(), sink.clone())
+            .await;
         assert!(
             clarify.has_pending("s1"),
             "/deny must not consume the clarify question"
@@ -1284,6 +1383,53 @@ mod tests {
             .expect("handler channel closed")
     }
 
+    /// Chat platforms deliver at-least-once: Telegram redelivers a whole batch
+    /// when the offset never got committed, Feishu retries what it thinks was
+    /// not acked, and either survives a gateway restart. A redelivery must not
+    /// run a second turn — and the gate sits in front of *commands* too, so a
+    /// redelivered `/approve` cannot approve twice.
+    #[tokio::test]
+    async fn a_redelivered_message_never_runs_a_second_turn() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = dispatcher_with_parts(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: Arc::new(Semaphore::new(8)),
+            }),
+            Arc::new(ClarifyState::new()),
+            Arc::new(DedupingInbox::default()),
+        );
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+        let origin = InboundOrigin::new("telegram", "42");
+
+        dispatcher
+            .handle("s1", origin.clone(), "hello".into(), sink.clone())
+            .await;
+        assert_eq!(next_entered(&mut entered_rx).await, "hello");
+
+        // The same platform message, delivered again.
+        dispatcher
+            .handle("s1", origin, "hello".into(), sink.clone())
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "a redelivered message must not start a second turn"
+        );
+
+        // A genuinely new message still gets through.
+        dispatcher
+            .handle(
+                "s1",
+                InboundOrigin::new("telegram", "43"),
+                "and another".into(),
+                sink,
+            )
+            .await;
+        assert_eq!(next_entered(&mut entered_rx).await, "and another");
+    }
+
     #[tokio::test]
     async fn mid_turn_messages_merge_into_one_turn_and_cap() {
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
@@ -1297,13 +1443,21 @@ mod tests {
         let sink = Arc::new(RecordingSink { sent: sent.clone() }) as Arc<dyn ReplySink>;
 
         // m1 dispatches and blocks in the handler.
-        dispatcher.handle("s1", "m1".into(), sink.clone()).await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "m1".into(), sink.clone())
+            .await;
         assert_eq!(next_entered(&mut entered_rx).await, "m1");
 
         // m2, m3 queue behind it; m4 overflows the cap and is rejected.
-        dispatcher.handle("s1", "m2".into(), sink.clone()).await;
-        dispatcher.handle("s1", "m3".into(), sink.clone()).await;
-        dispatcher.handle("s1", "m4".into(), sink.clone()).await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "m2".into(), sink.clone())
+            .await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "m3".into(), sink.clone())
+            .await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "m4".into(), sink.clone())
+            .await;
 
         // Everything queued behind m1 runs as ONE turn, in order — a user who
         // splits a thought across messages gets one answer, not one per line.
@@ -1336,10 +1490,16 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
 
-        dispatcher.handle("s7", "m1".into(), sink.clone()).await;
+        dispatcher
+            .handle("s7", InboundOrigin::local(), "m1".into(), sink.clone())
+            .await;
         assert_eq!(next_entered(&mut entered_rx).await, "m1");
-        dispatcher.handle("s7", "m2".into(), sink.clone()).await;
-        dispatcher.handle("s7", "m3".into(), sink.clone()).await;
+        dispatcher
+            .handle("s7", InboundOrigin::local(), "m2".into(), sink.clone())
+            .await;
+        dispatcher
+            .handle("s7", InboundOrigin::local(), "m3".into(), sink.clone())
+            .await;
 
         // What the agent loop does between rounds.
         let interjector = QueueInterjector {
@@ -1418,11 +1578,15 @@ mod tests {
 
         // First turn panics — the catch keeps the task alive and the guard/finish
         // path releases the session.
-        dispatcher.handle("s1", "boom".into(), sink.clone()).await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "boom".into(), sink.clone())
+            .await;
         assert_eq!(next_entered(&mut entered_rx).await, "boom");
 
         // A later message must still be handled (session not permanently busy).
-        dispatcher.handle("s1", "after".into(), sink.clone()).await;
+        dispatcher
+            .handle("s1", InboundOrigin::local(), "after".into(), sink.clone())
+            .await;
         permits.add_permits(1);
         assert_eq!(next_entered(&mut entered_rx).await, "after");
     }

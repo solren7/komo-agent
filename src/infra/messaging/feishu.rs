@@ -17,8 +17,8 @@
 use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
 use komo_agent::pairing::PairingGuard;
+use komo_core::domain::inbox::InboundOrigin;
 use std::{
-    collections::{HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -42,8 +42,6 @@ use komo_config::FeishuConfig;
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
 /// Refresh the tenant token this long before Feishu's reported expiry.
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
-/// Remember this many recent message ids to drop redelivered events.
-const DEDUP_CAPACITY: usize = 256;
 
 /// Outbound side of the integration: tenant token cache + message send.
 /// Shared by the ingress channel (replies) and the `HomeNotifier` (proactive
@@ -233,19 +231,7 @@ impl Channel for FeishuChannel {
         // Consumer: one message at a time, in arrival order. The chat id keys
         // the session, so a p2p chat is one continuous conversation.
         let consume = async {
-            let mut seen = HashSet::new();
-            let mut order = VecDeque::new();
             while let Some(msg) = rx.recv().await {
-                if !seen.insert(msg.message_id.clone()) {
-                    continue;
-                }
-                order.push_back(msg.message_id.clone());
-                if order.len() > DEDUP_CAPACITY
-                    && let Some(oldest) = order.pop_front()
-                {
-                    seen.remove(&oldest);
-                }
-
                 // Pairing gate: unknown senders get a pairing code instead of
                 // the agent until `komo pair approve` runs on the host.
                 let sender = self.sender.clone();
@@ -268,7 +254,11 @@ impl Channel for FeishuChannel {
                 });
                 // Returns promptly: a turn runs on its own task so this loop can
                 // keep consuming and deliver the user's `/approve` reply.
-                dispatcher.handle(&session_id, msg.text, sink).await;
+                // Feishu retries a message it believes was not acked, and the
+                // gateway restarts. Both are the inbox's job now — the old
+                // in-process `seen` set survived neither.
+                let origin = InboundOrigin::new("feishu", msg.message_id.clone());
+                dispatcher.handle(&session_id, origin, msg.text, sink).await;
             }
         };
 
