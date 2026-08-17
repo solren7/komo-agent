@@ -83,6 +83,13 @@ reject two consecutive user messages on replay. Keeping that true at each write
 site took three separate patches; it is now one function, testable without a
 database. **Add a new read path through `projected`, never `entries`.**
 
+A **windowed** read (`find_windowed`, every turn) reads only the file's
+tail — reading a whole conversation to discard all but its last few
+messages costs IO and parsing on the reply path that grows for as long as
+the session lives. It falls back to the full read when the tail does not
+hold the window, so the window is never short; the fold rules resolve
+against the most recent user message, which a window always contains.
+
 Schema-change rules (toasty's `push_schema` runs only for **new** db files, and
 is not idempotent):
 

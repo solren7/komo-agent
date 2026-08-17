@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use komo_core::domain::message::{Message, Role, ToolEntry};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -55,6 +55,11 @@ use tracing::warn;
 /// A reader that meets a version it does not know skips the line rather than
 /// guessing at it — the same rule the turn journal follows.
 const LINE_VERSION: u32 = 1;
+
+/// How much of a transcript's tail a windowed read looks at. Far more than any
+/// history window needs (a window is tens of messages; this is thousands), so
+/// the fallback to a full read is the rare case, not the common one.
+const TAIL_BYTES: u64 = 512 * 1024;
 
 /// Marks a line that records a tool call rather than something that was said.
 ///
@@ -259,12 +264,86 @@ impl MessageLog {
 
     /// The most recent `limit` messages, still in chronological order.
     /// `limit == 0` means the whole transcript.
+    ///
+    /// Reads only the **tail** of the file. This runs on every turn, and the
+    /// whole point of a window is not to pay for a conversation's whole past —
+    /// but reading the file to throw all but the last few messages away pays
+    /// for it in IO and parsing anyway, on the reply path, growing for as long
+    /// as the session lives. A session that is never rotated would get slower
+    /// every day for a reason nobody could see.
     pub async fn window(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
+        if limit == 0 {
+            return self.list(session_id).await;
+        }
+        if let Some(tail) = self.tail_messages(session_id, limit).await? {
+            return Ok(tail);
+        }
+        // The tail did not hold `limit` messages: fall back rather than answer
+        // with a short window. Correctness first — the tail is an optimisation,
+        // not a different contract.
         let mut all = self.list(session_id).await?;
-        if limit > 0 && all.len() > limit {
+        if all.len() > limit {
             all.drain(..all.len() - limit);
         }
         Ok(all)
+    }
+
+    /// The last `limit` messages read from at most [`TAIL_BYTES`] of the file,
+    /// or `None` when that much of the file did not contain them.
+    async fn tail_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Option<Vec<Message>>> {
+        let path = self.path_for(session_id);
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some(Vec::new()));
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "could not read the transcript {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        let from = size.saturating_sub(TAIL_BYTES);
+        if from > 0 {
+            file.seek(std::io::SeekFrom::Start(from))
+                .await
+                .map_err(|e| anyhow::anyhow!("could not seek the transcript: {e}"))?;
+        }
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not read the transcript: {e}"))?;
+        let mut text = String::from_utf8_lossy(&buf).into_owned();
+        if from > 0 {
+            // The seek landed mid-line; that fragment is not a record.
+            match text.find('\n') {
+                Some(nl) => text = text[nl + 1..].to_string(),
+                None => return Ok(None),
+            }
+        }
+
+        let mut messages: Vec<Message> = fold(parse_lines(&text, &path))
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Said(message) => Some(message),
+                _ => None,
+            })
+            .collect();
+        // Short only because the file itself is short is still the whole
+        // answer; short because we cut the file is not.
+        if messages.len() < limit && from > 0 {
+            return Ok(None);
+        }
+        if messages.len() > limit {
+            messages.drain(..messages.len() - limit);
+        }
+        Ok(Some(messages))
     }
 
     /// How many user messages the session holds — the turn count the reviewer's
@@ -532,6 +611,83 @@ mod tests {
         let (log, _home) = log("missing");
         assert!(log.list("api:never-used").await.unwrap().is_empty());
         assert!(log.is_empty("api:never-used").await.unwrap());
+    }
+
+    /// The tail read is an optimisation, so its only real contract is that it
+    /// cannot be told apart from the full read. Sized past `TAIL_BYTES` so the
+    /// seek genuinely lands mid-line and the partial fragment has to be dropped.
+    #[tokio::test]
+    async fn a_windowed_read_of_a_long_transcript_matches_reading_all_of_it() {
+        let (log, _home) = log("tail");
+        let filler = "x".repeat(2_000);
+        // ~600 messages × ~2KB ≈ 1.2MB, comfortably past the 512KB tail.
+        for i in 0..300 {
+            log.append("api:s", &Message::user(format!("q{i} {filler}")))
+                .await
+                .unwrap();
+            log.append("api:s", &assistant(&format!("a{i} {filler}")))
+                .await
+                .unwrap();
+        }
+        assert!(
+            std::fs::metadata(log.path_for("api:s")).unwrap().len() > TAIL_BYTES,
+            "the file must exceed the tail for this to test anything"
+        );
+
+        // The point of the change: this window is served from the tail, not by
+        // reading a megabyte to discard all but 40 messages.
+        assert!(
+            log.tail_messages("api:s", 40).await.unwrap().is_some(),
+            "a windowed read must be served from the tail"
+        );
+        // And a window the tail cannot hold falls back rather than answering
+        // short — ~2KB a message, so 400 of them do not fit in 512KB.
+        assert!(
+            log.tail_messages("api:s", 400).await.unwrap().is_none(),
+            "a window larger than the tail must fall back to the full read"
+        );
+
+        for limit in [1usize, 5, 40] {
+            let windowed = log.window("api:s", limit).await.unwrap();
+            let mut full = log.list("api:s").await.unwrap();
+            full.drain(..full.len() - limit);
+            assert_eq!(
+                windowed.iter().map(|m| &m.content).collect::<Vec<_>>(),
+                full.iter().map(|m| &m.content).collect::<Vec<_>>(),
+                "tail read disagreed with the full read at limit {limit}"
+            );
+        }
+    }
+
+    /// The fold rules have to hold on the tail too — they resolve against the
+    /// most recent user message, which a window always contains.
+    #[tokio::test]
+    async fn folding_still_applies_to_a_tail_read() {
+        let (log, _home) = log("tail-fold");
+        let filler = "y".repeat(2_000);
+        for i in 0..300 {
+            log.append("api:s", &Message::user(format!("q{i} {filler}")))
+                .await
+                .unwrap();
+            log.append("api:s", &assistant(&format!("a{i} {filler}")))
+                .await
+                .unwrap();
+        }
+        log.append("api:s", &Message::user("cancel me"))
+            .await
+            .unwrap();
+        log.record_cancelled_turn("api:s").await.unwrap();
+        log.append("api:s", &Message::user("kept")).await.unwrap();
+        log.record_interjection("api:s", "and this").await.unwrap();
+
+        let windowed = log.window("api:s", 2).await.unwrap();
+        assert_eq!(windowed.len(), 2);
+        assert!(
+            windowed[0].content.starts_with("a299"),
+            "the cancelled turn must be gone, got {:?}",
+            windowed[0].content
+        );
+        assert_eq!(windowed[1].content, "kept\nand this");
     }
 
     #[tokio::test]
