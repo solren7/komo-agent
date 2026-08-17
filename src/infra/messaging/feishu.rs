@@ -5,9 +5,11 @@
 //! routes each text message through the `MessageHandler` as one session turn,
 //! and replies via the IM REST API with a plain reqwest call.
 //!
-//! open-lark is used only for the long connection (the frames are
-//! protobuf-encoded, which it handles); replies and token fetching go through
-//! reqwest directly so the SDK surface we depend on stays minimal.
+//! openlark is used only for the long connection (the frames are
+//! protobuf-encoded, which it handles); event payloads are consumed raw with
+//! our own tolerant serde structs (the SDK's typed events once dropped whole
+//! messages over null sender fields), and replies and token fetching go
+//! through reqwest directly so the SDK surface we depend on stays minimal.
 //!
 //! Access control follows hermes-agent's feishu adapter: an `allow_from`
 //! open_id allowlist (empty = open), a `require_mention` gate for group
@@ -24,10 +26,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+// The `openlark` package keeps `open_lark` as its lib name for compatibility.
 use open_lark::{
-    client::ws_client::LarkWsClient, core::config::Config as LarkConfig,
-    event::dispatcher::EventDispatcherHandler,
-    service::im::v1::p2_im_message_receive_v1::P2ImMessageReceiveV1,
+    Config as LarkConfig,
+    ws_client::{EventDispatcherHandler, EventHandler, LarkWsClient, WsClientError},
 };
 use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -217,9 +219,8 @@ impl Channel for FeishuChannel {
         let (tx, mut rx) = mpsc::unbounded_channel::<Inbound>();
 
         // The long connection runs on its own thread with a single-threaded
-        // runtime: open-lark's event dispatcher is not `Send`, so it cannot
-        // live inside this (tokio::spawn'd) future. Events cross back over
-        // the mpsc channel.
+        // runtime, keeping its heartbeat/reconnect loop isolated from the
+        // main runtime. Events cross back over the mpsc channel.
         let ws_thread = spawn_ws_thread(
             self.sender.app_id.clone(),
             self.sender.app_secret.clone(),
@@ -298,36 +299,34 @@ fn spawn_ws_thread(
                 .build(),
         );
         runtime.block_on(async move {
-            // The dispatcher is consumed by each `open` call, so it is
-            // rebuilt per attempt.
+            // Every event is acked by the session regardless of registration,
+            // so subscribing to the one event we consume is enough — read
+            // receipts and the rest are acked without a handler.
+            let dispatcher = match EventDispatcherHandler::builder().register_raw(
+                "im.message.receive_v1",
+                ReceiveHandler {
+                    policy,
+                    events,
+                },
+            ) {
+                Ok(builder) => builder.build(),
+                Err(error) => {
+                    error!(%error, "failed to register feishu event handler");
+                    return;
+                }
+            };
             let mut backoff = 0usize;
             loop {
                 if *shutdown.borrow() {
                     break;
                 }
-                let tx = events.clone();
-                let admit_policy = policy.clone();
-                let dispatcher = match EventDispatcherHandler::builder()
-                    .register_p2_im_message_receive_v1(move |event| {
-                        if let Some(msg) = admit(event, &admit_policy) {
-                            let _ = tx.send(msg);
-                        }
-                    })
-                    // Komo does not consume read receipts, but acknowledging
-                    // subscribed events prevents Feishu from redelivering them.
-                    .and_then(|builder| builder.register_p2_im_message_read_v1(|_event| {}))
-                {
-                    Ok(builder) => builder.build(),
-                    Err(error) => {
-                        error!(%error, "failed to register feishu event handler");
-                        return;
-                    }
-                };
                 let started = std::time::Instant::now();
                 let connected = tokio::select! {
                     _ = shutdown.changed() => break,
-                    result = LarkWsClient::open(ws_config.clone(), dispatcher) => match result {
-                        Ok(()) => {
+                    result = LarkWsClient::open(ws_config.clone(), dispatcher.clone()) => match result {
+                        // A session that terminates normally surfaces as
+                        // `ConnectionClosed`, not `Ok`.
+                        Ok(()) | Err(WsClientError::ConnectionClosed { .. }) => {
                             warn!("feishu connection closed; reconnecting");
                             true
                         }
@@ -357,14 +356,81 @@ fn spawn_ws_thread(
     })
 }
 
+/// Forwards admitted `im.message.receive_v1` payloads to the consumer task.
+/// Parses the raw payload with our own tolerant structs — sender fields
+/// arrive as null for bot mentions or without contact scope, and a strict
+/// schema would drop the whole message.
+struct ReceiveHandler {
+    policy: AdmitPolicy,
+    events: mpsc::UnboundedSender<Inbound>,
+}
+
+impl EventHandler for ReceiveHandler {
+    fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match serde_json::from_slice::<ReceiveEvent>(payload) {
+            Ok(event) => {
+                if let Some(msg) = admit(event, &self.policy) {
+                    let _ = self.events.send(msg);
+                }
+            }
+            // Ack anyway: redelivery cannot fix a payload we cannot parse.
+            Err(error) => warn!(%error, "feishu event payload failed to parse"),
+        }
+        Ok(())
+    }
+}
+
+/// The `im.message.receive_v1` payload, reduced to the fields `admit` reads.
+#[derive(Deserialize)]
+struct ReceiveEvent {
+    event: ReceiveBody,
+}
+
+#[derive(Deserialize)]
+struct ReceiveBody {
+    sender: EventSender,
+    message: EventMessage,
+}
+
+#[derive(Deserialize)]
+struct EventSender {
+    #[serde(default)]
+    sender_id: Option<SenderId>,
+    #[serde(default)]
+    sender_type: String,
+}
+
+#[derive(Deserialize)]
+struct SenderId {
+    #[serde(default)]
+    open_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EventMessage {
+    message_id: String,
+    chat_id: String,
+    #[serde(default)]
+    chat_type: String,
+    #[serde(default)]
+    message_type: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    mentions: Option<Vec<serde_json::Value>>,
+}
+
 /// Reduce a raw receive event to an `Inbound`, or `None` when the agent
 /// should ignore it (policy rejection, non-text, non-user sender, empty
 /// after mention strip).
-fn admit(event: P2ImMessageReceiveV1, policy: &AdmitPolicy) -> Option<Inbound> {
+fn admit(event: ReceiveEvent, policy: &AdmitPolicy) -> Option<Inbound> {
     let sender = event.event.sender;
     if sender.sender_type != "user" {
         return None;
     }
+    // Pairing keys on the open_id; a user message without one cannot be
+    // admitted or paired.
+    let sender_id = sender.sender_id.and_then(|id| id.open_id)?;
     let message = event.event.message;
     if message.message_type != "text" {
         return None;
@@ -385,7 +451,7 @@ fn admit(event: P2ImMessageReceiveV1, policy: &AdmitPolicy) -> Option<Inbound> {
     }
     Some(Inbound {
         message_id: message.message_id,
-        sender_id: sender.sender_id.open_id,
+        sender_id,
         chat_id: message.chat_id,
         text,
     })
@@ -422,7 +488,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn event(overrides: serde_json::Value) -> P2ImMessageReceiveV1 {
+    fn event(overrides: serde_json::Value) -> ReceiveEvent {
         let mut base = json!({
             "schema": "2.0",
             "header": { "event_type": "im.message.receive_v1" },
@@ -489,6 +555,23 @@ mod tests {
         assert_eq!(msg.chat_id, "oc_1");
         assert_eq!(msg.sender_id, "ou_1");
         assert_eq!(msg.text, "hello");
+    }
+
+    #[test]
+    fn admit_tolerates_null_sender_fields() {
+        // Feishu sends null user_id/union_id/tenant_key for bot mentions or
+        // without contact scope; only the open_id is required.
+        let msg = admit(
+            event(json!({
+                "event": { "sender": {
+                    "sender_id": { "union_id": null, "user_id": null, "open_id": "ou_1" },
+                    "tenant_key": null
+                } }
+            })),
+            &AdmitPolicy::default(),
+        )
+        .expect("admitted");
+        assert_eq!(msg.sender_id, "ou_1");
     }
 
     #[test]

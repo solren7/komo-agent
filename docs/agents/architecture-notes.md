@@ -732,8 +732,8 @@ model's view is one config value, in one place.
 - background install: `komo gateway start` (see `cli/service.rs`) supervises it with launchd on macOS only; bare `komo gateway` is the foreground process for Docker/Linux and the process launchd invokes on macOS
 
 `infra/messaging/feishu.rs` — the feishu integration: `FeishuChannel` (ingress), `FeishuSender` (outbound: cached tenant token + send; also a `TextSender` for the shared `HomeNotifier`)
-- receives `im.message.receive_v1` over Feishu's WebSocket long connection (open-lark, no public callback URL needed); replies via the IM REST API with plain reqwest
-- the ws connection runs on a dedicated thread with a current-thread runtime because open-lark's event dispatcher is not `Send`; events cross back over an mpsc channel
+- receives `im.message.receive_v1` over Feishu's WebSocket long connection (openlark, no public callback URL needed); event payloads are consumed raw with komo's own tolerant serde structs; replies via the IM REST API with plain reqwest
+- the ws connection runs on a dedicated thread with a current-thread runtime, isolated from the main runtime; events cross back over an mpsc channel
 - `admit` filters message shape: `require_mention` for group chats, non-text and bot-sent messages dropped; sender identity goes through the shared `PairingGuard`
 - session id is `feishu:{chat_id}`, so each chat is one continuous session; group @mention placeholders are stripped
 

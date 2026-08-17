@@ -41,7 +41,7 @@ riko 是一个通过飞书、Telegram 和 CLI 持续接收任务、调用模型�
 | 全文检索 | Turso Tantivy FTS | 混合检索的关键词信号 + embedding 不可用时的降级路径；处于实验状态，藏在 `MemoryStore` 后 |
 | 时间 | time | `OffsetDateTime` + RFC3339 serde，不使用 chrono |
 | cron | croner | 仅解析表达式，调度循环自行实现 |
-| 飞书 | open-lark（先验证 WS 长连接） | 失败时以 tokio-tungstenite 自封适配器替代 |
+| 飞书 | openlark（先验证 WS 长连接） | 失败时以 tokio-tungstenite 自封适配器替代 |
 | Telegram | reqwest | 仅 `getUpdates` 长轮询、`sendMessage` 等必要端点 |
 
 ## 3. 总体架构

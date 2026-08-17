@@ -56,9 +56,11 @@ reqwest = { version = "0.13", default-features = false, features = [
     # `bytes_stream()` — the provider layer reads every completion as SSE.
     "stream",
 ] }
-open-lark = { version = "0.14", default-features = false, features = [
+# Only the WebSocket long connection — event payloads are consumed raw
+# (`register_raw`) with our own tolerant serde structs, and replies go
+# through reqwest, so no business-domain feature is needed.
+openlark = { version = "0.20", default-features = false, features = [
     "websocket",
-    "im",
 ] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -76,7 +78,7 @@ croner = "3"
 chrono = { workspace = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # Both `ring` and `aws-lc-rs` are activated transitively. Select ring explicitly
-# before any TLS client is constructed (notably open-lark's WebSocket runtime).
+# before any TLS client is constructed (notably openlark's WebSocket runtime).
 rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
 futures-util = { workspace = true }
 wechatbot = "=0.4.0"
@@ -179,12 +181,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
 ] }
 
-# Vendored open-lark 0.14.0 with nullable event fields (user_id/union_id/name/
-# tenant_key arrive as null for bot mentions or without contact scope, and the
-# stock struct drops the whole message) + payload snippet in the ws error log.
 [patch.crates-io]
-open-lark = { path = "vendor/open-lark" }
-
 # Vendored qdrant-edge 0.8.0 with `parking_lot/deadlock_detection` removed from
 # its dependency features. That feature is mutually exclusive with `send_guard`,
 # which turso_sdk_kit requires, and cargo unifies features across the graph — so
