@@ -590,15 +590,26 @@ mod tests {
     /// The bug `process_group` + `killpg` fixes: killing `sh` alone leaves the
     /// processes it started running. Here a backgrounded child would create a
     /// marker file one second in — it must never get the chance.
+    /// A timeout must end the whole tree, not just `sh` — a killed shell that
+    /// leaves a build (or a `sleep`) running is the failure this tool's process
+    /// group exists to prevent.
+    ///
+    /// Deliberately not "wait a while and check a file did not appear": that
+    /// races the orphan's own clock against a loaded machine's scheduler, and
+    /// loses on a busy CI box. The orphan announces its pid instead, and the
+    /// test polls until that pid is gone — an answer about the process itself,
+    /// not about who won a stopwatch.
     #[tokio::test]
     async fn a_timeout_kills_processes_the_command_started() {
         let dir = scratch("orphan");
-        let marker = dir.join("alive.txt");
+        let pid_file = dir.join("orphan.pid");
         let tool = ShellTool::new(workspace());
-        let command = format!(
-            "(sleep 1; echo alive > {}) & sleep 30",
-            marker.to_string_lossy()
-        );
+        // The orphan outlives the tool's budget by two orders of magnitude, so
+        // "still running" can only mean it was never killed.
+        // `$!`, not `$$`: in POSIX sh a subshell's `$$` is still the *parent*
+        // shell's pid, which `kill_on_drop` reaps anyway — the test would then
+        // pass without the process group doing anything.
+        let command = format!("sleep 30 & echo $! > {}; sleep 30", pid_file.display());
 
         let out = tool
             .call(
@@ -609,12 +620,41 @@ mod tests {
             .unwrap();
         assert_eq!(out.structured["timeout"], true);
 
-        // Well past when the orphan would have written.
-        tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+        let Some(pid) = read_pid(&pid_file).await else {
+            // Killed before it could even name itself — the outcome under test,
+            // reached sooner. Nothing left to check.
+            return;
+        };
         assert!(
-            !marker.exists(),
-            "a process started by the command survived the timeout"
+            wait_until_gone(pid).await,
+            "a process started by the command survived the timeout (pid {pid})"
         );
+    }
+
+    /// The orphan's pid once it has written one, or `None` if it never does.
+    async fn read_pid(path: &std::path::Path) -> Option<i32> {
+        for _ in 0..40 {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                return Some(pid);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    /// Poll `kill(pid, 0)` until the process is gone. `true` if it went.
+    async fn wait_until_gone(pid: i32) -> bool {
+        for _ in 0..40 {
+            // Safety: signal 0 performs the permission/existence check only and
+            // sends nothing.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
     }
 
     /// A [`CancelSignal`] that fires after a delay — a stand-in for the user
