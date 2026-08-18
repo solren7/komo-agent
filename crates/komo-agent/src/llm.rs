@@ -646,7 +646,7 @@ fn rebuild_from_journal(entries: &[JournalEntry]) -> anyhow::Result<RebuiltTurn>
                     AssistantBlock::ToolCall { id, call_id, .. } => Some(UserBlock::ToolResult {
                         id: id.clone(),
                         call_id: call_id.clone(),
-                        text: INTERRUPTED_RESULT_NOTE.to_string(),
+                        text: INTERRUPTED_RESULT_NOTE.clone(),
                     }),
                     _ => None,
                 })
@@ -737,8 +737,12 @@ impl JournalEnvelope {
 /// What a tool call whose result was lost to the interruption gets fed back as
 /// on resume. The tools themselves are never re-run here: a mutation cannot be
 /// assumed idempotent, so whether to re-issue the call is the model's decision.
-const INTERRUPTED_RESULT_NOTE: &str = "[This call's result was lost when the process \
-     was interrupted before it finished. Re-issue the call if you still need it.]";
+static INTERRUPTED_RESULT_NOTE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "[This call's result was lost when the process was interrupted before it finished. {}]",
+        komo_core::domain::tool::UNCERTAIN_OUTCOME_ADVICE
+    )
+});
 
 /// How a [`TurnLoop`] opens: a fresh turn sends its prompt; a resumed one
 /// picks up from whatever state the journal ended in.
@@ -1717,12 +1721,24 @@ mod tests {
                 [UserBlock::ToolResult { id, call_id, text }] => {
                     assert_eq!(id, "item-shell");
                     assert_eq!(call_id.as_deref(), Some("call-shell"));
-                    assert_eq!(text, INTERRUPTED_RESULT_NOTE);
+                    assert_eq!(text, &*INTERRUPTED_RESULT_NOTE);
                 }
                 other => panic!("expected one synthesized result, got {other:?}"),
             },
             other => panic!("expected a user turn, got {other:?}"),
         }
+        // The advice must be the one the executor gives for the same situation:
+        // the call went out and nobody knows whether it landed. Telling the
+        // model to just re-issue it here — at the *most* dangerous moment, after
+        // a crash mid-mutation — is what this used to do.
+        assert!(
+            INTERRUPTED_RESULT_NOTE.contains(komo_core::domain::tool::UNCERTAIN_OUTCOME_ADVICE),
+            "the interrupted-result note must carry the shared uncertain-outcome advice"
+        );
+        assert!(
+            !INTERRUPTED_RESULT_NOTE.contains("Re-issue the call if you still need it"),
+            "an unknown outcome must not invite a blind retry"
+        );
     }
 
     #[test]

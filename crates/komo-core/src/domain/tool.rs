@@ -151,6 +151,18 @@ impl std::fmt::Display for TransientError {
 
 impl std::error::Error for TransientError {}
 
+/// What a model is told when a call's outcome is unknown — it was issued, and
+/// whether it landed cannot be established.
+///
+/// One sentence, one place, because there are two ways to arrive here and they
+/// must not give opposite advice: a call that timed out or failed ambiguously
+/// (`ToolError::Uncertain`), and a call whose result was lost to a crash and is
+/// replayed on resume. The second used to say "re-issue the call if you still
+/// need it" — the most dangerous moment to invite a blind retry, since a
+/// mutation may already have been applied.
+pub const UNCERTAIN_OUTCOME_ADVICE: &str = "It may or may not have taken effect — check the target's state before calling it again; \
+     repeating it blindly can apply the same change twice.";
+
 /// Marks a failure as one where the call may still have taken effect.
 ///
 /// Carried through `anyhow` the same way [`TransientError`] is, so the fact
