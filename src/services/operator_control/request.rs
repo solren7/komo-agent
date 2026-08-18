@@ -9,7 +9,7 @@ use crate::domain::{
     cron::{CronJob, CronJobSpec},
     memory::Memory,
     reminder::Reminder,
-    run::{Run, RunStep},
+    run::{MemoryUse, Run, RunStep},
     task::Task,
 };
 
@@ -41,6 +41,8 @@ pub enum OperatorQuery {
     /// every other operator read so a running gateway lends its embedder;
     /// without one the same scoring runs lexical-only.
     MemorySearch { query: String, limit: usize },
+    /// Which turns a memory reached the prompt of.
+    MemoryUsed { id: String, limit: usize },
     /// Hash-free pairing rows.
     Pairings,
     /// The dreaming dry-run classification.
@@ -71,6 +73,7 @@ pub enum OperatorQueryResult {
     Sessions(Vec<SessionSummary>),
     Memories(Vec<Memory>),
     MemorySearch(Vec<Memory>),
+    MemoryUsed(Vec<MemoryUse>),
     Pairings(Vec<PairingView>),
     DreamPreview(DreamReport),
     SkillAudit(Vec<SkillInvocation>),

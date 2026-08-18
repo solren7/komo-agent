@@ -21,7 +21,7 @@ use komo_core::domain::{
     },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, ReviewCandidate, SessionRepository},
-    run::{INTERRUPTED_ERROR, Run, RunRepository, RunStatus, RunStep, parse_run_status},
+    run::{INTERRUPTED_ERROR, MemoryUse, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     session::Session,
     skill::Skill,
     todo::{SessionTodoRepository, TodoItem},
@@ -294,6 +294,33 @@ const INBOX_TABLE_DDL: &[&str] = &[
      \"completed_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
 ];
 
+/// One `(memory, run)` link — the reverse index behind `runs_using_memory`.
+/// Written when the run finishes, because that is when the turn's injected
+/// memories are known.
+#[derive(Debug, toasty::Model)]
+struct RunMemoryRecord {
+    #[key]
+    id: String,
+
+    #[index]
+    memory_id: String,
+
+    run_id: String,
+    session_id: String,
+    pinned: bool,
+    started_at: i64,
+}
+
+/// DDL for [`RunMemoryRecord`], for a state.db that predates it. Byte-parity is
+/// locked by `run_memory_table_ddl_matches_push_schema`.
+const RUN_MEMORY_TABLE: &str = "run_memory_records";
+const RUN_MEMORY_TABLE_DDL: &[&str] = &[
+    "CREATE TABLE \"run_memory_records\" (\"id\" TEXT NOT NULL, \"memory_id\" TEXT NOT NULL, \
+     \"run_id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \"pinned\" BOOLEAN NOT NULL, \
+     \"started_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+    "CREATE INDEX \"index_run_memory_records_by_memory_id\" ON \"run_memory_records\" (\"memory_id\")",
+];
+
 const INBOX_STATUS_CLAIMED: &str = "claimed";
 const INBOX_STATUS_COMPLETED: &str = "completed";
 
@@ -379,6 +406,7 @@ impl Db {
             ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
             ensure_table(p, JOURNAL_TABLE, JOURNAL_TABLE_DDL).await?;
             ensure_table(p, INBOX_TABLE, INBOX_TABLE_DDL).await?;
+            ensure_table(p, RUN_MEMORY_TABLE, RUN_MEMORY_TABLE_DDL).await?;
         }
 
         // MVCC concurrent-writes on (UUID keys throughout, so no AUTOINCREMENT).
@@ -399,7 +427,8 @@ impl Db {
                 RunRecord,
                 RunStepRecord,
                 TurnJournalRecord,
-                InboxRecord
+                InboxRecord,
+                RunMemoryRecord
             ))
             .max_pool_size(DEFAULT_POOL_SIZE)
             .build(driver)
@@ -1273,8 +1302,35 @@ impl RunRepository for Db {
                 .tokens_in(run.tokens_in)
                 .tokens_out(run.tokens_out)
                 .tokens_cached(run.tokens_cached)
+                // Written here, not at `start`: the enricher runs inside the
+                // turn, so at `start` there is nothing to record yet.
+                .memories(if run.memories.is_empty() {
+                    String::new()
+                } else {
+                    serde_json::to_string(&run.memories).unwrap_or_default()
+                })
                 .exec(&mut conn)
                 .await?;
+            // The reverse index, written from the same value and at the same
+            // moment, so the two can never disagree about what a turn used.
+            for (memory_id, pinned) in run
+                .memories
+                .pinned
+                .iter()
+                .map(|id| (id, true))
+                .chain(run.memories.recall.iter().map(|id| (id, false)))
+            {
+                toasty::create!(RunMemoryRecord {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    memory_id: memory_id.clone(),
+                    run_id: run.id.clone(),
+                    session_id: run.session_id.clone(),
+                    pinned,
+                    started_at: run.started_at,
+                })
+                .exec(&mut conn)
+                .await?;
+            }
             Ok(())
         })
         .await
@@ -1330,6 +1386,15 @@ impl RunRepository for Db {
                 for step in steps {
                     step.delete().exec(&mut tx).await?;
                 }
+                // The memory index drops with its run, or `komo memory used`
+                // would keep citing turns whose transcript and ledger are gone.
+                let mem_run_id = run.id.clone();
+                let links = toasty::query!(RunMemoryRecord FILTER .run_id == #mem_run_id)
+                    .exec(&mut tx)
+                    .await?;
+                for link in links {
+                    link.delete().exec(&mut tx).await?;
+                }
                 let journal_run_id = run.id.clone();
                 let journal = toasty::query!(TurnJournalRecord FILTER .run_id == #journal_run_id)
                     .exec(&mut tx)
@@ -1383,6 +1448,29 @@ impl RunRepository for Db {
             Ok(())
         })
         .await
+    }
+
+    async fn runs_using_memory(
+        &self,
+        memory_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryUse>> {
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(
+            RunMemoryRecord FILTER .memory_id == #memory_id ORDER BY .started_at DESC LIMIT #limit
+        )
+        .exec(&mut conn)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MemoryUse {
+                memory_id: r.memory_id,
+                run_id: r.run_id,
+                session_id: r.session_id,
+                pinned: r.pinned,
+                started_at: r.started_at,
+            })
+            .collect())
     }
 
     async fn steps_by_tool(&self, tool_name: &str, limit: usize) -> anyhow::Result<Vec<RunStep>> {
@@ -1748,6 +1836,112 @@ mod tests {
         }
     }
 
+    /// The reverse direction: which turns did this memory shape? Written from
+    /// the same value as `Run.memories` at the same moment, so the two cannot
+    /// disagree — and dropped with the run, so a pruned turn stops being cited.
+    #[tokio::test]
+    async fn a_memory_can_be_traced_back_to_the_turns_it_shaped() {
+        use komo_core::domain::run::{RecalledMemories, Run, RunStatus};
+        let db = Db::connect(&sqlite_url("komo_memory_used_test.db"))
+            .await
+            .unwrap();
+
+        let finish = |id: &str, at: i64, mem: RecalledMemories| {
+            let mut run = Run::start("api:s", id);
+            run.started_at = at;
+            run.memories = mem;
+            run.status = RunStatus::Done;
+            run
+        };
+        let older = finish(
+            "first",
+            1_000,
+            RecalledMemories {
+                pinned: vec!["mem-p".into()],
+                recall: vec!["mem-a".into()],
+            },
+        );
+        let newer = finish(
+            "second",
+            2_000,
+            RecalledMemories {
+                pinned: Vec::new(),
+                recall: vec!["mem-a".into()],
+            },
+        );
+        for run in [&older, &newer] {
+            RunRepository::start(&db, run).await.unwrap();
+            RunRepository::finish(&db, run).await.unwrap();
+        }
+
+        let uses = RunRepository::runs_using_memory(&db, "mem-a", 10)
+            .await
+            .unwrap();
+        assert_eq!(uses.len(), 2);
+        assert_eq!(uses[0].run_id, newer.id, "newest first");
+        assert!(!uses[0].pinned, "mem-a was recalled, not pinned");
+
+        // The tier is kept, because "it was pinned then" and "it matched the
+        // question" are different reasons for a memory to be in a prompt.
+        let pinned = RunRepository::runs_using_memory(&db, "mem-p", 10)
+            .await
+            .unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned[0].pinned);
+
+        // A memory nothing used has no history — not an error.
+        assert!(
+            RunRepository::runs_using_memory(&db, "mem-never", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Pruning a run takes its links: citing a turn whose ledger row is gone
+        // would send the operator to a `run inspect` that finds nothing.
+        RunRepository::prune(&db, 1_500).await.unwrap();
+        let after = RunRepository::runs_using_memory(&db, "mem-a", 10)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "the pruned run's link went with it");
+        assert_eq!(after[0].run_id, newer.id);
+    }
+
+    #[tokio::test]
+    async fn run_memory_table_ddl_matches_push_schema() {
+        let fresh = std::env::temp_dir().join("komo_run_memory_ddl_fresh.db");
+        crate::persistence::reset_test_db(&fresh);
+        let db = Db::connect(&format!("turso:{}", fresh.display()))
+            .await
+            .unwrap();
+        drop(db);
+        let reference = table_schema_sql(&fresh, RUN_MEMORY_TABLE).await;
+        assert!(!reference.is_empty(), "push_schema created the table");
+
+        let old = std::env::temp_dir().join("komo_run_memory_ddl_old.db");
+        crate::persistence::reset_test_db(&old);
+        let db = Db::connect(&format!("turso:{}", old.display()))
+            .await
+            .unwrap();
+        drop(db);
+        {
+            let raw = turso::Builder::new_local(old.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = raw.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute("DROP TABLE \"run_memory_records\"", ())
+                .await
+                .unwrap();
+        }
+        let db = Db::connect(&format!("turso:{}", old.display()))
+            .await
+            .unwrap();
+        drop(db);
+        assert_eq!(table_schema_sql(&old, RUN_MEMORY_TABLE).await, reference);
+    }
+
     #[tokio::test]
     async fn inbox_table_ddl_matches_push_schema() {
         let fresh = std::env::temp_dir().join("komo_inbox_ddl_fresh.db");
@@ -1888,19 +2082,32 @@ mod tests {
         let db = Db::connect(&sqlite_url("komo_run_memories_test.db"))
             .await
             .unwrap();
+
+        // The real order, which is the whole point: a run is opened *before*
+        // the turn runs, so at `start` there is nothing to record — the
+        // enricher has not run yet. Recording only at `start` (as this first
+        // did) leaves the column empty forever in production while a
+        // storage-roundtrip test passes happily.
         let mut run = Run::start("api:s", "why did you say that");
+        assert!(run.memories.is_empty());
+        RunRepository::start(&db, &run).await.unwrap();
+
         run.memories = RecalledMemories {
             pinned: vec!["mem-pinned".into()],
             recall: vec!["mem-a".into(), "mem-b".into()],
         };
-        RunRepository::start(&db, &run).await.unwrap();
+        run.status = komo_core::domain::run::RunStatus::Done;
+        RunRepository::finish(&db, &run).await.unwrap();
+
         let back = RunRepository::get(&db, &run.id).await.unwrap().unwrap();
         assert_eq!(back.memories.pinned, ["mem-pinned"]);
         assert_eq!(back.memories.recall, ["mem-a", "mem-b"]);
 
         // A turn that used none records none.
-        let plain = Run::start("api:s", "hi");
+        let mut plain = Run::start("api:s", "hi");
         RunRepository::start(&db, &plain).await.unwrap();
+        plain.status = komo_core::domain::run::RunStatus::Done;
+        RunRepository::finish(&db, &plain).await.unwrap();
         assert!(
             RunRepository::get(&db, &plain.id)
                 .await

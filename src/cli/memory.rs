@@ -49,6 +49,44 @@ pub async fn list(control: &OperatorControl, status: Option<String>) -> anyhow::
 }
 
 /// Substring search across all scopes (operator view — no scope enforcement).
+/// Which turns a memory reached the prompt of, newest first.
+///
+/// The question worth asking right after correcting a memory: what did it
+/// already shape? Prints run ids so `komo run inspect <id>` is the next step.
+pub async fn used(control: &OperatorControl, id: &str, limit: usize) -> anyhow::Result<()> {
+    let uses = match control
+        .query(OperatorQuery::MemoryUsed {
+            id: id.to_string(),
+            limit,
+        })
+        .await?
+    {
+        OperatorQueryResult::MemoryUsed(uses) => uses,
+        _ => unreachable!("MemoryUsed answers with MemoryUsed"),
+    };
+    if uses.is_empty() {
+        // Two different nothings, and the operator needs them apart: the ledger
+        // is pruned, so "never used" and "used before the ledger was trimmed"
+        // look identical from here.
+        println!(
+            "没有记录到这条记忆进入过 prompt（run ledger 会被 `komo run prune` 清理，更早的使用查不到）。"
+        );
+        return Ok(());
+    }
+    println!("这条记忆进入过 {} 次 prompt：", uses.len());
+    for use_ in &uses {
+        println!(
+            "  {}  {}  {}  {}",
+            crate::cli::inspect::local_time(use_.started_at),
+            if use_.pinned { "常驻" } else { "召回" },
+            use_.run_id,
+            use_.session_id
+        );
+    }
+    println!("\n用 `komo run inspect <run-id>` 看具体那一轮。");
+    Ok(())
+}
+
 pub async fn search(control: &OperatorControl, query: &str) -> anyhow::Result<()> {
     // The same hybrid query recall runs (lexical terms ∪ semantic vectors), not
     // a substring scan: an operator searching 智能设备 must find the memory

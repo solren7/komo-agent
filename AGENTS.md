@@ -23,7 +23,8 @@ komo logs [-n N] [-f] [--stdout]   # tail gateway tracing log
 komo doctor                        # config & gateway health
 komo health                        # liveness probe (exit 0 = healthy; Docker HEALTHCHECK)
 
-komo memory list|search|promote|reject|pin|triage|report|repair-scopes
+komo memory list|search|used|promote|reject|pin|triage|report|repair-scopes
+komo memory used <id>              # which turns this memory shaped (run ledger; pruned with it)
 komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; index is incremental)
 komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--grant c:m:v]|run|enable|disable|remove
@@ -450,6 +451,13 @@ call the same functions, which is what keeps validation from forking.
   memory produced *this* answer" — and, read the other way, which turns a
   memory you just corrected had already shaped. Ids only; the store stays the
   authority on content.
+  The reverse direction — *which turns did this memory shape?*, the question
+  asked right after correcting one — is a thin `run_memory_records` index
+  written from the same value in the same `finish`, and dropped with its run
+  by `prune`. Not answered by scanning runs: a `Run` carries two 4000-char
+  fields, so reading thousands of them for one JSON column is the wrong
+  query. **`memories` is written by `finish`, not `start`** — the enricher
+  runs inside the turn, so at `start` there is nothing yet to record.
   `elapsed_ms` is the duration field (`started_at`/`ended_at` are whole
   seconds); 0 / empty `structured` read as *unknown/absent*, never
   instant/empty-object. Args redacted per-tool (`Tool::redact_args`); results

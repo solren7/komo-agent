@@ -599,6 +599,21 @@ impl GatewayClient {
         .await
     }
 
+    /// Which turns a memory reached the prompt of — read from the ledger, which
+    /// only the gateway process can open while it runs.
+    pub async fn memory_used(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<komo_core::domain::run::MemoryUse>> {
+        self.post_field(
+            "/api/memories/used",
+            json!({ "id": id, "limit": limit }),
+            "uses",
+        )
+        .await
+    }
+
     /// Embed every memory still missing a current vector, server-side; returns
     /// how many gained one. Slow by nature — a never-embedded library calls the
     /// model once per batch — so it rides the long timeout, like wiki indexing.

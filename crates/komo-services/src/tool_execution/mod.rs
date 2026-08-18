@@ -944,6 +944,14 @@ mod tests {
 
     #[async_trait]
     impl RunRepository for RecordingRuns {
+        async fn runs_using_memory(
+            &self,
+            _memory_id: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<komo_core::domain::run::MemoryUse>> {
+            Ok(Vec::new())
+        }
+
         async fn start(&self, _run: &Run) -> anyhow::Result<()> {
             Ok(())
         }

@@ -166,6 +166,9 @@ impl DirectOperatorAdapter {
                     actions::search_memories(&service, db.as_ref(), &query, limit).await?,
                 )
             }
+            OperatorQuery::MemoryUsed { id, limit } => OperatorQueryResult::MemoryUsed(
+                RunRepository::runs_using_memory(self.db().await?.as_ref(), &id, limit).await?,
+            ),
             OperatorQuery::Memories => {
                 OperatorQueryResult::Memories(self.memory().await?.list().await?)
             }

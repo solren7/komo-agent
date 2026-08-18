@@ -333,6 +333,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/memories/repair-scopes", post(memory_repair_scopes))
         .route("/api/memories/backfill", post(memory_backfill))
         .route("/api/memories/search", post(memory_search))
+        .route("/api/memories/used", post(memory_used))
         .route("/api/wiki/search", post(wiki_search))
         .route("/api/wiki/status", get(wiki_status))
         .route("/api/wiki/index", post(wiki_index))
@@ -1426,6 +1427,20 @@ async fn memory_search(
 ) -> Result<Response, ApiError> {
     let memories = state.actions.memory_search(&body.query, body.limit).await?;
     Ok(Json(json!({ "memories": memories })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct MemoryUsedBody {
+    id: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+async fn memory_used(
+    State(state): State<AppState>,
+    Json(body): Json<MemoryUsedBody>,
+) -> Result<Response, ApiError> {
+    let uses = state.actions.memory_used(&body.id, body.limit).await?;
+    Ok(Json(json!({ "uses": uses })).into_response())
 }
 
 /// Embed every memory still missing a current vector (backs

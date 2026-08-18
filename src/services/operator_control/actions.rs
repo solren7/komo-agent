@@ -26,7 +26,7 @@ use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, 
 use crate::domain::reminder::{Reminder, ReminderRepository};
 use crate::domain::repository::{MessageRepository, SessionRepository, SkillRepository};
 use crate::domain::run::{
-    Run, RunRepository, RunStep, resume_prompt, skill_viewed, step_views_skill,
+    MemoryUse, Run, RunRepository, RunStep, resume_prompt, skill_viewed, step_views_skill,
 };
 use crate::domain::session::Session;
 use crate::domain::skill::Skill;
@@ -318,6 +318,20 @@ impl OperatorActions {
     pub async fn skill_audit(&self, name: &str) -> anyhow::Result<Vec<SkillInvocation>> {
         let steps = self.runs.steps_by_tool("skill", AUDIT_SCAN_LIMIT).await?;
         Ok(skill_invocations(steps, name, AUDIT_RESULT_CAP))
+    }
+
+    /// Which turns a memory reached the prompt of, newest first.
+    ///
+    /// The direction that gets asked after a memory turns out to be wrong:
+    /// what did it already shape? `Run.memories` answers the other way round
+    /// (this turn used these memories) and cannot be read backwards without
+    /// scanning every run.
+    pub async fn memory_used(
+        &self,
+        memory_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryUse>> {
+        self.runs.runs_using_memory(memory_id, limit).await
     }
 
     /// Every active skill ranked coldest-first — the aggregate the per-name

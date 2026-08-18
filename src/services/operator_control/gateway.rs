@@ -37,6 +37,9 @@ impl GatewayOperatorAdapter {
             OperatorQuery::MemorySearch { query, limit } => {
                 OperatorQueryResult::MemorySearch(self.client.memory_search(&query, limit).await?)
             }
+            OperatorQuery::MemoryUsed { id, limit } => {
+                OperatorQueryResult::MemoryUsed(self.client.memory_used(&id, limit).await?)
+            }
             OperatorQuery::Memories => OperatorQueryResult::Memories(self.client.memories().await?),
             OperatorQuery::Pairings => OperatorQueryResult::Pairings(self.client.pairings().await?),
             OperatorQuery::DreamPreview => {
