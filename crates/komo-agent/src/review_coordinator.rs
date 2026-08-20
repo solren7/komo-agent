@@ -24,15 +24,15 @@ use komo_core::domain::{
     session::Session,
 };
 
-/// Sessions the reviewer must never extract from. A briefing restates facts
-/// the agent already knows (tasks, memories, device state), so extraction
-/// there re-observes the same claims every day — each daily session is a "new
-/// independent occasion" to the consolidator, flooding the memory pipeline
-/// with duplicate candidates instead of evidence. The briefing runtime already
-/// wires `review: None`; this guard covers the scheduled sweep, which scans
-/// every persisted session.
+/// Sessions the reviewer must never extract from: unattended sweep turns
+/// (briefings and cron jobs). A sweep restates facts the agent already knows
+/// (tasks, memories, device state), so extraction there re-observes the same
+/// claims on every run — each run's session is a "new independent occasion" to
+/// the consolidator, flooding the memory pipeline with duplicate candidates
+/// instead of evidence. Both sweep runtimes already wire `review: None`; this
+/// guard covers the scheduled sweep, which scans every persisted session.
 fn exempt_from_review(session_id: &str) -> bool {
-    session_id.starts_with("briefing:")
+    session_id.starts_with("briefing:") || session_id.starts_with("cron:")
 }
 
 /// Why a review is being requested.
@@ -422,11 +422,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn briefing_sessions_are_never_reviewed() {
-        // Scheduled sweep: the briefing session is skipped even with unseen turns.
+    async fn sweep_sessions_are_never_reviewed() {
+        // Scheduled sweep: briefing and cron sessions are skipped even with
+        // unseen turns.
         let sessions = Arc::new(FakeSessions::new(
             vec![
                 candidate("briefing:2026-08-20", 3, 0),
+                candidate("cron:alarm-rotate:1755600000", 4, 0),
                 candidate("feishu:oc_1", 5, 0),
             ],
             10,
@@ -442,13 +444,15 @@ mod tests {
         );
 
         // After-turn: skipped before the cadence count even runs.
-        let report = c
-            .run(ReviewTrigger::AfterTurn {
-                session_id: "briefing:2026-08-20".into(),
-            })
-            .await
-            .unwrap();
-        assert!(report.is_empty());
+        for id in ["briefing:2026-08-20", "cron:alarm-rotate:1755600000"] {
+            let report = c
+                .run(ReviewTrigger::AfterTurn {
+                    session_id: id.into(),
+                })
+                .await
+                .unwrap();
+            assert!(report.is_empty());
+        }
         assert_eq!(reviewer.reviewed.lock().unwrap().len(), 1);
     }
 
