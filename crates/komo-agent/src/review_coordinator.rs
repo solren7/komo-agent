@@ -24,6 +24,17 @@ use komo_core::domain::{
     session::Session,
 };
 
+/// Sessions the reviewer must never extract from. A briefing restates facts
+/// the agent already knows (tasks, memories, device state), so extraction
+/// there re-observes the same claims every day — each daily session is a "new
+/// independent occasion" to the consolidator, flooding the memory pipeline
+/// with duplicate candidates instead of evidence. The briefing runtime already
+/// wires `review: None`; this guard covers the scheduled sweep, which scans
+/// every persisted session.
+fn exempt_from_review(session_id: &str) -> bool {
+    session_id.starts_with("briefing:")
+}
+
 /// Why a review is being requested.
 pub enum ReviewTrigger {
     /// A turn just finished in `session_id`: review it if the cadence
@@ -94,6 +105,9 @@ impl ReviewCoordinator {
         let mut report = ReviewReport::default();
         match trigger {
             ReviewTrigger::AfterTurn { session_id } => {
+                if exempt_from_review(&session_id) {
+                    return Ok(report);
+                }
                 // Cadence is driven by the true user-turn total (a cheap
                 // COUNT) — a windowed in-memory count would plateau at the
                 // window size and mis-fire the modulo.
@@ -114,7 +128,8 @@ impl ReviewCoordinator {
                 // seen yet, instead of loading and re-reviewing everything.
                 let candidates = self.sessions.review_candidates().await?;
                 for candidate in candidates {
-                    if candidate.user_turns == 0
+                    if exempt_from_review(&candidate.id)
+                        || candidate.user_turns == 0
                         || candidate.user_turns <= candidate.reviewed_through
                     {
                         continue;
@@ -404,6 +419,37 @@ mod tests {
             vec![("fresh".to_string(), 5)],
             "only the reviewed session's watermark advances, to its live count"
         );
+    }
+
+    #[tokio::test]
+    async fn briefing_sessions_are_never_reviewed() {
+        // Scheduled sweep: the briefing session is skipped even with unseen turns.
+        let sessions = Arc::new(FakeSessions::new(
+            vec![
+                candidate("briefing:2026-08-20", 3, 0),
+                candidate("feishu:oc_1", 5, 0),
+            ],
+            10,
+        ));
+        let reviewer = Arc::new(RecordingReviewer::default());
+        let c = coordinator(sessions.clone(), reviewer.clone(), 10);
+
+        let report = c.run(ReviewTrigger::Scheduled).await.unwrap();
+        assert_eq!(report.sessions_reviewed, 1);
+        assert_eq!(
+            *reviewer.reviewed.lock().unwrap(),
+            vec!["feishu:oc_1".to_string()]
+        );
+
+        // After-turn: skipped before the cadence count even runs.
+        let report = c
+            .run(ReviewTrigger::AfterTurn {
+                session_id: "briefing:2026-08-20".into(),
+            })
+            .await
+            .unwrap();
+        assert!(report.is_empty());
+        assert_eq!(reviewer.reviewed.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -320,6 +320,11 @@ call the same functions, which is what keeps validation from forking.
   aux call (`grounded_rewrite`) that is handed the real body and returns the
   complete replacement; failing to ground drops the proposal rather than writing
   the blind one. New skills need no second pass.
+  **Briefing sessions (`briefing:*`) are exempt from review** — a briefing
+  restates facts the agent already knows, and each daily session counts as a
+  fresh "independent occasion" to the consolidator, so extracting there floods
+  the memory pipeline with duplicate candidates. The guard lives in
+  `ReviewCoordinator` (`exempt_from_review`), covering both triggers.
 - `komo-agent`'s `delegate` — sub-agent as a real agent turn on a `delegate:<uuid>`
   session; inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
