@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::domain::approval::{ActionRef, ApprovalRequest, Risk};
 use crate::domain::cron::CronJob;
-use crate::domain::policy::{Category, Policy, Rule, RuleSource, Verdict};
+use crate::domain::policy::{Category, Policy, PolicyMode, Rule, RuleSource, Verdict};
 use komo_config::{ConfigSnapshot, PolicyReport};
 use komo_infra::permissions_store::PermissionsStore;
 
@@ -76,6 +76,7 @@ pub fn parse_grant(arg: &str) -> anyhow::Result<komo_core::domain::policy::RuleS
 pub fn list(config: &ConfigSnapshot, jobs: Option<&[CronJob]>) -> anyhow::Result<()> {
     let PolicyReport {
         policy,
+        mode,
         invalid,
         configured,
     } = &config.runtime.policy;
@@ -95,6 +96,17 @@ pub fn list(config: &ConfigSnapshot, jobs: Option<&[CronJob]>) -> anyhow::Result
     }
 
     println!("default_normal: {}", verdict_str(policy.default_normal()));
+    // The mode changes who answers an "ask", so it belongs with the defaults
+    // rather than buried below the rules: in auto mode a prompt the rules
+    // produced may never reach the operator at all.
+    match mode {
+        PolicyMode::Ask => println!("mode: ask (every escalation reaches you)"),
+        PolicyMode::Auto => println!(
+            "mode: auto (an aux-model reviewer may auto-allow an escalation \
+             the request plainly covers; it can never deny, and Dangerous \
+             actions always reach you)"
+        ),
+    }
     println!("(Dangerous always asks unless a rule sets include_dangerous; Safe is deny-only)");
 
     if policy.rules().is_empty() {

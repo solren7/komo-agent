@@ -150,6 +150,34 @@ impl Verdict {
     }
 }
 
+/// How a [`Verdict::Ask`] is handled — the `[policy] mode` setting.
+///
+/// Deliberately *not* a field on [`Policy`]: the engine is a pure rule
+/// evaluator, and this changes nothing about which verdict a request gets. It
+/// decides who answers an `Ask` — the human alone, or an aux-model reviewer
+/// first (`agent::auto_reviewer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolicyMode {
+    /// Every `Ask` goes straight to the human. The default, and what komo did
+    /// before the mode existed.
+    #[default]
+    Ask,
+    /// An `Ask` is reviewed by the aux model first, which may auto-allow it or
+    /// hand it to the human. It can never deny — refusal stays the operator's.
+    Auto,
+}
+
+impl PolicyMode {
+    /// Parse the `[policy] mode` value (`ask` / `auto`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "ask" => Some(Self::Ask),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
 /// One policy rule. Built by `config.rs` from a `[[policy.rule]]` table.
 #[derive(Debug, Clone)]
 pub struct Rule {

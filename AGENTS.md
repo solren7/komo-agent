@@ -151,7 +151,11 @@ fork — add new operator actions there, not in the CLI or api handlers.
 `briefing_schedule_enabled` / `dream_schedule_enabled` (default true; `false`
 disables the sweep while leaving its cron in place, so
 `KOMO_BRIEFING_SCHEDULE_ENABLED=false` / `KOMO_DREAM_SCHEDULE_ENABLED=false`
-silence a deployment without rewriting config.toml), `[channels.*]`, `[policy]`,
+silence a deployment without rewriting config.toml), `[channels.*]`, `[policy]`
+— `default_normal`, the `[[policy.rule]]` list, and `mode` (`ask` default /
+`auto`, which routes an escalation through the aux reviewer first; an
+unparseable value warns and stays `ask`, since a typo must never widen the
+gate) —
 `[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
 cross-language recall; no model = lexical-only —
 `[wiki]` — `vault` (the note directory; absent = no `wiki_search`/`wiki_read`/`wiki_index`),
@@ -351,6 +355,25 @@ call the same functions, which is what keeps validation from forking.
   deny-only — never prompted. Wholly-denied tools are dropped from the catalog
   at wiring (`drop_policy_denied`). Policy only tightens; hardline floors
   short-circuit inside the tool.
+- `komo-agent`'s `auto_reviewer` — the `[policy] mode = "auto"` rung, sitting
+  between the engine's `Ask` and the human (attended runtimes only; `mode =
+  "ask"` is the default and omits the decorator entirely). An aux-model reviewer
+  judges whether the action is plainly authorized by the operator's own latest
+  message, and **may only allow or hand over — never deny**; refusal stays the
+  operator's. Four structural properties, each a test: no deny;
+  `Risk::Dangerous` never reviewed; unattended turns never reviewed (cron /
+  briefing keep the "shrink the action set in advance" contract and don't wire
+  it at all); fail-closed — model error, 20s timeout, unparseable verdict, or no
+  operator message to judge against all mean "ask". Verdict parsing is
+  deliberately strict: the word must lead the first line **and** be the only
+  verdict named on it, because a line saying "ALLOW would be wrong; ASK" has
+  not decided. The reviewer's trust boundary (only the operator's message
+  authorizes; tool output and agent text never do) is the same rule the main
+  prompt states in `system_prompt::TRUST_BOUNDARY_GUIDANCE` — one rule, so the
+  agent and its reviewer cannot disagree on what authorization is. This reopens
+  ADR 0002's "no LLM approver" half under that ADR's own stated trigger (MCP
+  landed); the sandbox and credential-broker halves stand. See
+  `docs/adr/0003-auto-policy-llm-reviewer.md`.
 - `komo-mcp` + `komo-tools`' `mcp` — external MCP servers over Streamable HTTP
   (rmcp, client features only). `[mcp.servers.*]` is connected **once at
   wiring**: the catalog is immutable after that (`register` takes

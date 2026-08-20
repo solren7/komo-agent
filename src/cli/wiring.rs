@@ -141,16 +141,6 @@ pub async fn build(
         .clone()
         .with_saved(permissions.rules());
 
-    // Wrap the interactive approver in the configurable permission policy
-    // (roadmap §3): the policy auto-allows / hard-denies per `[policy]` rules and
-    // only escalates to `approver` when it says "ask". With no `[policy]` table
-    // this is the empty policy — identical to the bare interactive approver.
-    let approver = komo_agent::policy_approver::PolicyApprover::wrap_with_store(
-        interactive_policy,
-        approver,
-        permissions.clone(),
-    );
-
     // Over-limit tool output is kept in full under ~/.komo/tool-output; the model
     // gets a head+tail preview naming the file (roadmap item 10).
     let output_store = Arc::new(ToolOutputStore::new(
@@ -198,6 +188,42 @@ pub async fn build(
     // Aux/delegate sub-agents must not be fed the user's memory library — and
     // the aux agent never gets an aux of its own (no recursion).
     let aux_llm = build_llm(&aux_config, None, aux_preamble, None, Some("aux"))?;
+
+    // ── The attended approval chain ──────────────────────────────────────────
+    // Built here rather than at the top of `build` because its middle rung needs
+    // the aux model above.
+    //
+    // `[policy] mode = "auto"` inserts a second-opinion reviewer between the
+    // policy's `Ask` and the human: it may auto-allow an action the operator's
+    // own request plainly covers, or hand it over — it can never deny. In `ask`
+    // mode (the default) the decorator is absent, so this is byte-identical to
+    // what the chain was before the mode existed.
+    //
+    // Attended runtimes only. Cron and briefing build their own `PolicyApprover`
+    // over a deny-all inner further down and deliberately skip this: an
+    // unattended turn grants through rules approved in advance, never a live
+    // judgement call (ADR 0002 / 0003).
+    let approver = match config.runtime.policy.mode {
+        komo_core::domain::policy::PolicyMode::Auto => {
+            tracing::info!("permission policy: auto mode (aux reviewer may auto-allow prompts)");
+            komo_agent::auto_reviewer::AutoReviewApprover::wrap(
+                aux_llm.clone(),
+                db.clone(),
+                approver,
+            )
+        }
+        komo_core::domain::policy::PolicyMode::Ask => approver,
+    };
+
+    // Wrap that in the configurable permission policy (roadmap §3): the policy
+    // auto-allows / hard-denies per `[policy]` rules and only escalates when it
+    // says "ask". With no `[policy]` table this is the empty policy — identical
+    // to the bare interactive approver.
+    let approver = komo_agent::policy_approver::PolicyApprover::wrap_with_store(
+        interactive_policy,
+        approver,
+        permissions.clone(),
+    );
 
     // The governed skill store: `~/.komo/skills` is the komo-owned home for
     // durable skills (files, not db — roadmap §9). Reviewer proposals land in

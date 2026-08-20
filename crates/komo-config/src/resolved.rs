@@ -454,6 +454,10 @@ impl ModelConfig {
 /// The resolved policy plus load diagnostics (for `komo policy list` / doctor).
 pub struct PolicyReport {
     pub policy: komo_core::domain::policy::Policy,
+    /// Who answers a `Verdict::Ask` — the human, or the aux reviewer first.
+    /// Carried beside the policy rather than inside it: the rule engine's
+    /// verdicts do not depend on it (see `domain::policy::PolicyMode`).
+    pub mode: komo_core::domain::policy::PolicyMode,
     /// Config indices (0-based `[[policy.rule]]` order) of ignored invalid rules.
     pub invalid: Vec<usize>,
     /// Whether a `[policy]` table was present at all.
@@ -630,6 +634,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         Some(cfg) => build_policy(cfg, &mut issues),
         None => PolicyReport {
             policy: Default::default(),
+            mode: Default::default(),
             invalid: Vec::new(),
             configured: false,
         },
@@ -1127,13 +1132,27 @@ fn skills_dirs(env: &KomoEnv) -> Vec<PathBuf> {
 }
 
 fn build_policy(cfg: PolicyFileConfig, issues: &mut Vec<ConfigIssue>) -> PolicyReport {
-    use komo_core::domain::policy::{Policy, Verdict};
+    use komo_core::domain::policy::{Policy, PolicyMode, Verdict};
 
     let default_normal = cfg
         .default_normal
         .as_deref()
         .and_then(Verdict::parse_default)
         .unwrap_or(Verdict::Ask);
+
+    // An unreadable mode falls back to `ask` with a warning rather than
+    // silently enabling the reviewer: a typo must never widen the gate.
+    let mode = match cfg.mode.as_deref() {
+        None => PolicyMode::Ask,
+        Some(raw) => PolicyMode::parse(raw).unwrap_or_else(|| {
+            issues.push(ConfigIssue {
+                path: "policy.mode",
+                severity: IssueSeverity::Warning,
+                message: format!("[policy] mode = \"{raw}\" is not ask/auto, using ask"),
+            });
+            PolicyMode::Ask
+        }),
+    };
 
     let mut rules = Vec::new();
     let mut invalid = Vec::new();
@@ -1152,6 +1171,7 @@ fn build_policy(cfg: PolicyFileConfig, issues: &mut Vec<ConfigIssue>) -> PolicyR
     }
     PolicyReport {
         policy: Policy::new(rules, default_normal),
+        mode,
         invalid,
         configured: true,
     }
@@ -1160,7 +1180,29 @@ fn build_policy(cfg: PolicyFileConfig, issues: &mut Vec<ConfigIssue>) -> PolicyR
 #[cfg(test)]
 mod policy_rule_tests {
     use super::*;
-    use komo_core::domain::policy::{Access, Category, Matcher};
+    use komo_core::domain::policy::{Access, Category, Matcher, PolicyMode};
+
+    fn mode_of(raw: Option<&str>) -> (PolicyMode, usize) {
+        let mut issues = Vec::new();
+        let report = build_policy(
+            PolicyFileConfig {
+                mode: raw.map(str::to_string),
+                ..Default::default()
+            },
+            &mut issues,
+        );
+        (report.mode, issues.len())
+    }
+
+    /// A typo must never turn the reviewer on: an unreadable mode falls back to
+    /// `ask` **and** says so, rather than silently widening the gate.
+    #[test]
+    fn policy_mode_defaults_to_ask_and_warns_on_a_bad_value() {
+        assert_eq!(mode_of(None), (PolicyMode::Ask, 0));
+        assert_eq!(mode_of(Some("ask")), (PolicyMode::Ask, 0));
+        assert_eq!(mode_of(Some(" AUTO ")), (PolicyMode::Auto, 0));
+        assert_eq!(mode_of(Some("yolo")), (PolicyMode::Ask, 1));
+    }
 
     fn rule(category: &str, matcher: &str, value: &str) -> PolicyRuleFileConfig {
         PolicyRuleFileConfig {

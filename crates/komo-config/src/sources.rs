@@ -452,6 +452,10 @@ pub struct PolicyFileConfig {
     /// = current behavior), `deny`, or `allow`. `Risk::Dangerous` always asks
     /// unless an explicit `include_dangerous` allow rule grants it.
     pub default_normal: Option<String>,
+    /// `ask` (default, = current behavior) or `auto`. In `auto`, an action the
+    /// rules would escalate to a prompt gets a second-opinion aux-model review
+    /// first, which may only auto-allow or leave it for the human.
+    pub mode: Option<String>,
     /// `[[policy.rule]]` entries, evaluated deny-first.
     pub rule: Vec<PolicyRuleFileConfig>,
 }

@@ -11,6 +11,7 @@
 //! around `system_prompt`, and a delegation runs a real agent turn on an
 //! `AgentRuntime`.
 
+pub mod auto_reviewer;
 pub mod daemon;
 pub mod delegate;
 pub mod gateway;

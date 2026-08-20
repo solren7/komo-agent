@@ -297,7 +297,7 @@ fn schedule_health(config: &ConfigSnapshot) {
 /// The permission policy: configured?, rule count, load errors, and the two
 /// runtime grant sources (saved prompts, scheduled jobs).
 async fn policy_health(config: &ConfigSnapshot, control: &OperatorControl) {
-    use crate::domain::policy::Verdict;
+    use crate::domain::policy::{PolicyMode, Verdict};
     let report = &config.runtime.policy;
     println!("\npolicy:");
     // Saved grants are reported whether or not a [policy] table exists — they are
@@ -333,6 +333,12 @@ async fn policy_health(config: &ConfigSnapshot, control: &OperatorControl) {
         "  {OK} {} rule(s), default_normal = {d}  (see `komo policy list`)",
         report.policy.rules().len()
     );
+    // Worth a line of its own: in auto mode a prompt the rules produced may be
+    // answered by the aux reviewer instead of reaching the operator, which is
+    // exactly the kind of thing someone reads `doctor` to find out.
+    if report.mode == PolicyMode::Auto {
+        println!("  {OK} mode = auto — the aux reviewer may auto-allow prompts (never deny)");
+    }
     if !report.invalid.is_empty() {
         println!(
             "  {BAD} {} invalid rule(s) ignored — fix [[policy.rule]] in config.toml",
