@@ -119,6 +119,26 @@ const TOOL_ECONOMY_GUIDANCE: &str = "Tool calls in one round run concurrently: \
     have not changed since you last ran it — verify once, at the point the result \
     actually matters.";
 
+/// Gated on `run_code`. How to *write* a program is covered by the API listing
+/// at the tail of this tier (`run_code::sdk_note`); what belongs here is the
+/// routing decision, which nothing else states. Left unsaid, the model keeps to
+/// the only pattern it was told about — the round-economy rule right above,
+/// one round per step — and a tool that can collapse a search-then-act loop
+/// into a single call goes unused.
+const CODE_GUIDANCE: &str = "`run_code` runs a Python program that calls these \
+    same tools, and it is the right choice whenever the work is not a fixed set \
+    of calls you can name up front: the set comes out of a previous result \
+    (search, then act on each hit), the same call repeats over many items, or a \
+    result has to be looped over, filtered or counted before it means anything. \
+    One program is one round and pays context only for what it returns, where \
+    the same work called step by step is a round-trip per step with every \
+    intermediate result spent as context. Call a tool directly when you need one \
+    thing, issue independent calls together in one round when you already know \
+    all of them, and reach for a program at the point you would otherwise read a \
+    result only to decide what to call next. Do not wrap a single call in a \
+    program, and inside one prefer `tools.<name>(...)` over `tools.shell(...)` — \
+    a program is a way to sequence your tools, not a way around them.";
+
 /// Injected whenever any tool is loaded, and the reason is a real incident: asked
 /// what it had spent this month, the model answered "no records, 0 yuan" in 76
 /// output tokens with zero tool steps in the ledger — the data was there the whole
@@ -425,6 +445,11 @@ impl SystemPromptBuilder {
             parts.push(TRUST_BOUNDARY_GUIDANCE.to_string());
             parts.push(TOOL_ECONOMY_GUIDANCE.to_string());
         }
+        // Immediately after the round-economy rule it extends: that rule covers
+        // a set of calls the model can name, this one the set it cannot.
+        if self.has("run_code") {
+            parts.push(CODE_GUIDANCE.to_string());
+        }
         if self.has("time") {
             parts.push(TIME_GUIDANCE.to_string());
         }
@@ -666,6 +691,22 @@ mod tests {
             .home(tmp("economy_off"))
             .build();
         assert!(!without.contains("run concurrently"));
+    }
+
+    /// The routing rule is what makes `run_code` reachable at all: the API
+    /// listing says how to write a program, never when one beats N rounds.
+    #[test]
+    fn code_guidance_appears_only_with_run_code() {
+        let with = SystemPromptBuilder::new(&config())
+            .home(tmp("code_on"))
+            .tools(vec!["run_code".into(), "read".into()])
+            .build();
+        assert!(with.contains("reach for a program"), "{with}");
+        let without = SystemPromptBuilder::new(&config())
+            .home(tmp("code_off"))
+            .tools(vec!["read".into()])
+            .build();
+        assert!(!without.contains("reach for a program"));
     }
 
     #[test]
